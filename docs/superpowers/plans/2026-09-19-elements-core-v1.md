@@ -1477,15 +1477,29 @@ fn different_seeds_produce_different_fields() {
     assert_ne!(a, b);
 }
 
+/// Seeds 7 and 8 above differ in their low bits, so they cannot detect a seed
+/// combination that discards information. These two collide under a bare XOR
+/// of the halves, which is the bug this guards against.
+#[test]
+fn seeds_that_collide_under_xor_produce_different_fields() {
+    let a = noise_values(0x0000_0001_0000_0000, 4.0);
+    let b = noise_values(0x0000_0000_0000_0001, 4.0);
+    assert_ne!(a, b, "distinct u64 seeds must not collapse to one field");
+}
+
 #[test]
 fn noise_stays_in_range_and_is_finite() {
     let values = noise_values(7, 4.0);
     assert_eq!(values.len(), 16 * 16 * 16);
     for v in &values {
         assert!(v.is_finite(), "noise produced a non-finite value: {v}");
+        // The analytic bound, not the clamp's range: three octaves at
+        // 0.5/0.25/0.125 over a hash bounded by [-1, 1] cannot exceed 0.875.
+        // Asserting the loose [-1, 1] would not detect a change to the octave
+        // amplitudes or the hash range; this does.
         assert!(
-            (-1.001..=1.001).contains(v),
-            "noise escaped [-1, 1]: {v}"
+            (-0.876..=0.876).contains(v),
+            "noise escaped its analytic bound of 0.875: {v}"
         );
     }
 }
@@ -1573,7 +1587,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let uvw = (vec3<f32>(gid) + vec3<f32>(0.5)) / vec3<f32>(params.dims);
-    let seed = params.seed_lo ^ params.seed_hi;
+    // Mix with an odd multiplier rather than a bare XOR: `lo ^ hi` collides
+    // for realistic seed-packing patterns such as `(frame << 32) | id`, where
+    // 0x1_0000_0000 and 0x1 both reduce to 1 and yield identical noise.
+    let seed = params.seed_lo ^ (params.seed_hi * 0x9e3779b9u);
 
     var value: f32 = 0.0;
     var amplitude: f32 = 0.5;
@@ -1584,7 +1601,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         freq = freq * 2.0;
     }
 
-    // Three octaves at 0.5/0.25/0.125 sum to at most 0.875; clamp defensively.
+    // Unreachable by construction: hash3 returns [-1, 1], the trilinear
+    // weights are a partition of unity, and three octaves at 0.5/0.25/0.125
+    // bound the sum to [-0.875, 0.875]. Kept because a later change to the
+    // octave count or amplitudes could make it reachable, and it costs nothing.
     textureStore(field, vec3<i32>(gid), vec4<f32>(clamp(value, -1.0, 1.0), 0.0, 0.0, 0.0));
 }
 ```
