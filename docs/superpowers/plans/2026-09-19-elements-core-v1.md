@@ -607,13 +607,18 @@ impl GpuContext {
     }
 
     async fn new_headless_async() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        // Note `InstanceDescriptor` is passed BY VALUE, and the constructor is
+        // `new_without_display_handle_from_env` — verified against the vendored
+        // wgpu 30.0.1 source. There is no `from_env_or_default` in this version.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|_| GpuError::NoAdapter)?;
@@ -625,6 +630,7 @@ impl GpuContext {
                 label: Some("elements-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::downlevel_defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -694,7 +700,25 @@ pub mod gpu;
 Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test gpu_context`
 Expected: PASS — three tests ok.
 
-If `scoped_reports_validation_errors` fails because wgpu 30 rejects the zero-size buffer at a different layer, substitute a texture with `size.width = 0` as the invalid resource. The assertion under test is "an invalid call produces `GpuError::Validation`", not the specific invalid call.
+**Verified on this project:** the zero-size `MAP_READ` buffer does *not* trip
+validation on Metal (Apple M1 Max, wgpu 30.0.1). Use a texture with
+`size.width = 0` as the invalid resource instead. The assertion under test is
+"an invalid call produces `GpuError::Validation`", not the specific invalid
+call — but whichever you use, confirm the test fails when `scoped` is stubbed to
+return `Ok`, or it is passing vacuously.
+
+**A note on verifying wgpu APIs.** Three signatures in this task's code were
+wrong when first written from documentation. The reliable check is the vendored
+source, not docs.rs:
+
+```bash
+R=$(find ~/.cargo/registry/src -maxdepth 2 -type d -name 'wgpu-types-30.0.1' | head -1)
+grep -rn 'pub struct DeviceDescriptor' $R/src/
+```
+
+Descriptors used by Tasks 3–5 were verified this way and are correct as written:
+`TextureDescriptor`, `BufferDescriptor`, `TexelCopyBufferLayout` (it does have
+`rows_per_image`), and `ComputePipelineDescriptor`.
 
 - [ ] **Step 6: Commit**
 
