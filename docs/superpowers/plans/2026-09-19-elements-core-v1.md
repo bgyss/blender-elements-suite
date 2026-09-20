@@ -48,6 +48,9 @@ Every task's requirements implicitly include this section.
 - **Protocol version constant is `ELEMENTS_PROTOCOL_VERSION: u32 = 1`.** Every control message carries it.
 - **Document format version constant is `ELEMENTS_DOC_VERSION: u32 = 1`.** Any PR changing the `.elements` schema must bump it and add a migration test.
 - **Blender extension packaging:** `__init__.py` and `blender_manifest.toml` at the ZIP root, nothing nested under a package directory; relative imports only inside the addon package.
+- **Never set `WGPU_BACKEND` in a local command.** Development happens on macOS
+  where the backend is Metal; `WGPU_BACKEND=vulkan` makes wgpu fail to find an
+  adapter. Local runs use `just test` or a plain `cargo test` / `cargo nextest`.
 - **CI runs on lavapipe** (software Vulkan) via `just ci-test`, which sets `WGPU_BACKEND=vulkan` and `LIBGL_ALWAYS_SOFTWARE=1`. These variables are CI-only: `WGPU_BACKEND=vulkan` is wrong on macOS, where the backend is Metal. Tests requiring a device call `GpuContext::new_headless()`.
 - **`just check` must pass before every commit.** It runs `cargo fmt --check`, `clippy -D warnings`, `ruff check`, and the full test suite.
 - **All Python targets 3.11**, formatted and linted with `ruff`. Two versions are
@@ -706,7 +709,7 @@ pub mod gpu;
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test gpu_context`
+Run: `cargo test -p elements-core --test gpu_context`
 Expected: PASS — three tests ok.
 
 **Verified on this project:** the zero-size `MAP_READ` buffer does *not* trip
@@ -831,7 +834,7 @@ recycling test that cannot detect non-recycling is worthless.
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test field_pool`
+Run: `cargo test -p elements-core --test field_pool`
 Expected: FAIL — `unresolved imports FieldDims, FieldFormat, FieldPool`.
 
 - [ ] **Step 3: Add dependencies**
@@ -1113,7 +1116,7 @@ pub use pool::FieldPool;
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test field_pool`
+Run: `cargo test -p elements-core --test field_pool`
 Expected: PASS — five tests ok.
 
 - [ ] **Step 7: Commit**
@@ -1214,7 +1217,7 @@ fn pipeline_cache_returns_the_same_compiled_pipeline() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test dispatch`
+Run: `cargo test -p elements-core --test dispatch`
 Expected: FAIL — `unresolved imports fill_constant, PipelineCache`.
 
 - [ ] **Step 3: Add the dev-dependency**
@@ -1421,7 +1424,7 @@ pub use dispatch::{dispatch_over_field, fill_constant, PipelineCache, WORKGROUP}
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test dispatch`
+Run: `cargo test -p elements-core --test dispatch`
 Expected: PASS — three tests ok.
 
 - [ ] **Step 8: Commit**
@@ -1517,7 +1520,7 @@ fn noise_is_not_constant() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test noise`
+Run: `cargo test -p elements-core --test noise`
 Expected: FAIL — `unresolved import fill_curl_noise`.
 
 - [ ] **Step 3: Write the shader**
@@ -1687,7 +1690,7 @@ pub use dispatch::{
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test noise`
+Run: `cargo test -p elements-core --test noise`
 Expected: PASS — four tests ok.
 
 - [ ] **Step 6: Verify the whole workspace still passes**
@@ -1881,7 +1884,7 @@ fn eval_without_an_output_is_an_error() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test graph`
+Run: `cargo test -p elements-core --test graph`
 Expected: FAIL — `error[E0432]: unresolved import elements_core::graph`.
 
 - [ ] **Step 3: Implement sockets**
@@ -1955,6 +1958,10 @@ pub enum NodeError {
 }
 
 /// A value travelling along a connection.
+///
+/// `Debug` is implemented by hand rather than derived: deriving would require
+/// `Field: Debug`, and `Field` deliberately has no `Debug` because printing a
+/// GPU texture handle is meaningless. The tests need `Debug` for `unwrap_err`.
 pub enum Value {
     Field(Field),
     Scalar(f32),
@@ -2307,7 +2314,7 @@ pub mod graph;
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test graph`
+Run: `cargo test -p elements-core --test graph`
 Expected: PASS — nine tests ok.
 
 - [ ] **Step 8: Commit**
@@ -2758,7 +2765,7 @@ fn registry_exposes_all_three_builtins() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test nodes`
+Run: `cargo test -p elements-core --test nodes`
 Expected: FAIL — `registry_exposes_all_three_builtins` asserts against an empty list; the others fail with `UnknownKind`.
 
 - [ ] **Step 3: Implement ConstantField**
@@ -2944,14 +2951,14 @@ pub mod nodes;
 
 - [ ] **Step 6: Run the node tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test nodes`
+Run: `cargo test -p elements-core --test nodes`
 Expected: PASS — four tests ok.
 
 - [ ] **Step 7: Unignore the deferred document tests**
 
 Modify `crates/elements-core/tests/document.rs`, deleting the three `#[ignore]` attributes and their `// unignore in Task 8` comments.
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test document`
+Run: `cargo test -p elements-core --test document`
 Expected: PASS — seven tests ok, none ignored.
 
 - [ ] **Step 8: Commit**
@@ -4751,7 +4758,7 @@ Open `noise_8_z4.png`. It must look like smooth structured noise, not uniform gr
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-cli`
+Run: `cargo test -p elements-cli`
 Expected: PASS — five tests ok.
 
 - [ ] **Step 8: Commit**
@@ -6225,7 +6232,7 @@ fn serve(mut stream: elements_ipc::Stream, channel: &std::path::Path) -> anyhow:
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elementsd`
+Run: `cargo test -p elementsd`
 Expected: PASS — five tests ok.
 
 - [ ] **Step 6: Commit**
@@ -6412,7 +6419,7 @@ fn the_python_client_speaks_the_real_protocol() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elementsd --test python_contract`
+Run: `cargo test -p elementsd --test python_contract`
 Expected: FAIL — python exits non-zero with `ModuleNotFoundError: No module named 'blender_elements'`.
 
 - [ ] **Step 3: Implement the client**
@@ -6629,7 +6636,7 @@ class FrameReader:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elementsd --test python_contract`
+Run: `cargo test -p elementsd --test python_contract`
 Expected: PASS — `the_python_client_speaks_the_real_protocol ... ok`.
 
 - [ ] **Step 5: Confirm CI runs this on Blender's Python**
@@ -7341,7 +7348,7 @@ the step CI will now run passes locally first.
 
 - [ ] **Step 7: Run the Blender integration test**
 
-Run: `BLENDER_BIN=$(command -v blender) WGPU_BACKEND=vulkan cargo test -p elementsd --test blender_integration -- --nocapture`
+Run: `BLENDER_BIN=$(command -v blender) cargo test -p elementsd --test blender_integration -- --nocapture`
 Expected: PASS with `blender roundtrip ok` in the output.
 
 Or simply: `just blender-test`, which locates Blender on PATH or in
