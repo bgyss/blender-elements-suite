@@ -1,0 +1,12 @@
+/target/
+/dist/
+/result
+.direnv/
+__pycache__/
+.venv/
+*.vdb
+*.npy
+*.png
+!crates/*/tests/golden/*.npy
+!crates/*/tests/golden/*.png
+.superpowers/
