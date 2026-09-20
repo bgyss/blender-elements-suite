@@ -8,6 +8,7 @@ pub mod vdb;
 
 pub use npy::{read_npy, write_npy};
 pub use preview::write_slice_png;
+pub use vdb::write_float_grid;
 
 /// Everything that can go wrong writing an Elements output file.
 #[derive(Debug, thiserror::Error)]
@@ -24,4 +25,6 @@ pub enum IoError {
     LengthMismatch { expected: usize, got: usize },
     #[error("field {dims:?} exceeds the 4096^3 limit of a single root child")]
     FieldTooLarge { dims: [u32; 3] },
+    #[error("OpenVDB UUIDs are 36 ASCII characters, got {len}")]
+    BadUuid { len: usize },
 }

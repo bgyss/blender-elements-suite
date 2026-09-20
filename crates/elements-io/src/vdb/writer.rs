@@ -170,7 +170,9 @@ pub fn write_archive_header<W: Write + Seek>(
     w: &mut ByteWriter<W>,
     uuid: &str,
 ) -> Result<(), IoError> {
-    debug_assert_eq!(uuid.len(), 36, "OpenVDB stores a fixed 36-byte UUID");
+    if uuid.len() != 36 {
+        return Err(IoError::BadUuid { len: uuid.len() });
+    }
 
     w.u64(OPENVDB_MAGIC)?;
     w.u32(OPENVDB_FILE_VERSION)?;

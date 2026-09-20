@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
 use elements_io::vdb::{
-    ByteWriter, COMPRESSION_ACTIVE_MASK, MetaValue, write_archive_header, write_grid_descriptor,
-    write_metadata,
+    ByteWriter, COMPRESSION_ACTIVE_MASK, MetaValue, OPENVDB_MAGIC, write_archive_header,
+    write_grid_descriptor, write_metadata,
 };
 
 /// Build a file containing a header and one grid whose body is metadata only.
@@ -76,6 +76,24 @@ fn byte_writer_patches_offsets_in_place() {
     assert_eq!(&bytes[0..4], &0xdead_beefu32.to_le_bytes());
     assert_eq!(&bytes[4..12], &0x0102_0304_0506_0708u64.to_le_bytes());
     assert_eq!(&bytes[12..16], &0x1234_5678u32.to_le_bytes());
+}
+
+#[test]
+fn archive_header_starts_with_the_openvdb_magic() {
+    let bytes = header_only_file("density");
+    // vdb-rs's magic check is a blocklist that only rejects one byte-swapped
+    // value, so a successful parse alone would not prove the magic is right.
+    assert_eq!(&bytes[0..8], &OPENVDB_MAGIC.to_le_bytes());
+}
+
+#[test]
+fn write_archive_header_rejects_a_malformed_uuid() {
+    let mut w = ByteWriter::new(Cursor::new(Vec::new()));
+    let err = write_archive_header(&mut w, "not-a-uuid").unwrap_err();
+    assert!(
+        matches!(err, elements_io::IoError::BadUuid { len: 10 }),
+        "got {err:?}"
+    );
 }
 
 #[test]
