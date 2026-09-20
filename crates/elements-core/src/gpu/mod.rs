@@ -4,7 +4,7 @@ mod dispatch;
 mod field;
 mod pool;
 
-pub use dispatch::{PipelineCache, WORKGROUP, dispatch_over_field, fill_constant};
+pub use dispatch::{PipelineCache, WORKGROUP, dispatch_over_field, fill_constant, fill_curl_noise};
 pub use field::{Field, FieldDims, FieldFormat};
 pub use pool::FieldPool;
 

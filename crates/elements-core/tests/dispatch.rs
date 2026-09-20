@@ -1,5 +1,5 @@
 use elements_core::gpu::{
-    FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache, fill_constant,
+    FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache, fill_constant,
 };
 
 #[test]
@@ -76,4 +76,42 @@ fn pipeline_cache_returns_the_same_compiled_pipeline() {
         "get_or_create must return the same cached pipeline, not recompile it"
     );
     assert_eq!(cache.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "PipelineCache key collision")]
+fn pipeline_cache_detects_a_key_collision() {
+    let ctx = GpuContext::new_headless().expect("no GPU adapter available");
+    let mut cache = PipelineCache::new();
+    let constant_source = include_str!("../src/gpu/shaders/constant.wgsl");
+    let noise_source = include_str!("../src/gpu/shaders/curl_noise.wgsl");
+
+    cache
+        .get_or_create(&ctx, "shared-key", constant_source, "main")
+        .unwrap();
+    // Same key, different source: this must be caught, not silently accepted.
+    let _ = cache.get_or_create(&ctx, "shared-key", noise_source, "main");
+}
+
+#[test]
+fn broken_shader_surfaces_as_a_validation_error_not_a_panic() {
+    let ctx = GpuContext::new_headless().expect("no GPU adapter available");
+    let mut cache = PipelineCache::new();
+
+    let result = cache.get_or_create(
+        &ctx,
+        "broken-shader-for-testing",
+        "@compute fn main() { this is not wgsl }",
+        "main",
+    );
+
+    match result {
+        Err(GpuError::Validation(message)) => {
+            assert!(
+                !message.is_empty(),
+                "validation error should carry a non-empty message"
+            );
+        }
+        other => panic!("expected Err(GpuError::Validation(_)), got {other:?}"),
+    }
 }
