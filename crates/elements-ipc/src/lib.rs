@@ -1,0 +1,13 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//! Inter-process transport between the Elements engine and its clients.
+//!
+//! Two planes: a newline-delimited JSON control plane (`protocol`) and a
+//! memory-mapped double-buffered data plane (`channel`, added in Task 15).
+
+mod protocol;
+
+pub use protocol::{
+    Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, MAX_MESSAGE_BYTES, ProtocolError,
+    Response, read_message, write_message,
+};
