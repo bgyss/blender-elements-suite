@@ -41,7 +41,13 @@ Every task's requirements implicitly include this section.
 - **Blender extension packaging:** `__init__.py` and `blender_manifest.toml` at the ZIP root, nothing nested under a package directory; relative imports only inside the addon package.
 - **CI runs on lavapipe** (software Vulkan) via `just ci-test`, which sets `WGPU_BACKEND=vulkan` and `LIBGL_ALWAYS_SOFTWARE=1`. These variables are CI-only: `WGPU_BACKEND=vulkan` is wrong on macOS, where the backend is Metal. Tests requiring a device call `GpuContext::new_headless()`.
 - **`just check` must pass before every commit.** It runs `cargo fmt --check`, `clippy -D warnings`, `ruff check`, and the full test suite.
-- **All Python targets 3.11** and is formatted and linted with `ruff`.
+- **All Python targets 3.11**, formatted and linted with `ruff`. Two versions are
+  in play and both must work: **3.11** is the compatibility floor, because
+  `blender_version_min = "4.2.0"` promises Blender 4.2 and 5.0, which ship 3.11;
+  **3.13** is what the local Blender 5.2.2 LTS actually runs. The contract test
+  (Task 17) runs on the mise-pinned 3.11 to catch newer syntax; the Blender
+  integration test (Task 18) exercises the same code on 3.13. Neither substitutes
+  for the other.
 - **Commit style:** conventional commits (`feat:`, `test:`, `fix:`, `chore:`). Commit at the end of every task.
 
 ---
@@ -279,10 +285,21 @@ golden:
     cargo run -p elements-cli -- render-preview tests/graphs/noise_8.elements \
         --slice-z 4 --range -1,1 --out crates/elements-cli/tests/golden/noise_8_z4.png
 
-# Run the Blender integration test. Requires BLENDER_BIN.
+# Run the Blender integration test.
+# Finds Blender on PATH or in the standard macOS application bundle.
 blender-test:
-    BLENDER_BIN="${BLENDER_BIN:-$(command -v blender)}" \
-        cargo test -p elementsd --test blender_integration -- --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BLENDER_BIN="${BLENDER_BIN:-$(command -v blender || true)}"
+    if [ -z "$BLENDER_BIN" ] && [ -x /Applications/Blender.app/Contents/MacOS/Blender ]; then
+        BLENDER_BIN=/Applications/Blender.app/Contents/MacOS/Blender
+    fi
+    if [ -z "$BLENDER_BIN" ]; then
+        echo "Blender not found. Set BLENDER_BIN." >&2
+        exit 1
+    fi
+    echo "using $BLENDER_BIN ($("$BLENDER_BIN" --version | head -1))"
+    BLENDER_BIN="$BLENDER_BIN" cargo test -p elementsd --test blender_integration -- --nocapture
 ```
 
 `cargo nextest` replaces `cargo test` in these recipes because it runs each test
@@ -7221,13 +7238,26 @@ Expected: `layout ok [...]`.
 Run: `BLENDER_BIN=$(command -v blender) WGPU_BACKEND=vulkan cargo test -p elementsd --test blender_integration -- --nocapture`
 Expected: PASS with `blender roundtrip ok` in the output.
 
-If Blender is not installed, the test prints a skip notice and passes. Install Blender 4.2 or newer before claiming this task is done — a skipped test is not a passing one.
+Or simply: `just blender-test`, which locates Blender on PATH or in
+`/Applications/Blender.app`.
 
-Before reinstalling during iteration, delete the previous extension directory, or Blender will load stale code:
+The verified local target is **Blender 5.2.2 LTS, Python 3.13.13**. If Blender
+cannot be found the test prints a skip notice and passes — a skipped test is not
+a passing one, so confirm the output contains `blender roundtrip ok` before
+marking this task done.
+
+Blender caches installed extensions, so a reinstall over a stale directory loads
+old code. Move the previous install aside before reinstalling. Note the version
+in the path is **5.2**, matching the installed Blender:
 
 ```bash
-rm -rf "$HOME/Library/Application Support/Blender/4.2/extensions/user_default/blender_elements"
+EXT_DIR="$HOME/Library/Application Support/Blender/5.2/extensions/user_default/blender_elements"
+[ -d "$EXT_DIR" ] && mv "$EXT_DIR" "$HOME/.Trash/blender_elements-$(date +%s)"
 ```
+
+A Trash move rather than a recursive delete: it is recoverable if the path is
+ever wrong, and the path is built from `$HOME`, which is exactly where a typo is
+expensive.
 
 - [ ] **Step 8: Run the whole workspace**
 
