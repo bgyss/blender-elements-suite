@@ -60,7 +60,7 @@ impl GpuContext {
         let lost = Arc::new(Mutex::new(None));
         let lost_sink = Arc::clone(&lost);
         device.set_device_lost_callback(move |_reason, message| {
-            *lost_sink.lock().expect("device-lost mutex poisoned") = Some(message);
+            *lost_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
         });
 
         Ok(Self {
@@ -85,10 +85,7 @@ impl GpuContext {
 
     /// Returns the device-lost message if the device has been lost.
     pub fn device_lost(&self) -> Option<String> {
-        self.lost
-            .lock()
-            .expect("device-lost mutex poisoned")
-            .clone()
+        self.lost.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Run `f` inside a validation error scope, converting any captured error.
@@ -96,12 +93,28 @@ impl GpuContext {
     /// This is the only sanctioned way to submit GPU work in Elements: it turns
     /// `wgpu`'s asynchronous, panicking-by-default error reporting into a
     /// `Result` the daemon can surface to the addon.
+    ///
+    /// # Limitations
+    ///
+    /// This scope only catches encoding-time and descriptor validation errors
+    /// during the execution of `f`. It does NOT catch device-timeline faults
+    /// from work already submitted to the GPU: `Queue::submit` returns before
+    /// the hardware runs the work, so faults that only manifest during execution
+    /// may surface after `scoped` returns `Ok`, and may be misattributed to a
+    /// later `scoped` block. Call sites that must ensure submitted work succeeded
+    /// should wait for completion explicitly (for example via
+    /// `Queue::on_submitted_work_done`) before trusting an `Ok`.
     pub fn scoped<T>(&self, f: impl FnOnce() -> T) -> Result<T, GpuError> {
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let value = f();
         let error = pollster::block_on(guard.pop());
 
         if let Some(message) = self.device_lost() {
+            if let Some(e) = error {
+                return Err(GpuError::DeviceLost(format!(
+                    "{message} (a validation error was also captured: {e})"
+                )));
+            }
             return Err(GpuError::DeviceLost(message));
         }
         match error {
