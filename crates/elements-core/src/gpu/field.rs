@@ -31,25 +31,28 @@ impl FieldDims {
 /// The storage formats Core v1 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFormat {
-    R16Float,
+    R32Float,
     Rgba16Float,
 }
 
 impl FieldFormat {
     pub fn channels(&self) -> u32 {
         match self {
-            Self::R16Float => 1,
+            Self::R32Float => 1,
             Self::Rgba16Float => 4,
         }
     }
 
     pub fn bytes_per_voxel(&self) -> u32 {
-        self.channels() * 2
+        match self {
+            Self::R32Float => 4,
+            Self::Rgba16Float => 8,
+        }
     }
 
     pub(crate) fn wgpu_format(&self) -> wgpu::TextureFormat {
         match self {
-            Self::R16Float => wgpu::TextureFormat::R16Float,
+            Self::R32Float => wgpu::TextureFormat::R32Float,
             Self::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         }
     }
@@ -159,13 +162,22 @@ impl Field {
             let mapped = slice
                 .get_mapped_range()
                 .map_err(|e| GpuError::Validation(e.to_string()))?;
-            let row_values = self.dims.x as usize * channels;
+            let row_bytes = self.dims.x as usize * self.format.bytes_per_voxel() as usize;
             for z in 0..self.dims.z as usize {
                 for y in 0..self.dims.y as usize {
                     let start = (z * self.dims.y as usize + y) * padded_row as usize;
-                    let end = start + row_values * 2;
-                    let halves: &[half::f16] = bytemuck::cast_slice(&mapped[start..end]);
-                    out.extend(halves.iter().map(|h| h.to_f32()));
+                    let end = start + row_bytes;
+                    let row = &mapped[start..end];
+                    match self.format {
+                        FieldFormat::R32Float => {
+                            let floats: &[f32] = bytemuck::cast_slice(row);
+                            out.extend_from_slice(floats);
+                        }
+                        FieldFormat::Rgba16Float => {
+                            let halves: &[half::f16] = bytemuck::cast_slice(row);
+                            out.extend(halves.iter().map(|h| h.to_f32()));
+                        }
+                    }
                 }
             }
         }

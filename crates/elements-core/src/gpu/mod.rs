@@ -51,14 +51,7 @@ impl GpuContext {
 
         let adapter_name = adapter.get_info().name;
 
-        // `R16Float` fields need `STORAGE_BINDING` for compute passes, but the
-        // WebGPU spec only guarantees that usage for R16Float when this native
-        // extension is enabled (see `TextureFormat::guaranteed_format_features`
-        // in `wgpu-types`). Request it when the adapter supports it rather than
-        // unconditionally, so device creation still succeeds on adapters that
-        // don't expose it.
-        let required_features =
-            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES & adapter.features();
+        let required_features = wgpu::Features::empty();
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
