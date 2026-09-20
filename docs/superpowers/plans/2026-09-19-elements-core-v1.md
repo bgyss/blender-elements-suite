@@ -3181,8 +3181,13 @@ use crate::IoError;
 
 /// Write one z-slice as 8-bit greyscale, mapping `range` linearly onto 0..=255.
 ///
-/// Values outside `range` are clamped rather than wrapped, so a blown-up
-/// simulation reads as saturated white instead of noise.
+/// Values outside `range` are clamped rather than wrapped, and **non-finite
+/// values saturate to white**, so a blown-up simulation is visually obvious.
+/// That second rule is load-bearing: `f32::clamp` returns NaN unchanged, and
+/// `NaN as u8` is 0, so without an explicit check a diverged field would render
+/// as a plausible dark region — the opposite of what these previews are for.
+/// `NEG_INFINITY` is white too: one consistent "non-finite is white" rule reads
+/// more reliably at a glance than a physically intuitive split.
 pub fn write_slice_png(
     path: &Path,
     values: &[f32],
