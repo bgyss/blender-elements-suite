@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
+half.workspace = true
 pollster.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true

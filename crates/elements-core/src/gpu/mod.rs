@@ -1,5 +1,11 @@
 //! GPU device acquisition and error-scope handling.
 
+mod field;
+mod pool;
+
+pub use field::{Field, FieldDims, FieldFormat};
+pub use pool::FieldPool;
+
 use std::sync::{Arc, Mutex};
 
 /// Every way GPU work can fail in Elements.
@@ -45,10 +51,19 @@ impl GpuContext {
 
         let adapter_name = adapter.get_info().name;
 
+        // `R16Float` fields need `STORAGE_BINDING` for compute passes, but the
+        // WebGPU spec only guarantees that usage for R16Float when this native
+        // extension is enabled (see `TextureFormat::guaranteed_format_features`
+        // in `wgpu-types`). Request it when the adapter supports it rather than
+        // unconditionally, so device creation still succeeds on adapters that
+        // don't expose it.
+        let required_features =
+            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES & adapter.features();
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("elements-device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::downlevel_defaults(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
