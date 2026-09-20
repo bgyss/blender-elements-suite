@@ -6,5 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pollster.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
 
 [dev-dependencies]

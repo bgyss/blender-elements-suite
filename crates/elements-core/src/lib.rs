@@ -4,3 +4,5 @@
 
 /// The version of this crate, surfaced for protocol handshakes.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod gpu;
