@@ -20,6 +20,14 @@ pub enum ProtocolError {
     Io(#[from] std::io::Error),
     #[error("malformed message: {0}")]
     Json(#[from] serde_json::Error),
+    /// The line (payload plus trailing newline) exceeded `MAX_MESSAGE_BYTES`.
+    ///
+    /// The reader stops as soon as the cap is crossed, so the unread remainder
+    /// of the oversized line — including its eventual real `\n` — is still
+    /// sitting in the stream. The next `read_message` call would resume
+    /// mid-line, not at the next message boundary. Callers MUST treat this as
+    /// fatal and close the connection rather than continue reading from the
+    /// same stream.
     #[error("message of {bytes} bytes exceeds the {MAX_MESSAGE_BYTES} byte limit")]
     OversizedFrame { bytes: usize },
 }
@@ -133,6 +141,15 @@ pub fn read_message<R: BufRead, T: DeserializeOwned>(
         if trimmed.is_empty() {
             continue; // tolerate keepalive blank lines
         }
+        // Note: if a peer sends a complete, well-formed JSON object and then
+        // closes the connection without a trailing `\n`, `read_until` returns
+        // those bytes with no delimiter found. The strip_suffix calls above
+        // are then no-ops, `trimmed` still holds the whole object, and it
+        // parses successfully here — this function has no way to tell that
+        // case apart from a properly newline-terminated message, and does
+        // not try to. This is intentional: rejecting it would penalize a
+        // peer that behaved correctly except for the final delimiter, and
+        // genuinely partial/truncated JSON still fails with `ProtocolError::Json`.
         return Ok(Some(serde_json::from_slice(trimmed)?));
     }
 }

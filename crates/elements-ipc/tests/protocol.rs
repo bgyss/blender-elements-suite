@@ -1,9 +1,27 @@
 use std::io::{BufReader, Cursor};
 
 use elements_ipc::{
-    Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, ProtocolError, Response,
-    read_message, write_message,
+    Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, MAX_MESSAGE_BYTES, ProtocolError,
+    Response, read_message, write_message,
 };
+
+/// Build a `LoadGraph` command whose serialized-JSON-plus-trailing-newline
+/// length is exactly `total_bytes`, by padding the `path` field. Computed
+/// from the serialized length of the rest of the message rather than a
+/// hardcoded constant, so this stays correct if a field is ever renamed.
+fn load_graph_of_exact_wire_size(total_bytes: usize) -> Command {
+    let probe = Command::LoadGraph {
+        path: String::new(),
+    };
+    let probe_len = serde_json::to_vec(&probe).unwrap().len();
+    // total_bytes = probe_len + padding + 1 (the trailing newline write_message adds).
+    let padding = total_bytes
+        .checked_sub(probe_len + 1)
+        .expect("total_bytes must be large enough to hold an empty-path LoadGraph plus a newline");
+    Command::LoadGraph {
+        path: "a".repeat(padding),
+    }
+}
 
 #[test]
 fn commands_round_trip_as_ndjson() {
@@ -126,6 +144,54 @@ fn oversized_lines_are_rejected_before_parsing() {
     assert!(
         matches!(result, Err(ProtocolError::OversizedFrame { .. })),
         "a hostile or desynced peer must not be able to exhaust memory"
+    );
+}
+
+#[test]
+fn a_message_of_exactly_the_maximum_size_is_accepted() {
+    let msg = load_graph_of_exact_wire_size(MAX_MESSAGE_BYTES);
+
+    let mut buf = Vec::new();
+    write_message(&mut buf, &msg).unwrap();
+    assert_eq!(
+        buf.len(),
+        MAX_MESSAGE_BYTES,
+        "test setup: the constructed message must land exactly on the limit"
+    );
+
+    let mut reader = BufReader::new(Cursor::new(buf));
+    let result: Command = read_message(&mut reader)
+        .expect("a message of exactly MAX_MESSAGE_BYTES must be accepted")
+        .expect("stream must not be treated as EOF");
+
+    match result {
+        Command::LoadGraph { path } => {
+            assert!(
+                path.chars().all(|c| c == 'a'),
+                "path must round-trip intact"
+            );
+        }
+        other => panic!("expected LoadGraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_message_one_byte_over_the_maximum_size_is_rejected() {
+    let msg = load_graph_of_exact_wire_size(MAX_MESSAGE_BYTES + 1);
+
+    let mut buf = Vec::new();
+    write_message(&mut buf, &msg).unwrap();
+    assert_eq!(
+        buf.len(),
+        MAX_MESSAGE_BYTES + 1,
+        "test setup: the constructed message must be exactly one byte over the limit"
+    );
+
+    let mut reader = BufReader::new(Cursor::new(buf));
+    let result: Result<Option<Command>, _> = read_message(&mut reader);
+    assert!(
+        matches!(result, Err(ProtocolError::OversizedFrame { .. })),
+        "a message one byte over the limit must be rejected, got {result:?}"
     );
 }
 
