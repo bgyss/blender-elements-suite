@@ -208,3 +208,34 @@ pub trait Node: Send + Sync {
     /// Compute this node's outputs. Must return exactly `sockets().outputs.len()` values.
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `with_evaluating_node` must only replace the `NodeId(u32::MAX)`
+    /// sentinel. An error that already names a real node — such as
+    /// `MissingInput` naming the node whose input is unconnected — must pass
+    /// through unchanged, or the error would end up naming the wrong node
+    /// and mislead whoever reads it.
+    #[test]
+    fn does_not_clobber_an_error_that_already_names_a_real_node() {
+        let err = NodeError::MissingInput {
+            node: NodeId(7),
+            index: 0,
+        };
+
+        let result = err.with_evaluating_node(NodeId(3));
+
+        match result {
+            NodeError::MissingInput { node, .. } => {
+                assert_eq!(
+                    node,
+                    NodeId(7),
+                    "should not have clobbered the real node id"
+                )
+            }
+            other => panic!("expected MissingInput, got {other:?}"),
+        }
+    }
+}

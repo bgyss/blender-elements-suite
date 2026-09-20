@@ -1,4 +1,7 @@
-use elements_core::graph::{DocError, Document, ELEMENTS_DOC_VERSION, NodeRegistry};
+use elements_core::graph::{
+    DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION, EvalCtx, Node, NodeError,
+    NodeRegistry, SocketSpec, SocketType, Value,
+};
 
 const MINIMAL: &str = include_str!("fixtures/v1_minimal.elements");
 
@@ -27,6 +30,7 @@ fn round_trips_without_loss() {
         assert_eq!(a.kind, b.kind);
         assert_eq!(a.params, b.params);
     }
+    assert_eq!(again.edges, doc.edges);
 }
 
 #[test]
@@ -97,4 +101,114 @@ fn builds_a_graph_with_the_declared_output() {
     assert_eq!(dims.x, 8);
     assert_eq!(graph.output().unwrap().0, 1);
     assert_eq!(graph.node_count(), 2);
+}
+
+/// A node with a single scalar output, used to build a document that wires
+/// one output to two inputs.
+struct Producer;
+
+impl Node for Producer {
+    fn kind(&self) -> &'static str {
+        "test.producer"
+    }
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![],
+            outputs: vec![SocketType::Scalar],
+        }
+    }
+    fn eval(&self, _ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        Ok(vec![Value::Scalar(1.0)])
+    }
+}
+
+/// A node with two scalar inputs, used as the two competing consumers of one
+/// producer's output.
+struct Consumer;
+
+impl Node for Consumer {
+    fn kind(&self) -> &'static str {
+        "test.consumer"
+    }
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Scalar, SocketType::Scalar],
+            outputs: vec![],
+        }
+    }
+    fn eval(&self, _ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        Ok(vec![])
+    }
+}
+
+fn test_registry() -> NodeRegistry {
+    let mut registry = NodeRegistry::new();
+    registry.register("test.producer", |_params| Ok(Box::new(Producer)));
+    registry.register("test.consumer", |_params| Ok(Box::new(Consumer)));
+    registry
+}
+
+#[test]
+fn rejects_a_document_wiring_one_output_to_two_inputs() {
+    let doc = Document {
+        version: ELEMENTS_DOC_VERSION,
+        dims: [8, 8, 8],
+        nodes: vec![
+            DocNode {
+                id: 0,
+                kind: "test.producer".to_string(),
+                params: serde_json::Value::Null,
+            },
+            DocNode {
+                id: 1,
+                kind: "test.consumer".to_string(),
+                params: serde_json::Value::Null,
+            },
+        ],
+        edges: vec![
+            DocEdge {
+                from_node: 0,
+                from_index: 0,
+                to_node: 1,
+                to_index: 0,
+            },
+            DocEdge {
+                from_node: 0,
+                from_index: 0,
+                to_node: 1,
+                to_index: 1,
+            },
+        ],
+        output: 1,
+    };
+
+    let registry = test_registry();
+    match doc.into_graph(&registry) {
+        Err(DocError::Graph(NodeError::AlreadyConsumed { .. })) => {}
+        other => panic!("expected DocError::Graph(AlreadyConsumed), got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_an_out_of_range_output() {
+    let doc = Document {
+        version: ELEMENTS_DOC_VERSION,
+        dims: [8, 8, 8],
+        nodes: vec![DocNode {
+            id: 0,
+            kind: "test.producer".to_string(),
+            params: serde_json::Value::Null,
+        }],
+        edges: vec![],
+        output: 5,
+    };
+
+    let registry = test_registry();
+    match doc.into_graph(&registry) {
+        Err(DocError::BadParams { reason, .. }) => {
+            assert!(reason.contains('5'), "got {reason}");
+            assert!(reason.contains('1'), "got {reason}");
+        }
+        other => panic!("expected BadParams, got {other:?}"),
+    }
 }

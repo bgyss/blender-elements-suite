@@ -36,7 +36,7 @@ pub struct DocNode {
     pub params: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocEdge {
     pub from_node: u32,
     pub from_index: u32,
@@ -91,6 +91,17 @@ impl Document {
             }
             let node = registry.build(&doc_node.kind, &doc_node.params)?;
             graph.add_node(node);
+        }
+
+        if self.output as usize >= self.nodes.len() {
+            return Err(DocError::BadParams {
+                kind: "document".to_string(),
+                reason: format!(
+                    "output node {} is out of range; the document has {} node(s)",
+                    self.output,
+                    self.nodes.len()
+                ),
+            });
         }
 
         for edge in &self.edges {
