@@ -464,10 +464,12 @@ jobs:
 
       - name: Test on lavapipe
         run: just ci-test
-
-      - name: Build the Blender extension
-        run: just addon
 ```
+
+The workflow deliberately does **not** run `just addon` yet: `scripts/build_addon.py`
+does not exist until Task 18, and a step that fails for seventeen tasks trains
+everyone to ignore a red CI, which is how a real regression gets through. Task 18
+adds that step at the same time it adds the script.
 
 `mise-action` installs exactly the tools `mise.toml` pins, so CI and a developer
 machine run the same `ruff`, `python` and `just`. Rust still comes from the
@@ -7232,6 +7234,22 @@ Run:
 python3 -c "import zipfile; ns=zipfile.ZipFile('dist/blender_elements-0.1.0.zip').namelist(); assert '__init__.py' in ns and 'blender_manifest.toml' in ns; assert not any(n.startswith('blender_elements/') for n in ns); print('layout ok', ns)"
 ```
 Expected: `layout ok [...]`.
+
+- [ ] **Step 6b: Add the extension build to CI**
+
+`scripts/build_addon.py` now exists, so CI can build and verify the extension.
+Task 1 deliberately left this step out to avoid seventeen tasks of red CI.
+
+Modify `.github/workflows/ci.yml`, appending to the `test` job's steps:
+
+```yaml
+      - name: Build the Blender extension
+        run: just addon
+```
+
+Run: `just addon`
+Expected: `built .../dist/blender_elements-0.1.0.zip with 7 files`, confirming
+the step CI will now run passes locally first.
 
 - [ ] **Step 7: Run the Blender integration test**
 
