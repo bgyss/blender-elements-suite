@@ -23,9 +23,11 @@ impl NodeRegistry {
         Self::default()
     }
 
-    /// The node kinds every Elements build ships. Populated in Task 8.
+    /// The node kinds every Elements build ships.
     pub fn with_builtins() -> Self {
-        Self::new()
+        let mut registry = Self::new();
+        crate::nodes::register_builtins(&mut registry);
+        registry
     }
 
     pub fn register(&mut self, kind: &'static str, ctor: NodeCtor) {

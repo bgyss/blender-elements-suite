@@ -64,9 +64,7 @@ fn rejects_non_positional_node_ids() {
     }
 }
 
-// unignore in Task 8
 #[test]
-#[ignore]
 fn rejects_an_unknown_node_kind() {
     let doc =
         Document::from_json(&MINIMAL.replace("core.noise_field", "core.does_not_exist")).unwrap();
@@ -77,9 +75,7 @@ fn rejects_an_unknown_node_kind() {
     }
 }
 
-// unignore in Task 8
 #[test]
-#[ignore]
 fn rejects_malformed_params() {
     let doc =
         Document::from_json(&MINIMAL.replace("\"seed\": 7", "\"seed\": \"not-a-number\"")).unwrap();
@@ -90,9 +86,7 @@ fn rejects_malformed_params() {
     }
 }
 
-// unignore in Task 8
 #[test]
-#[ignore]
 fn builds_a_graph_with_the_declared_output() {
     let doc = Document::from_json(MINIMAL).unwrap();
     let registry = NodeRegistry::with_builtins();
