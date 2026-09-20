@@ -3005,6 +3005,10 @@ fn ramp(dims: [u32; 3]) -> Vec<f32> {
     (0..n).map(|i| i as f32 / n as f32).collect()
 }
 
+// Test dimensions are deliberately NON-CUBIC. A transposed axis order still
+// round-trips perfectly through read_npy, so with cubic dims the bug would be
+// undetectable; with [4, 3, 2] the dims assertion catches it.
+
 #[test]
 fn npy_round_trips() {
     let dir = tempfile::tempdir().unwrap();
@@ -3043,7 +3047,7 @@ fn png_writes_the_requested_slice() {
 
     write_slice_png(&path, &values, [8, 8, 4], 2, (0.0, 3.0)).unwrap();
 
-    let decoder = png::Decoder::new(std::fs::File::open(&path).unwrap());
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
     let mut reader = decoder.read_info().unwrap();
     let mut buf = vec![0; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut buf).unwrap();
@@ -3062,7 +3066,7 @@ fn png_clamps_out_of_range_values() {
 
     write_slice_png(&path, &values, [2, 2, 1], 0, (0.0, 1.0)).unwrap();
 
-    let decoder = png::Decoder::new(std::fs::File::open(&path).unwrap());
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
     let mut reader = decoder.read_info().unwrap();
     let mut buf = vec![0; reader.output_buffer_size().unwrap()];
     reader.next_frame(&mut buf).unwrap();
@@ -3100,7 +3104,7 @@ repository.workspace = true
 
 [dependencies]
 half.workspace = true
-ndarray = "0.16"
+ndarray = "0.17.2"  # the version ndarray-npy 0.10.0 requires
 ndarray-npy.workspace = true
 png.workspace = true
 thiserror.workspace = true
@@ -3109,7 +3113,8 @@ thiserror.workspace = true
 tempfile.workspace = true
 ```
 
-If `cargo build -p elements-io` reports that `ndarray-npy` 0.10 needs a different `ndarray` minor, run `cargo add ndarray -p elements-io` and let cargo pick the compatible version. Record whichever version resolves in this manifest.
+**Verified:** `ndarray-npy` 0.10.0 requires `ndarray` 0.17.2. A mismatched pair
+fails with a confusing trait error rather than a clear version message.
 
 - [ ] **Step 4: Implement NPY**
 
@@ -4460,7 +4465,7 @@ fn render_preview_writes_a_png_of_the_right_size() {
         .unwrap();
     assert!(status.success());
 
-    let decoder = png::Decoder::new(std::fs::File::open(&out).unwrap());
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap()));
     let reader = decoder.read_info().unwrap();
     assert_eq!(reader.info().width, 8);
     assert_eq!(reader.info().height, 8);
