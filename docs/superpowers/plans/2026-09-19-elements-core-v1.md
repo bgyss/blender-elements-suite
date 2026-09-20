@@ -2752,6 +2752,16 @@ fn noise_frequency_defaults_when_omitted() {
     let values = eval_doc(&doc);
     assert_eq!(values.len(), 512);
     assert!(values.iter().all(|v| v.is_finite()));
+
+    // Finiteness alone cannot detect the regression this test exists for. A
+    // plain `#[serde(default)]` yields frequency 0.0, which produces a
+    // perfectly finite CONSTANT field. Only checking that the values vary
+    // distinguishes the correct default from the zero one.
+    let first = values[0];
+    assert!(
+        values.iter().any(|v| (v - first).abs() > 1e-3),
+        "frequency defaulted to 0, producing a constant field"
+    );
 }
 
 #[test]
