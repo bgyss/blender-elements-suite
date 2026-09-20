@@ -3637,7 +3637,11 @@ pub fn write_archive_header<W: Write + Seek>(
     w: &mut ByteWriter<W>,
     uuid: &str,
 ) -> Result<(), IoError> {
-    debug_assert_eq!(uuid.len(), 36, "OpenVDB stores a fixed 36-byte UUID");
+    // A real error, not a debug_assert: that would compile out in release and
+    // silently write a corrupt archive for a malformed UUID.
+    if uuid.len() != 36 {
+        return Err(IoError::BadUuid { len: uuid.len() });
+    }
 
     w.u64(OPENVDB_MAGIC)?;
     w.u32(OPENVDB_FILE_VERSION)?;
@@ -3825,6 +3829,44 @@ fn vdb_rs_reads_a_full_tree_from_our_writer() {
     assert_eq!(grid.tree.root_nodes.len(), 1);
     let root = &grid.tree.root_nodes[0];
     assert_eq!(root.child_mask.count_ones(), 1, "one 128^3 internal node");
+}
+
+/// The single-leaf tests above CANNOT detect a two-pass ordering bug: with one
+/// leaf there is only one possible order. Reversing the leaf iteration in the
+/// data pass only — the most likely real defect in this task — passes every
+/// other test in this file. Two leaves with distinct values is the minimum that
+/// catches it.
+#[test]
+fn leaf_values_are_not_scrambled_across_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two_leaves.vdb");
+    // 16 along x spans two leaves; give each a distinct constant value.
+    let dims = [16u32, 8, 8];
+    let mut values = vec![0.0f32; 16 * 8 * 8];
+    for z in 0..8 {
+        for y in 0..8 {
+            for x in 0..16 {
+                let i = (z * 8 + y) * 16 + x;
+                values[i] = if x < 8 { 1.0 } else { 2.0 };
+            }
+        }
+    }
+
+    write_float_grid(&path, "density", &values, dims, 0.1, 0.0).unwrap();
+
+    let file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+    let mut reader = vdb_rs::VdbReader::new(file).unwrap();
+    let grid = reader.read_grid::<f32>("density").unwrap();
+
+    // Every voxel must come back with its own leaf's value, not the other's.
+    for (coord, value) in grid.iter() {
+        let expected = if coord.x < 8 { 1.0 } else { 2.0 };
+        assert_eq!(
+            value, expected,
+            "voxel {coord:?} has the other leaf's value: the two write passes \
+             disagree on leaf order"
+        );
+    }
 }
 
 #[test]
