@@ -7375,6 +7375,13 @@ Every box below must be checked with a command that was actually run.
 Deliberately deferred here, and the first things Ember will need:
 
 - **Multi-consumer outputs.** Task 6 restricts each output to one input so values can be moved. Ember's graphs branch; this needs reference counting or a copy node.
+- **Partial writes read stale data.** `FieldPool::acquire` returns a recycled
+  texture whose contents are whatever the last user left, and the contract that
+  callers must fully write a field before reading it is enforced only by a doc
+  comment. Every Core v1 node writes every voxel, so this is safe today. The
+  first node that writes only part of a field — a masked or sparse write — will
+  silently read the previous frame's data in the untouched voxels. Whichever
+  task introduces that must either zero on acquire or track written regions.
 - **Cross-frame state.** `FieldPool` recycles within a frame. A solver needs fields that persist between frames, which changes the pool's lifetime model.
 - **Time.** `Command::Render { frame }` carries a frame number the engine currently ignores. Nodes will need it.
 - **In-memory volume handoff.** Task 18 round-trips a `.vdb` through disk. Ember should push grids to Blender without the file.
