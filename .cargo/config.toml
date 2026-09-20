@@ -1,3 +1,4 @@
+# Requires Xcode Command Line Tools on macOS. See README.md "Development setup".
 # On this machine `~/.nix-profile/bin` precedes `/usr/bin` in PATH, so the
 # default `cc` resolves to nix's GCC/ld, which cannot parse this macOS SDK's
 # libSystem.tbd ("unknown architecture arm64e.x1-macos") and fails every link.
