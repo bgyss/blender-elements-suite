@@ -247,6 +247,77 @@ fn a_malformed_graph_reports_a_document_error_and_keeps_the_session() {
 }
 
 #[test]
+fn a_graph_with_absurd_dimensions_is_an_error_not_a_crash() {
+    let daemon = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("absurd.elements");
+    std::fs::write(
+        &bad,
+        r#"{
+          "version": 1,
+          "dims": [3000000, 3000000, 3000000],
+          "nodes": [
+            { "id": 0, "kind": "core.noise_field", "params": { "seed": 7 } },
+            { "id": 1, "kind": "core.output", "params": {} }
+          ],
+          "edges": [{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }],
+          "output": 1
+        }"#,
+    )
+    .unwrap();
+
+    let mut stream = daemon.connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_message(
+        &mut stream,
+        &Command::Hello {
+            protocol_version: ELEMENTS_PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
+    let _: Response = read_message(&mut reader).unwrap().unwrap();
+
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: bad.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    match read_message::<_, Response>(&mut reader).unwrap().unwrap() {
+        Response::Error(e) => assert_eq!(e.kind, ErrorKind::Document),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // The session must still be usable: a valid graph loads normally.
+    let good = graph_file(dir.path());
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: good.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message::<_, Response>(&mut reader).unwrap().unwrap(),
+        Response::Loaded { .. }
+    ));
+}
+
+#[test]
+fn rendering_before_hello_is_refused() {
+    let daemon = Daemon::start();
+    let mut stream = daemon.connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    write_message(&mut stream, &Command::Render { frame: 1 }).unwrap();
+    match read_message::<_, Response>(&mut reader).unwrap().unwrap() {
+        Response::Error(e) => assert_eq!(e.kind, ErrorKind::ProtocolVersion),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[test]
 fn repeated_renders_advance_the_sequence() {
     let daemon = Daemon::start();
     let dir = tempfile::tempdir().unwrap();

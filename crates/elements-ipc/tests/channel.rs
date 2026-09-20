@@ -129,6 +129,41 @@ fn a_truncated_channel_file_is_rejected() {
 }
 
 #[test]
+fn absurd_dims_report_field_too_large_instead_of_overflowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frame.bin");
+
+    match FrameWriter::create(&path, [3_000_000, 3_000_000, 3_000_000], 1) {
+        Err(ChannelError::FieldTooLarge { .. }) => {}
+        Err(other) => panic!("expected FieldTooLarge, got {other:?}"),
+        Ok(_) => panic!("expected FieldTooLarge, got Ok"),
+    }
+}
+
+#[test]
+fn a_reader_detects_a_reallocated_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frame.bin");
+
+    let mut writer = FrameWriter::create(&path, [8, 8, 8], 1).unwrap();
+    writer.publish(&[1.0; 512]).unwrap();
+
+    let reader = FrameReader::open(&path).unwrap();
+    let (seq, values) = reader.read_latest().unwrap();
+    assert_eq!(seq, 1);
+    assert_eq!(values, vec![1.0; 512]);
+
+    // Reallocate the channel in place at the same path with different dims,
+    // as `daemon::load` does on a resolution change.
+    let _new_writer = FrameWriter::create(&path, [4, 4, 4], 1).unwrap();
+
+    match reader.read_latest() {
+        Err(ChannelError::Reallocated) => {}
+        other => panic!("expected Reallocated, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_reader_survives_a_writer_publishing_concurrently() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frame.bin");

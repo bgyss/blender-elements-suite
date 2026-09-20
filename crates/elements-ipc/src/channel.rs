@@ -58,6 +58,12 @@ pub enum ChannelError {
     LengthMismatch { expected: usize, got: usize },
     #[error("the writer lapped the reader repeatedly")]
     Torn,
+    #[error("dims {dims:?} with {channels} channel(s) overflow the channel size computation")]
+    FieldTooLarge { dims: [u32; 3], channels: u32 },
+    #[error(
+        "the channel at this path was reallocated with different dims; the caller must reopen it"
+    )]
+    Reallocated,
 }
 
 /// The fixed-size channel header.
@@ -73,6 +79,39 @@ pub struct ChannelHeader {
 
 fn value_count(dims: [u32; 3], channels: u32) -> usize {
     dims[0] as usize * dims[1] as usize * dims[2] as usize * channels as usize
+}
+
+/// Compute `(values, buffer_bytes)` for `dims`/`channels` using checked
+/// arithmetic throughout, so a hostile document's dims cannot overflow this
+/// computation into a panic (under `overflow-checks = true`) or a silently
+/// wrapped, too-small allocation (in release). Everything is done in `u64`
+/// and only converted to `usize` — itself checked — at the very end.
+fn checked_value_count_and_bytes(
+    dims: [u32; 3],
+    channels: u32,
+) -> Result<(usize, usize), ChannelError> {
+    let too_large = || ChannelError::FieldTooLarge { dims, channels };
+
+    let values_u64 = (dims[0] as u64)
+        .checked_mul(dims[1] as u64)
+        .and_then(|v| v.checked_mul(dims[2] as u64))
+        .and_then(|v| v.checked_mul(channels as u64))
+        .ok_or_else(too_large)?;
+    let buffer_bytes_u64 = values_u64
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .ok_or_else(too_large)?;
+    // The total file size doubles the buffer (two alternating buffers) plus
+    // the header; make sure that fits too, even though only `values` and
+    // `buffer_bytes` are returned, so `create` cannot go on to overflow when
+    // it computes `total` from these.
+    buffer_bytes_u64
+        .checked_mul(2)
+        .and_then(|b| b.checked_add(CHANNEL_HEADER_BYTES as u64))
+        .ok_or_else(too_large)?;
+
+    let values = usize::try_from(values_u64).map_err(|_| too_large())?;
+    let buffer_bytes = usize::try_from(buffer_bytes_u64).map_err(|_| too_large())?;
+    Ok((values, buffer_bytes))
 }
 
 fn read_u32(map: &[u8], offset: usize) -> u32 {
@@ -123,8 +162,8 @@ pub struct FrameWriter {
 impl FrameWriter {
     /// Create (or truncate) the channel file and write its header.
     pub fn create(path: &Path, dims: [u32; 3], channels: u32) -> Result<Self, ChannelError> {
-        let values = value_count(dims, channels);
-        let buffer_bytes = values * std::mem::size_of::<f32>();
+        let (values, buffer_bytes) = checked_value_count_and_bytes(dims, channels)?;
+        // Already checked not to overflow by `checked_value_count_and_bytes`.
         let total = CHANNEL_HEADER_BYTES + 2 * buffer_bytes;
 
         if let Some(parent) = path.parent() {
@@ -216,6 +255,16 @@ impl FrameWriter {
 }
 
 /// The client side: maps the file read-only and samples the latest frame.
+///
+/// A client must reopen this channel after any `Response::Loaded` reporting
+/// dims different from the ones it opened with: the engine reallocates the
+/// backing file in place when the field's resolution changes, and an already
+/// open `FrameReader`'s cached buffer geometry goes stale. [`read_latest`]
+/// detects this (it re-reads the header every call and compares against what
+/// was cached at [`open`](FrameReader::open)) and returns
+/// [`ChannelError::Reallocated`] rather than reading stale bytes at wrong
+/// offsets or reading past the end of a shrunken mapping; it never recovers
+/// on its own; the caller must call `open` again to pick up the new geometry.
 #[derive(Debug)]
 pub struct FrameReader {
     map: memmap2::Mmap,
@@ -303,6 +352,26 @@ impl FrameReader {
     ///
     /// Returns sequence 0 and zeros if nothing has been published yet.
     pub fn read_latest(&self) -> Result<(u64, Vec<f32>), ChannelError> {
+        // Re-read the header fresh on every call, before touching any buffer
+        // offsets. The header always lives in the first `CHANNEL_HEADER_BYTES`
+        // bytes, which `open` already validated as within this mapping, so
+        // this is safe to read even if the file was since reallocated to a
+        // *smaller* size (whose buffers would otherwise be out of bounds for
+        // this stale mapping). If dims or buffer_bytes changed since `open`,
+        // the engine reallocated the channel out from under this reader and
+        // its cached geometry (and mapping) no longer describe the file;
+        // reading buffer offsets computed from either would be wrong at best
+        // and out of bounds at worst, so bail out before doing so.
+        let current_dims = [
+            read_u32(&self.map, OFF_DIMS),
+            read_u32(&self.map, OFF_DIMS + 4),
+            read_u32(&self.map, OFF_DIMS + 8),
+        ];
+        let current_buffer_bytes = read_u64(&self.map, OFF_BUFFER_BYTES);
+        if current_dims != self.header.dims || current_buffer_bytes != self.header.buffer_bytes {
+            return Err(ChannelError::Reallocated);
+        }
+
         for _ in 0..3 {
             // SAFETY: see `load_seq`; length/alignment established in `open`.
             let before = unsafe { load_seq(&self.map) };

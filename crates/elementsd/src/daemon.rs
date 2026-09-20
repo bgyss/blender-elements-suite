@@ -66,17 +66,38 @@ pub fn handle(session: &mut Session, command: Command) -> Response {
             }
         }
 
-        Command::LoadGraph { path } => match load(session, Path::new(&path)) {
-            Ok(response) => response,
-            Err(e) => Response::Error(e),
-        },
+        Command::LoadGraph { path } => {
+            if let Err(e) = require_greeted(session) {
+                return Response::Error(e);
+            }
+            match load(session, Path::new(&path)) {
+                Ok(response) => response,
+                Err(e) => Response::Error(e),
+            }
+        }
 
-        Command::Render { frame: _ } => match render(session) {
-            Ok(response) => response,
-            Err(e) => Response::Error(e),
-        },
+        Command::Render { frame: _ } => {
+            if let Err(e) = require_greeted(session) {
+                return Response::Error(e);
+            }
+            match render(session) {
+                Ok(response) => response,
+                Err(e) => Response::Error(e),
+            }
+        }
 
         Command::Shutdown => Response::Bye,
+    }
+}
+
+fn require_greeted(session: &Session) -> Result<(), EngineError> {
+    if session.greeted {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            ErrorKind::ProtocolVersion,
+            "client must send Hello first",
+        ))
     }
 }
 
@@ -98,8 +119,14 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
     };
     if needs_channel {
         session.writer = Some(
-            FrameWriter::create(&session.channel_path, [dims.x, dims.y, dims.z], 1)
-                .map_err(|e| EngineError::new(ErrorKind::Io, e.to_string()))?,
+            FrameWriter::create(&session.channel_path, [dims.x, dims.y, dims.z], 1).map_err(
+                |e| match e {
+                    elements_ipc::ChannelError::FieldTooLarge { .. } => {
+                        EngineError::new(ErrorKind::Document, e.to_string())
+                    }
+                    other => EngineError::new(ErrorKind::Io, other.to_string()),
+                },
+            )?,
         );
     }
 
@@ -150,10 +177,27 @@ fn render(session: &mut Session) -> Result<Response, EngineError> {
 }
 
 fn map_node_error(e: elements_core::graph::NodeError) -> EngineError {
+    use elements_core::gpu::GpuError;
     use elements_core::graph::NodeError;
     let kind = match &e {
+        NodeError::Gpu(GpuError::DeviceLost(_)) => ErrorKind::DeviceLost,
         NodeError::Gpu(_) => ErrorKind::Gpu,
         _ => ErrorKind::Graph,
     };
     EngineError::new(kind, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_node_error;
+    use elements_core::gpu::GpuError;
+    use elements_core::graph::NodeError;
+    use elements_ipc::ErrorKind;
+
+    #[test]
+    fn device_lost_maps_to_device_lost_not_a_generic_gpu_error() {
+        let e = NodeError::Gpu(GpuError::DeviceLost("test".into()));
+        let mapped = map_node_error(e);
+        assert_eq!(mapped.kind, ErrorKind::DeviceLost);
+    }
 }
