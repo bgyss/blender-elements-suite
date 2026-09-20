@@ -5959,6 +5959,10 @@ use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions, Stream as RawStream,
     ToFsName, ToNsName,
 };
+// `try_clone` is NOT in the local_socket prelude: it is a separate top-level
+// trait implemented on the concrete Stream enum. Verified against
+// interprocess 2.4.4.
+use interprocess::TryClone;
 
 use crate::ProtocolError;
 
@@ -6033,7 +6037,29 @@ impl Listener {
 }
 ```
 
-If `interprocess` 2.4's `try_clone` is not available on `Stream`, keep one `Stream` and construct the `BufReader` over a borrowed `&mut` reference instead, restructuring the daemon loop to read and write through the same handle sequentially. The tests use `try_clone` only for clarity.
+**Verified:** `Stream::try_clone` exists in `interprocess` 2.4.4, but comes from
+the top-level `interprocess::TryClone` trait rather than the `local_socket`
+prelude — importing only the prelude gives a confusing "method not found" error
+on a method that does exist.
+
+**A dropped readiness line makes the session tests HANG, not fail.** A hang is
+not a passing test and not a failing one; it yields no signal and stalls CI.
+Add a bounded test that reads the readiness line on a background thread with
+`mpsc::recv_timeout`, so the failure is deterministic and quick:
+
+```rust
+#[test]
+fn the_readiness_line_arrives_promptly_after_bind() {
+    // A missing or unflushed readiness line would otherwise hang every
+    // consumer indefinitely, including the Blender add-on.
+    let (tx, rx) = std::sync::mpsc::channel();
+    // ... spawn the daemon, read one line on a worker thread, send it ...
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("daemon did not announce readiness within 5s");
+    assert!(line.starts_with("ready "), "daemon said: {line}");
+}
+```
 
 Modify `crates/elements-ipc/src/lib.rs`, adding:
 
