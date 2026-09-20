@@ -1,9 +1,13 @@
 //! The node graph: connections, topological evaluation, and cycle detection.
 
+mod document;
 mod node;
+mod registry;
 mod socket;
 
+pub use document::{DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION};
 pub use node::{EvalCtx, Node, NodeError, Value};
+pub use registry::{NodeCtor, NodeRegistry};
 pub use socket::{NodeId, SocketId, SocketSpec, SocketType};
 
 use std::collections::HashMap;
@@ -25,6 +29,19 @@ pub struct Graph {
     /// Maps a destination input socket to the source output socket feeding it.
     edges: HashMap<SocketId, SocketId>,
     output: Option<NodeId>,
+}
+
+// `Node` trait objects don't implement `Debug`, so this can't be derived.
+// Kept intentionally shallow — it exists so `Result<(Graph, _), _>` can be
+// unwrapped/panicked on in tests, not as a graph-inspection tool.
+impl std::fmt::Debug for Graph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Graph")
+            .field("node_count", &self.nodes.len())
+            .field("edge_count", &self.edges.len())
+            .field("output", &self.output)
+            .finish()
+    }
 }
 
 impl Graph {
@@ -224,7 +241,9 @@ impl Graph {
                 inputs,
                 taken,
             };
-            let outputs = node.eval(&mut ctx)?;
+            let outputs = node
+                .eval(&mut ctx)
+                .map_err(|err| err.with_evaluating_node(id))?;
             produced.insert(id, outputs.into_iter().map(Some).collect());
         }
 

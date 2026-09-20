@@ -49,6 +49,33 @@ impl std::fmt::Debug for Value {
     }
 }
 
+impl NodeError {
+    /// Fill in the node actually being evaluated when the error was raised
+    /// from inside a bare `Value` (which does not know its own position).
+    ///
+    /// `Value::as_field`/`as_scalar` cannot name the node they belong to, so
+    /// they stamp `NodeId(u32::MAX)` as a sentinel. `Graph::eval` calls this
+    /// on every error a node's `eval` returns, replacing that sentinel with
+    /// the id it was actually evaluating, so a type-mismatch bug inside a
+    /// node reports which node failed instead of a meaningless
+    /// `NodeId(4294967295)`. Errors that already name a real node pass
+    /// through unchanged.
+    pub(crate) fn with_evaluating_node(self, node: NodeId) -> Self {
+        match self {
+            Self::TypeMismatch {
+                node: NodeId(u32::MAX),
+                index,
+                expected,
+            } => Self::TypeMismatch {
+                node,
+                index,
+                expected,
+            },
+            other => other,
+        }
+    }
+}
+
 impl Value {
     pub fn as_field(&self) -> Result<&Field, NodeError> {
         match self {

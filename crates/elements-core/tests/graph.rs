@@ -330,6 +330,60 @@ fn input_after_take_input_reports_the_input_was_taken() {
     );
 }
 
+/// A buggy node: declares a scalar input but reads it as a field, which
+/// `Value::as_field` cannot attribute to a node on its own (it stamps a
+/// sentinel `NodeId(u32::MAX)`). Used to prove `Graph::eval` fills in the
+/// real node id before the error leaves the graph.
+struct WrongType;
+
+impl Node for WrongType {
+    fn kind(&self) -> &'static str {
+        "test.wrong_type"
+    }
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Scalar],
+            outputs: vec![SocketType::Scalar],
+        }
+    }
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let _ = ctx.input(0)?.as_field()?;
+        unreachable!("as_field on a Scalar should have errored")
+    }
+}
+
+#[test]
+fn a_type_mismatch_inside_a_node_names_that_node() {
+    let mut g = Graph::new();
+    let lit = g.add_node(Box::new(Literal(1.0)));
+    let bug = g.add_node(Box::new(WrongType));
+
+    g.connect(
+        SocketId {
+            node: lit,
+            index: 0,
+        },
+        SocketId {
+            node: bug,
+            index: 0,
+        },
+    )
+    .unwrap();
+    g.set_output(bug);
+
+    let (gpu, mut pool, mut pipelines) = harness();
+    let err = g
+        .eval(&gpu, &mut pool, &mut pipelines, FieldDims::new(4, 4, 4))
+        .unwrap_err();
+    match err {
+        NodeError::TypeMismatch { node, .. } => assert_eq!(
+            node, bug,
+            "the error should name the node that was actually evaluating, not a sentinel"
+        ),
+        other => panic!("expected TypeMismatch, got {other:?}"),
+    }
+}
+
 #[test]
 fn eval_without_an_output_is_an_error() {
     let g = Graph::new();
