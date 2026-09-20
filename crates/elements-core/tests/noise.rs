@@ -33,8 +33,26 @@ fn noise_stays_in_range_and_is_finite() {
     assert_eq!(values.len(), 16 * 16 * 16);
     for v in &values {
         assert!(v.is_finite(), "noise produced a non-finite value: {v}");
-        assert!((-1.001..=1.001).contains(v), "noise escaped [-1, 1]: {v}");
+        // Three octaves at amplitudes 0.5/0.25/0.125 bound the sum to
+        // [-0.875, 0.875] given hash3's [-1, 1] range and the trilinear
+        // weights' partition of unity. 0.876 leaves a small epsilon for
+        // float error while still catching a change to the amplitudes or
+        // the hash range.
+        assert!(
+            (-0.876..=0.876).contains(v),
+            "noise escaped the analytic bound [-0.875, 0.875]: {v}"
+        );
     }
+}
+
+#[test]
+fn seeds_that_collide_under_xor_produce_different_fields() {
+    let a = noise_values(0x0000_0001_0000_0000u64, 4.0);
+    let b = noise_values(0x0000_0000_0000_0001u64, 4.0);
+    assert_ne!(
+        a, b,
+        "seeds that collide under plain XOR of their halves must still produce different fields"
+    );
 }
 
 #[test]

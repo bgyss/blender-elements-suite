@@ -60,7 +60,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let uvw = (vec3<f32>(gid) + vec3<f32>(0.5)) / vec3<f32>(params.dims);
-    let seed = params.seed_lo ^ params.seed_hi;
+    // Mix with a large odd multiplier rather than plain XOR: XOR of the two
+    // halves collapses distinct u64 seeds that share the same halves in
+    // swapped positions (e.g. 0x00000001_00000000 and 0x00000000_00000001
+    // both XOR to 1), which silently defeats determinism-by-seed.
+    let seed = params.seed_lo ^ (params.seed_hi * 0x9e3779b9u);
 
     var value: f32 = 0.0;
     var amplitude: f32 = 0.5;
@@ -71,6 +75,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         freq = freq * 2.0;
     }
 
-    // Three octaves at 0.5/0.25/0.125 sum to at most 0.875; clamp defensively.
+    // Three octaves at 0.5/0.25/0.125 sum to at most 0.875, so this clamp is
+    // unreachable by construction with the current amplitudes: hash3 is
+    // bounded to [-1, 1], the trilinear weights partition unity, and the
+    // per-octave amplitudes bound the sum to [-0.875, 0.875]. It stays as a
+    // defensive guard in case a future change to the octave count or
+    // amplitudes makes it reachable; it costs nothing at runtime.
     textureStore(field, vec3<i32>(gid), vec4<f32>(clamp(value, -1.0, 1.0), 0.0, 0.0, 0.0));
 }
