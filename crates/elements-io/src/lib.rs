@@ -4,6 +4,7 @@
 
 mod npy;
 mod preview;
+pub mod vdb;
 
 pub use npy::{read_npy, write_npy};
 pub use preview::write_slice_png;
@@ -21,4 +22,6 @@ pub enum IoError {
     BadSlice { z: u32, depth: u32 },
     #[error("expected {expected} values, got {got}")]
     LengthMismatch { expected: usize, got: usize },
+    #[error("field {dims:?} exceeds the 4096^3 limit of a single root child")]
+    FieldTooLarge { dims: [u32; 3] },
 }
