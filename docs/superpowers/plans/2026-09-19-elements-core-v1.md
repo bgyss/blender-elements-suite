@@ -3449,14 +3449,16 @@ Modify `crates/elements-io/Cargo.toml` `[dev-dependencies]`:
 
 ```toml
 [dev-dependencies]
-glam = "0.29"
+glam = "0.24"  # the version vdb-rs 0.6.0 re-exports; 0.29 puts two incompatible glam crates in the graph
 tempfile.workspace = true
 vdb-rs.workspace = true
 ```
 
 `vdb-rs` pulls in `blosc-src`, which needs a C compiler in CI. `ubuntu-24.04` has one. If the build fails for want of `libblosc`, add `sudo apt-get install -y libblosc-dev` to the CI install step. `vdb-rs` is a dev-dependency only and never ships in the engine.
 
-`glam` must match the version `vdb-rs` re-exports in its public API, or the `IVec3` comparison will not type-check. If `cargo test` reports two `glam` versions, run `cargo tree -p vdb-rs | grep glam` and pin this entry to that version.
+**Verified:** `vdb-rs` 0.6.0 re-exports `glam` **0.24.2**. Pinning 0.29 puts two
+incompatible `glam` crates in the graph and the `IVec3` assertions fail to
+type-check.
 
 - [ ] **Step 4: Implement the byte writer**
 
