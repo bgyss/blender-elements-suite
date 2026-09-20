@@ -1,4 +1,6 @@
-use elements_ipc::{CHANNEL_HEADER_BYTES, CHANNEL_MAGIC, ChannelError, FrameReader, FrameWriter};
+use elements_ipc::{
+    CHANNEL_HEADER_BYTES, CHANNEL_MAGIC, CHANNEL_VERSION, ChannelError, FrameReader, FrameWriter,
+};
 
 #[test]
 fn publish_then_read_returns_the_values() {
@@ -22,6 +24,8 @@ fn the_header_describes_the_field() {
     let path = dir.path().join("frame.bin");
 
     let mut writer = FrameWriter::create(&path, [2, 3, 4], 1).unwrap();
+    assert_eq!(writer.dims(), [2, 3, 4]);
+    assert_eq!(writer.channels(), 1);
     writer.publish(&[0.0; 24]).unwrap();
 
     let reader = FrameReader::open(&path).unwrap();
@@ -96,6 +100,31 @@ fn a_foreign_file_is_rejected_by_magic() {
     match FrameReader::open(&path) {
         Err(ChannelError::BadMagic { .. }) => {}
         other => panic!("expected BadMagic, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_truncated_channel_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("truncated.bin");
+
+    // A valid 64-byte header claiming a large `buffer_bytes`, with no buffer
+    // data following it at all. This mimics a process crashing mid-write, or
+    // a hand-built fixture with a wrong declared size.
+    let mut header = vec![0u8; CHANNEL_HEADER_BYTES];
+    header[0..4].copy_from_slice(&CHANNEL_MAGIC.to_le_bytes());
+    header[4..8].copy_from_slice(&CHANNEL_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&4u32.to_le_bytes());
+    header[12..16].copy_from_slice(&4u32.to_le_bytes());
+    header[16..20].copy_from_slice(&4u32.to_le_bytes());
+    header[20..24].copy_from_slice(&1u32.to_le_bytes());
+    header[24..32].copy_from_slice(&1_000_000u64.to_le_bytes());
+    header[32..40].copy_from_slice(&0u64.to_le_bytes());
+    std::fs::write(&path, &header).unwrap();
+
+    match FrameReader::open(&path) {
+        Err(ChannelError::LengthMismatch { .. }) => {}
+        other => panic!("expected LengthMismatch, got {other:?}"),
     }
 }
 

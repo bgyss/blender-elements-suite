@@ -9,6 +9,26 @@
 //! Protocol: the writer fills buffer `seq % 2`, then increments `seq`. A reader
 //! samples `seq`, reads buffer `(seq - 1) % 2`, and re-samples `seq`; if it
 //! changed, the writer lapped it and the read is retried.
+//!
+//! # Soundness caveat
+//!
+//! This is a seqlock, and a seqlock is not fully soundly expressible in safe
+//! Rust. The buffer copies in [`FrameWriter::publish`] and
+//! [`FrameReader::read_latest`] are ordinary, non-atomic accesses to the same
+//! memory, made through safe indexing APIs. When the writer begins
+//! overwriting the exact buffer a reader is mid-copy of, both threads are
+//! touching overlapping memory without synchronization on those bytes
+//! themselves — only `seq` is atomic. Under the strict Rust/C++ abstract
+//! memory model, that is a data race, which is formally undefined behavior,
+//! even though the sequence-number recheck afterwards always detects and
+//! discards any torn read: no incorrect data is ever returned to a caller.
+//! This is why the design cannot be expressed with only safe accesses to the
+//! buffer bytes; it works in practice on real hardware and compilers and is a
+//! well-known pattern in production systems code, but it is a residual,
+//! model-level unsoundness inherent to the seqlock design itself, not a bug
+//! in this implementation. The alternative, a lock around the buffer, was
+//! rejected: the writer must never block on a slow reader, and a lock would
+//! make that possible.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -123,7 +143,11 @@ impl FrameWriter {
         // mmap hazard of a file being truncated by another process
         // afterwards is out of scope: this file is private to this channel
         // and nothing else in this codebase resizes it). No other mapping of
-        // this file exists yet in this process.
+        // this file exists yet *from this call*, at this instant — a
+        // `FrameReader::open` racing this `create` (deliberately exercised by
+        // the concurrency test) will map the same file concurrently once this
+        // call returns, which is expected and is exactly what the seqlock
+        // protocol above is designed to make safe.
         let mut map = unsafe { memmap2::MmapMut::map_mut(&file)? };
 
         map[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&CHANNEL_MAGIC.to_le_bytes());
@@ -204,12 +228,17 @@ impl FrameReader {
     pub fn open(path: &Path) -> Result<Self, ChannelError> {
         let file = std::fs::File::open(path)?;
         // SAFETY: a concurrent writer may modify these bytes through its own
-        // mapping of the same file, which is the point of this channel; every
-        // read of mutable header/buffer state goes through `load_seq` (an
-        // atomic acquire load) or `read_latest`'s seqlock retry, which
-        // validates the sequence number before and after copying out a
-        // buffer, so no reader ever observes a partially-written value as if
-        // it were complete.
+        // mapping of the same file, which is the point of this channel. It is
+        // not only `seq`'s atomic access and the creation of this mapping
+        // that are unsafe here: the buffer copies in `read_latest` are also
+        // concurrently-racing accesses with the writer's buffer copies in
+        // `publish`, even though they go through safe indexing APIs — see the
+        // "Soundness caveat" section of the module docs. `load_seq` (an
+        // atomic acquire load) and `read_latest`'s seqlock retry validate the
+        // sequence number before and after copying out a buffer, so no
+        // reader ever returns a partially-written value to its caller as if
+        // it were complete, but the copy itself is not race-free under the
+        // abstract memory model.
         let map = unsafe { memmap2::Mmap::map(&file)? };
 
         if map.len() < CHANNEL_HEADER_BYTES {
@@ -232,6 +261,20 @@ impl FrameReader {
         let channels = read_u32(&map, OFF_CHANNELS);
         let buffer_bytes = read_u64(&map, OFF_BUFFER_BYTES) as usize;
         let values = value_count(dims, channels);
+
+        // `buffer_bytes` was just read from the file, which this crate did
+        // not necessarily write (a crashed process may have left a truncated
+        // file mid-write, or a test/fixture may hand-build one with a wrong
+        // size). It must be validated against the real mapping length before
+        // it is ever used to slice into `map`, or a malformed file turns
+        // into an out-of-bounds panic in `read_latest` instead of an error.
+        let expected = CHANNEL_HEADER_BYTES + 2 * buffer_bytes;
+        if map.len() < expected {
+            return Err(ChannelError::LengthMismatch {
+                expected,
+                got: map.len(),
+            });
+        }
 
         Ok(Self {
             header: ChannelHeader {
