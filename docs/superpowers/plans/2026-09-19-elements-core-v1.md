@@ -6,7 +6,9 @@
 
 **Architecture:** An out-of-process daemon (`elementsd`) owns a `wgpu` device and evaluates a serialized `.elements` node graph. A control plane of newline-delimited JSON over a Unix domain socket (named pipe on Windows) carries commands; a memory-mapped double-buffered file carries field data. A pure-Python Blender addon reads both with the standard library only.
 
-**Tech Stack:** Rust 2024 edition, `wgpu` 30.0.1, `pollster` 1.0.1, `serde`/`serde_json` 1.x, `memmap2` 0.9.11, `bytemuck` 1.25.2, `half` 2.7.1, `png` 0.18.1, `ndarray-npy` 0.10.0, `clap` 4.6.7, `thiserror` 2.0.20, `anyhow` 1.0.104. Dev-only: `vdb-rs` 0.6.0 (read-back oracle), `tempfile` 3.27.0, `approx` 0.5.1. Python 3.11+ standard library for the addon.
+**Tech Stack:** Rust 2024 edition, `wgpu` 30.0.1, `pollster` 1.0.1, `serde`/`serde_json` 1.x, `memmap2` 0.9.11, `bytemuck` 1.25.2, `half` 2.7.1, `png` 0.18.1, `ndarray-npy` 0.10.0, `clap` 4.6.7, `thiserror` 2.0.20, `anyhow` 1.0.104. Dev-only: `vdb-rs` 0.6.0 (read-back oracle), `tempfile` 3.27.0, `approx` 0.5.1. Python 3.11 standard library for the addon (Blender 5.0's version).
+
+**Tooling:** `mise` pins python/ruff/uv/just/cargo-nextest; `rustup` owns the Rust toolchain via `rust-toolchain.toml`; `flake.nix` offers the same environment to Nix users and CI; `just` is the task interface (`just check` gates every commit); `ruff` lints and formats all Python; `cargo nextest` runs Rust tests in isolated processes, which keeps a GPU device-lost in one test from poisoning others.
 
 ---
 
@@ -37,7 +39,9 @@ Every task's requirements implicitly include this section.
 - **Protocol version constant is `ELEMENTS_PROTOCOL_VERSION: u32 = 1`.** Every control message carries it.
 - **Document format version constant is `ELEMENTS_DOC_VERSION: u32 = 1`.** Any PR changing the `.elements` schema must bump it and add a migration test.
 - **Blender extension packaging:** `__init__.py` and `blender_manifest.toml` at the ZIP root, nothing nested under a package directory; relative imports only inside the addon package.
-- **CI runs on lavapipe** (software Vulkan). Set `WGPU_BACKEND=vulkan` and `LIBGL_ALWAYS_SOFTWARE=1`; tests requiring a device call `GpuContext::new_headless()`.
+- **CI runs on lavapipe** (software Vulkan) via `just ci-test`, which sets `WGPU_BACKEND=vulkan` and `LIBGL_ALWAYS_SOFTWARE=1`. These variables are CI-only: `WGPU_BACKEND=vulkan` is wrong on macOS, where the backend is Metal. Tests requiring a device call `GpuContext::new_headless()`.
+- **`just check` must pass before every commit.** It runs `cargo fmt --check`, `clippy -D warnings`, `ruff check`, and the full test suite.
+- **All Python targets 3.11** and is formatted and linted with `ruff`.
 - **Commit style:** conventional commits (`feat:`, `test:`, `fix:`, `chore:`). Commit at the end of every task.
 
 ---
@@ -104,14 +108,30 @@ tests/blender/test_roundtrip.py     run under `blender --background --python`
 
 ---
 
-## Task 1: Workspace scaffolding and CI
+## Task 1: Toolchain, workspace scaffolding and CI
 
 **Files:**
-- Create: `Cargo.toml`, `rust-toolchain.toml`, `.github/workflows/ci.yml`, `crates/elements-core/Cargo.toml`, `crates/elements-core/src/lib.rs`, `crates/elements-core/tests/smoke.rs`, `LICENSE-APACHE`, `LICENSE-MIT`, `.gitignore`
+- Create: `mise.toml`, `.envrc`, `flake.nix`, `justfile`, `ruff.toml`, `rust-toolchain.toml`, `Cargo.toml`, `.github/workflows/ci.yml`, `crates/elements-core/Cargo.toml`, `crates/elements-core/src/lib.rs`, `crates/elements-core/tests/smoke.rs`, `LICENSE-APACHE`, `LICENSE-MIT`, `.gitignore`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a compiling workspace with `elements-core` and the shared dependency table every later task adds to.
+- Produces: a compiling workspace, a pinned toolchain reproducible through either `mise` or `nix`, a `just` task interface every later task and CI invokes, and the shared dependency table later tasks add to.
+
+**Toolchain ownership, to avoid two managers fighting over one tool:**
+
+| Tool | Managed by | Why |
+|---|---|---|
+| Rust toolchain, `cargo`, `clippy`, `rustfmt` | `rustup` via `rust-toolchain.toml` | Cargo reads this file natively; `mise` managing Rust as well would shadow it |
+| `python`, `ruff`, `uv`, `just`, `cargo-nextest` | `mise` via `mise.toml` | Already active on this machine, and `cargo-nextest` currently has a shim with no version set |
+| Everything, reproducibly, for CI and Nix users | `flake.nix` | An alternative entry point, not a second source of truth |
+
+**Python version:** 3.11, because Blender 5.0 ships Python 3.11 and the add-on
+must import cleanly there. The system Python is newer; pinning 3.11 is what
+catches accidental use of later syntax.
+
+**GPU environment variables are CI-only.** `WGPU_BACKEND=vulkan` is correct for
+lavapipe on Linux and wrong on macOS, where the backend is Metal. They belong in
+the CI workflow and the `just ci-test` recipe, never in `mise.toml`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -127,9 +147,167 @@ fn crate_version_is_exposed() {
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p elements-core --test smoke`
-Expected: FAIL — `error: failed to load manifest` (no workspace yet).
+Expected: FAIL — `error: failed to load manifest` or `could not find Cargo.toml` (no workspace yet).
 
-- [ ] **Step 3: Create the workspace manifest**
+- [ ] **Step 3: Pin the toolchain**
+
+Create `rust-toolchain.toml`:
+
+```toml
+[toolchain]
+channel = "1.93"
+components = ["rustfmt", "clippy"]
+```
+
+Create `mise.toml`:
+
+```toml
+# Rust is deliberately absent: rustup owns it via rust-toolchain.toml.
+[tools]
+python = "3.11"        # Blender 5.0's Python; the oldest version the add-on must import on
+ruff = "latest"
+uv = "latest"
+just = "latest"
+"cargo:cargo-nextest" = "latest"
+
+[env]
+# Keep cargo's target dir out of the addon tree so build_addon.py never sees it.
+CARGO_TERM_COLOR = "always"
+```
+
+Create `.envrc`:
+
+```bash
+use mise
+```
+
+Run: `mise install && direnv allow`
+Expected: python 3.11, ruff, uv, just and cargo-nextest all resolve.
+
+Verify: `mise exec -- python --version` prints `Python 3.11.x`.
+
+- [ ] **Step 4: Add the Nix entry point**
+
+Create `flake.nix`:
+
+```nix
+{
+  description = "Elements Suite: real-time GPU field simulation for Blender";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+      in {
+        devShells.default = pkgs.mkShell {
+          # Rust comes from rustup so rust-toolchain.toml stays authoritative.
+          packages = with pkgs; [
+            rustup
+            python311
+            ruff
+            uv
+            just
+            cargo-nextest
+            pkg-config
+          ] ++ lib.optionals stdenv.isLinux [
+            # Software Vulkan, so `cargo test` works in a Nix shell and in CI.
+            mesa
+            vulkan-loader
+            vulkan-tools
+          ];
+
+          shellHook = ''
+            export RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          '' + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            export VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json
+            export LD_LIBRARY_PATH=${pkgs.vulkan-loader}/lib:$LD_LIBRARY_PATH
+          '';
+        };
+      });
+}
+```
+
+Run: `nix flake check` (or `nix develop --command just --version` if `flake check` is slow).
+Expected: the flake evaluates without error.
+
+- [ ] **Step 5: Create the task interface**
+
+Create `justfile`. Every later task and CI runs these recipes rather than
+remembering flag combinations:
+
+```just
+# Elements Suite task runner. Run `just` to list recipes.
+
+default:
+    @just --list
+
+# Format Rust and Python.
+fmt:
+    cargo fmt --all
+    ruff format addon scripts tests
+
+# Lint everything, failing on any warning.
+lint:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    ruff check addon scripts tests
+
+# Run the Rust test suite on this machine's native GPU backend.
+test:
+    cargo nextest run --workspace
+
+# Run the Rust test suite the way CI does, on software Vulkan.
+ci-test:
+    WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 cargo nextest run --workspace
+
+# Everything a commit must pass.
+check: lint test
+
+# Build and verify the Blender extension ZIP.
+addon:
+    python scripts/build_addon.py
+
+# Regenerate golden files. Review the PNG by eye before committing.
+golden:
+    cargo run -p elements-cli -- dump-npy tests/graphs/noise_8.elements \
+        --out crates/elements-cli/tests/golden/noise_8.npy
+    cargo run -p elements-cli -- render-preview tests/graphs/noise_8.elements \
+        --slice-z 4 --range -1,1 --out crates/elements-cli/tests/golden/noise_8_z4.png
+
+# Run the Blender integration test. Requires BLENDER_BIN.
+blender-test:
+    BLENDER_BIN="${BLENDER_BIN:-$(command -v blender)}" \
+        cargo test -p elementsd --test blender_integration -- --nocapture
+```
+
+`cargo nextest` replaces `cargo test` in these recipes because it runs each test
+in its own process. That matters here: several tests acquire a GPU device, and
+process isolation keeps a device-lost in one test from poisoning others.
+
+Individual task steps in this plan give `cargo test` commands for precision when
+running a single test. `just check` is what gates a commit.
+
+Create `ruff.toml`:
+
+```toml
+# Blender 5.0 ships Python 3.11; the add-on must import cleanly there.
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[lint.per-file-ignores]
+# Blender's API is injected at runtime; bpy imports resolve only inside Blender.
+"addon/**" = ["E402"]
+```
+
+- [ ] **Step 6: Create the workspace and crate**
 
 Create `Cargo.toml`:
 
@@ -168,19 +346,8 @@ opt-level = 1
 opt-level = 3
 ```
 
-`opt-level = 1` on our own code with `3` on dependencies keeps golden tests on lavapipe tolerable without slowing incremental builds.
-
-- [ ] **Step 4: Create the toolchain pin**
-
-Create `rust-toolchain.toml`:
-
-```toml
-[toolchain]
-channel = "1.93"
-components = ["rustfmt", "clippy"]
-```
-
-- [ ] **Step 5: Create the crate**
+`opt-level = 1` on our own code with `3` on dependencies keeps golden tests on
+software Vulkan tolerable without slowing incremental builds.
 
 Create `crates/elements-core/Cargo.toml`:
 
@@ -208,22 +375,40 @@ Create `crates/elements-core/src/lib.rs`:
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [ ] **Step 7: Run the test to verify it passes**
 
 Run: `cargo test -p elements-core --test smoke`
 Expected: PASS — `test crate_version_is_exposed ... ok`.
 
-- [ ] **Step 7: Add licences and gitignore**
-
-Download the standard texts:
+- [ ] **Step 8: Add licences and gitignore**
 
 ```bash
 curl -sL https://www.apache.org/licenses/LICENSE-2.0.txt -o LICENSE-APACHE
-printf 'MIT License\n\nCopyright (c) 2026 Elements Suite contributors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the "Software"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n' > LICENSE-MIT
-printf 'target/\n*.vdb\n*.npy\n*.png\n!tests/**/*.npy\n!tests/**/*.png\ndist/\n__pycache__/\n' > .gitignore
 ```
 
-- [ ] **Step 8: Create the CI workflow**
+Write `LICENSE-MIT` with the standard MIT text, copyright `2026 Elements Suite contributors`.
+
+Create `.gitignore`:
+
+```gitignore
+/target/
+/dist/
+/result
+.direnv/
+__pycache__/
+.venv/
+*.vdb
+*.npy
+*.png
+!crates/*/tests/golden/*.npy
+!crates/*/tests/golden/*.png
+.superpowers/
+```
+
+The negated patterns keep committed golden files tracked while ignoring the
+throwaway `.npy` and `.png` that every local run produces.
+
+- [ ] **Step 9: Create the CI workflow**
 
 Create `.github/workflows/ci.yml`:
 
@@ -240,34 +425,53 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
       - uses: Swatinem/rust-cache@v2
-      - name: Install lavapipe
+
+      - name: Install software Vulkan
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1 libblosc-dev
           vulkaninfo --summary | head -40
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        env:
-          WGPU_BACKEND: vulkan
-          LIBGL_ALWAYS_SOFTWARE: 1
-        run: cargo test --workspace
+
+      - name: Lint
+        run: just lint
+
+      - name: Test on lavapipe
+        run: just ci-test
+
+      - name: Build the Blender extension
+        run: just addon
 ```
 
-- [ ] **Step 9: Verify the whole workspace is clean**
+`mise-action` installs exactly the tools `mise.toml` pins, so CI and a developer
+machine run the same `ruff`, `python` and `just`. Rust still comes from the
+rustup action, honouring `rust-toolchain.toml`.
 
-Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
-Expected: all three succeed; one test passes.
+- [ ] **Step 10: Verify the whole toolchain end to end**
 
-- [ ] **Step 10: Commit**
+Run: `just check`
+Expected: `cargo fmt --check` clean, `clippy` clean, `ruff check` clean (no
+Python files yet, which ruff reports as success), one test passing under
+`cargo nextest`.
+
+Run: `just --list`
+Expected: every recipe above is listed.
+
+- [ ] **Step 11: Commit**
 
 ```bash
-git add Cargo.toml rust-toolchain.toml .github .gitignore LICENSE-APACHE LICENSE-MIT crates
-git commit -m "chore: scaffold Rust workspace and lavapipe CI"
+git add Cargo.toml rust-toolchain.toml mise.toml flake.nix justfile ruff.toml \
+        .envrc .gitignore .github LICENSE-APACHE LICENSE-MIT crates
+git commit -m "chore: pin toolchain with mise and nix, scaffold workspace and CI"
 ```
 
 ---
@@ -1381,8 +1585,8 @@ Expected: PASS — four tests ok.
 
 - [ ] **Step 6: Verify the whole workspace still passes**
 
-Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && WGPU_BACKEND=vulkan cargo test --workspace`
-Expected: clean.
+Run: `just check`
+Expected: clean — fmt, clippy, ruff and the full test suite.
 
 - [ ] **Step 7: Commit**
 
@@ -4014,8 +4218,8 @@ Expected: PASS — six tests ok.
 
 - [ ] **Step 5: Verify the whole crate and workspace**
 
-Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && WGPU_BACKEND=vulkan cargo test --workspace`
-Expected: clean.
+Run: `just check`
+Expected: clean — fmt, clippy, ruff and the full test suite.
 
 - [ ] **Step 6: Commit**
 
@@ -4416,8 +4620,8 @@ fn run() -> anyhow::Result<()> {
 The golden `.npy` is generated *once* by the implementation, then reviewed and committed. Generate it, then inspect the PNG before trusting it:
 
 ```bash
-mkdir -p crates/elements-cli/tests/golden
-cat > /tmp/noise.elements <<'GRAPH'
+mkdir -p crates/elements-cli/tests/golden tests/graphs
+cat > tests/graphs/noise_8.elements <<'GRAPH'
 {
   "version": 1,
   "dims": [8, 8, 8],
@@ -4429,11 +4633,12 @@ cat > /tmp/noise.elements <<'GRAPH'
   "output": 1
 }
 GRAPH
-WGPU_BACKEND=vulkan cargo run -p elements-cli -- dump-npy /tmp/noise.elements \
-  --out crates/elements-cli/tests/golden/noise_8.npy
-WGPU_BACKEND=vulkan cargo run -p elements-cli -- render-preview /tmp/noise.elements \
-  --slice-z 4 --range -1,1 --out crates/elements-cli/tests/golden/noise_8_z4.png
+just golden
 ```
+
+The graph fixture is committed at `tests/graphs/noise_8.elements` rather than
+written to a temp path, because `just golden` must be re-runnable by anyone and
+a golden that cannot be regenerated from a tracked input is not reproducible.
 
 Open `noise_8_z4.png`. It must look like smooth structured noise, not uniform grey (a dead shader), not salt-and-pepper (a broken hash), and not a hard-edged grid (a workgroup bounds bug). **Do not commit a golden you have not looked at.** A golden file blesses whatever the code did, including a bug.
 
@@ -6320,17 +6525,18 @@ class FrameReader:
 Run: `WGPU_BACKEND=vulkan cargo test -p elementsd --test python_contract`
 Expected: PASS — `the_python_client_speaks_the_real_protocol ... ok`.
 
-- [ ] **Step 5: Add Python to CI**
+- [ ] **Step 5: Confirm CI runs this on Blender's Python**
 
-Modify `.github/workflows/ci.yml`, adding before the test step:
+No workflow change is needed: `mise.toml` from Task 1 pins `python = "3.11"` and
+`jdx/mise-action` installs it, so CI already runs the contract test on Blender
+5.0's Python version. Verify rather than assume:
 
-```yaml
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-```
+Run: `mise exec -- python --version`
+Expected: `Python 3.11.x`.
 
-3.11 is Blender 5.0's Python; testing against the oldest supported version is what catches accidental use of newer syntax.
+Run: `mise exec -- python tests/python/contract.py` with no arguments
+Expected: an `IndexError` from `sys.argv`, proving the module imports cleanly on
+3.11 before the daemon is even involved.
 
 - [ ] **Step 6: Commit**
 
@@ -6540,7 +6746,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 3: Run the build to verify it fails**
 
-Run: `python3 scripts/build_addon.py`
+Run: `just addon`
 Expected: FAIL — `archive root is missing ['__init__.py', 'blender_manifest.toml']`.
 
 - [ ] **Step 4: Write the manifest and properties**
@@ -6999,7 +7205,7 @@ this task — an unverified live path is an open item, not a done one.
 
 - [ ] **Step 6: Build and verify the archive layout**
 
-Run: `python3 scripts/build_addon.py`
+Run: `just addon`
 Expected: `built .../dist/blender_elements-0.1.0.zip with 7 files`, no layout error.
 
 Verify independently, exactly as the project's packaging rule requires:
@@ -7027,10 +7233,7 @@ rm -rf "$HOME/Library/Application Support/Blender/4.2/extensions/user_default/bl
 
 Run:
 ```bash
-cargo fmt --all && \
-cargo clippy --workspace --all-targets -- -D warnings && \
-WGPU_BACKEND=vulkan cargo test --workspace && \
-python3 scripts/build_addon.py
+just check && just addon
 ```
 Expected: all clean.
 
