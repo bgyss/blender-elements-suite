@@ -1,8 +1,10 @@
 //! GPU device acquisition and error-scope handling.
 
+mod dispatch;
 mod field;
 mod pool;
 
+pub use dispatch::{PipelineCache, WORKGROUP, dispatch_over_field, fill_constant};
 pub use field::{Field, FieldDims, FieldFormat};
 pub use pool::FieldPool;
 
