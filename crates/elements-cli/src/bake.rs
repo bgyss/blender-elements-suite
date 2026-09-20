@@ -44,6 +44,15 @@ pub fn parse_frames(spec: &str) -> anyhow::Result<(u32, u32)> {
 }
 
 /// Write one `.vdb` per frame into `out_dir`.
+///
+/// Each file is named `{name}.{frame:04}.vdb`. The frame number is
+/// zero-padded to AT LEAST four digits: `{:04}` in Rust (like `%04d` in
+/// ffmpeg, Houdini, and Nuke) is a *minimum* width, not a fixed one, so frame
+/// `10000` renders as five digits (`10000`), not four. A consumer that lists
+/// the output directory and sorts filenames lexicographically will therefore
+/// place `density.10000.vdb` before `density.9999.vdb` (`'1' < '9'`).
+/// Consumers MUST parse the numeric frame out of the filename and sort/compare
+/// numerically rather than relying on string/lexicographic order.
 pub fn bake(
     graph: &Path,
     out_dir: &Path,
@@ -61,4 +70,49 @@ pub fn bake(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_frames;
+
+    #[test]
+    fn parse_frames_accepts_a_single_frame() {
+        assert_eq!(parse_frames("5").unwrap(), (5, 5));
+    }
+
+    #[test]
+    fn parse_frames_accepts_a_range() {
+        assert_eq!(parse_frames("1-3").unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn parse_frames_accepts_a_single_point_range() {
+        assert_eq!(parse_frames("5-5").unwrap(), (5, 5));
+    }
+
+    #[test]
+    fn parse_frames_rejects_a_backwards_range() {
+        assert!(parse_frames("3-1").is_err());
+    }
+
+    #[test]
+    fn parse_frames_rejects_a_missing_range_end() {
+        assert!(parse_frames("1-").is_err());
+    }
+
+    #[test]
+    fn parse_frames_rejects_a_missing_range_start() {
+        assert!(parse_frames("-1").is_err());
+    }
+
+    #[test]
+    fn parse_frames_rejects_an_empty_string() {
+        assert!(parse_frames("").is_err());
+    }
+
+    #[test]
+    fn parse_frames_rejects_a_number_that_overflows_u32() {
+        assert!(parse_frames("99999999999999999999").is_err());
+    }
 }

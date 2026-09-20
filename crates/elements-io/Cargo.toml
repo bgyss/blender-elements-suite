@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 half.workspace = true
-ndarray = "0.17.2"
+ndarray.workspace = true
 ndarray-npy.workspace = true
 png.workspace = true
 thiserror.workspace = true

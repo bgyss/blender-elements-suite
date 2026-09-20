@@ -26,6 +26,11 @@ enum Commands {
         graph: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Frame or inclusive range (e.g. `5` or `1-100`). Output filenames
+        /// zero-pad the frame number to AT LEAST four digits and grow beyond
+        /// that past frame 9999 (e.g. `density.10000.vdb`), so consumers
+        /// must parse the frame number rather than sort filenames as
+        /// strings.
         #[arg(long, default_value = "1")]
         frames: String,
         #[arg(long, default_value = "density")]

@@ -13,6 +13,7 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.11"
+ndarray = "0.17.2"
 ndarray-npy = "0.10.0"
 png = "0.18.1"
 pollster = "1.0.1"

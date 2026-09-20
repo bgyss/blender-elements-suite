@@ -45,6 +45,26 @@ fn bake_writes_one_vdb_per_frame() {
 }
 
 #[test]
+fn bake_pads_frame_numbers_to_at_least_four_digits() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = write_graph(dir.path());
+    let out = dir.path().join("vdb");
+
+    let status = cli()
+        .args(["bake", graph.to_str().unwrap()])
+        .args(["--out", out.to_str().unwrap()])
+        .args(["--frames", "9999-10001"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    for name in ["density.9999.vdb", "density.10000.vdb", "density.10001.vdb"] {
+        let path = out.join(name);
+        assert!(path.exists(), "missing {}", path.display());
+    }
+}
+
+#[test]
 fn dump_npy_matches_the_golden_field() {
     let dir = tempfile::tempdir().unwrap();
     let graph = write_graph(dir.path());

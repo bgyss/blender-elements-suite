@@ -36,3 +36,43 @@ pub fn dump_npy(graph: &Path, out: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", out.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    #[test]
+    fn parse_range_accepts_a_negative_low_bound() {
+        assert_eq!(parse_range("-1,1").unwrap(), (-1.0, 1.0));
+    }
+
+    #[test]
+    fn parse_range_accepts_a_zero_low_bound() {
+        assert_eq!(parse_range("0,1").unwrap(), (0.0, 1.0));
+    }
+
+    #[test]
+    fn parse_range_rejects_a_missing_comma() {
+        assert!(parse_range("1").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_a_missing_high_bound() {
+        assert!(parse_range("1,").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_a_missing_low_bound() {
+        assert!(parse_range(",1").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_an_empty_string() {
+        assert!(parse_range("").is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_non_numeric_bounds() {
+        assert!(parse_range("a,b").is_err());
+    }
+}
