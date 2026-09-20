@@ -33,7 +33,16 @@ Every task's requirements implicitly include this section.
 - **Rust edition 2024.** Workspace `resolver = "3"`.
 - **Engine licence: `Apache-2.0 OR MIT`.** Addon licence: `GPL-3.0-or-later`. No GPL-licensed code may be copied into any `elements-*` crate — published algorithms may be reimplemented, never vendored.
 - **No `unsafe` outside `elements-ipc`.** Every crate root except `elements-ipc` carries `#![forbid(unsafe_code)]`. `elements-ipc` carries `#![deny(unsafe_op_in_unsafe_fn)]` and documents a `# Safety` section on each `unsafe` block.
-- **Field formats for v1:** `R16Float` and `Rgba16Float` only.
+- **Field formats for v1:** `R32Float` (scalar) and `Rgba16Float` (vector) only.
+  **Not `R16Float`:** verified against the wgpu 30.0.1 source, the WebGPU
+  baseline does not permit `R16Float` as a storage texture at all — its allowed
+  usages exclude `STORAGE_BINDING`. Using it requires the optional
+  `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`, which drops the portability
+  guarantee that motivated choosing wgpu and is unlikely to hold on lavapipe.
+  `R32Float` guarantees storage binding including read-write on every conformant
+  adapter; `Rgba16Float` guarantees read-only/write-only storage. Half-precision
+  returns later as a *wire and export* format, where bandwidth actually matters,
+  not as a storage-texture format.
 - **Every stochastic node takes an explicit `seed: u64`.** No implicit entropy anywhere in the engine.
 - **Golden comparisons use tolerance**, never bit equality: absolute tolerance `1e-3` for `f16`-backed fields.
 - **Protocol version constant is `ELEMENTS_PROTOCOL_VERSION: u32 = 1`.** Every control message carries it.
@@ -739,7 +748,7 @@ git commit -m "feat: add GpuContext with device-lost and validation error scopes
 - Consumes: `GpuContext`, `GpuError` from Task 2.
 - Produces:
   - `struct FieldDims { pub x: u32, pub y: u32, pub z: u32 }` with `FieldDims::new(x, y, z)` and `voxel_count(&self) -> usize`
-  - `enum FieldFormat { R16Float, Rgba16Float }` with `channels(&self) -> u32` and `bytes_per_voxel(&self) -> u32`
+  - `enum FieldFormat { R32Float, Rgba16Float }` with `channels(&self) -> u32` and `bytes_per_voxel(&self) -> u32`
   - `struct Field { .. }` with `dims()`, `format()`, `texture() -> &wgpu::Texture`, `view() -> &wgpu::TextureView`
   - `struct FieldPool` with `FieldPool::new()`, `acquire(&mut self, ctx, dims, format) -> Result<Field, GpuError>`, `release(&mut self, field: Field)`, `pooled_count(&self) -> usize`
   - `Field::read_back(&self, ctx: &GpuContext) -> Result<Vec<f32>, GpuError>` — returns voxels in x-fastest order, `channels()` values per voxel, `f16` decoded to `f32`.
@@ -759,8 +768,8 @@ fn dims_report_voxel_count() {
 
 #[test]
 fn formats_report_their_size() {
-    assert_eq!(FieldFormat::R16Float.channels(), 1);
-    assert_eq!(FieldFormat::R16Float.bytes_per_voxel(), 2);
+    assert_eq!(FieldFormat::R32Float.channels(), 1);
+    assert_eq!(FieldFormat::R32Float.bytes_per_voxel(), 4);
     assert_eq!(FieldFormat::Rgba16Float.channels(), 4);
     assert_eq!(FieldFormat::Rgba16Float.bytes_per_voxel(), 8);
 }
@@ -771,12 +780,12 @@ fn pool_recycles_identical_fields() {
     let mut pool = FieldPool::new();
     let dims = FieldDims::new(8, 8, 8);
 
-    let first = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let first = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     let first_id = first.texture().global_id();
     pool.release(first);
     assert_eq!(pool.pooled_count(), 1);
 
-    let second = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let second = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     assert_eq!(second.texture().global_id(), first_id, "should reuse the texture");
     assert_eq!(pool.pooled_count(), 0);
 }
@@ -787,13 +796,13 @@ fn pool_does_not_recycle_across_shapes() {
     let mut pool = FieldPool::new();
 
     let a = pool
-        .acquire(&ctx, FieldDims::new(8, 8, 8), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(8, 8, 8), FieldFormat::R32Float)
         .unwrap();
     let a_id = a.texture().global_id();
     pool.release(a);
 
     let b = pool
-        .acquire(&ctx, FieldDims::new(16, 8, 8), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(16, 8, 8), FieldFormat::R32Float)
         .unwrap();
     assert_ne!(b.texture().global_id(), a_id);
     assert_eq!(pool.pooled_count(), 1, "the 8^3 field stays pooled");
@@ -805,7 +814,7 @@ fn fresh_field_reads_back_as_zeros() {
     let mut pool = FieldPool::new();
     let dims = FieldDims::new(4, 4, 4);
 
-    let field = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     let values = field.read_back(&ctx).unwrap();
 
     assert_eq!(values.len(), dims.voxel_count());
@@ -813,7 +822,12 @@ fn fresh_field_reads_back_as_zeros() {
 }
 ```
 
-`global_id()` is how we assert object identity without comparing contents. If `wgpu` 30 does not expose it, compare `Arc::as_ptr` of a cloned texture handle instead, or add a `Field::pool_generation()` counter incremented on allocation and assert it did not change.
+**Verified:** `wgpu::Texture::global_id()` does **not** exist in wgpu 30.0.1.
+Use the fallback: a `FieldPool` allocation counter exposed as
+`Field::pool_generation()`, incremented only when a texture is freshly created
+and never on reuse. Assert it is unchanged across a release/acquire cycle. Make
+sure the test would fail if the pool allocated instead of recycling — a
+recycling test that cannot detect non-recycling is worthless.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -867,25 +881,28 @@ impl FieldDims {
 /// The storage formats Core v1 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFormat {
-    R16Float,
+    R32Float,
     Rgba16Float,
 }
 
 impl FieldFormat {
     pub fn channels(&self) -> u32 {
         match self {
-            Self::R16Float => 1,
+            Self::R32Float => 1,
             Self::Rgba16Float => 4,
         }
     }
 
     pub fn bytes_per_voxel(&self) -> u32 {
-        self.channels() * 2
+        match self {
+            Self::R32Float => 4,
+            Self::Rgba16Float => 8,
+        }
     }
 
     pub(crate) fn wgpu_format(&self) -> wgpu::TextureFormat {
         match self {
-            Self::R16Float => wgpu::TextureFormat::R16Float,
+            Self::R32Float => wgpu::TextureFormat::R32Float,
             Self::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         }
     }
@@ -965,8 +982,9 @@ impl Field {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // `PollType::Wait` is a struct variant in wgpu 30, not a unit variant.
         ctx.device()
-            .poll(wgpu::PollType::Wait)
+            .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| GpuError::DeviceLost(e.to_string()))?;
         rx.recv()
             .map_err(|e| GpuError::Validation(e.to_string()))?
@@ -975,14 +993,26 @@ impl Field {
         let channels = self.format.channels() as usize;
         let mut out = Vec::with_capacity(self.dims.voxel_count() * channels);
         {
-            let mapped = slice.get_mapped_range();
+            let mapped = slice.get_mapped_range()?;
             let row_values = self.dims.x as usize * channels;
+            let row_bytes = row_values * self.format.bytes_per_voxel() as usize / channels;
+
             for z in 0..self.dims.z as usize {
                 for y in 0..self.dims.y as usize {
                     let start = (z * self.dims.y as usize + y) * padded_row as usize;
-                    let end = start + row_values * 2;
-                    let halves: &[half::f16] = bytemuck::cast_slice(&mapped[start..end]);
-                    out.extend(halves.iter().map(|h| h.to_f32()));
+                    let row = &mapped[start..start + row_bytes];
+
+                    // Decode per storage format. R32Float is already f32, so the
+                    // cast is free; Rgba16Float must be widened from half.
+                    match self.format {
+                        FieldFormat::R32Float => {
+                            out.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
+                        }
+                        FieldFormat::Rgba16Float => {
+                            let halves: &[half::f16] = bytemuck::cast_slice(row);
+                            out.extend(halves.iter().map(|h| h.to_f32()));
+                        }
+                    }
                 }
             }
         }
@@ -1124,7 +1154,7 @@ fn constant_fill_writes_every_voxel() {
     let mut cache = PipelineCache::new();
     let dims = FieldDims::new(8, 8, 8);
 
-    let field = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     fill_constant(&ctx, &mut cache, &field, 0.75).unwrap();
 
     let values = field.read_back(&ctx).unwrap();
@@ -1142,7 +1172,7 @@ fn constant_fill_handles_non_multiple_of_workgroup() {
     // 5 is not a multiple of the workgroup size 4: the shader must bounds-check.
     let dims = FieldDims::new(5, 5, 5);
 
-    let field = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     fill_constant(&ctx, &mut cache, &field, 1.0).unwrap();
 
     let values = field.read_back(&ctx).unwrap();
@@ -1158,7 +1188,7 @@ fn pipeline_cache_reuses_compiled_pipelines() {
     let mut cache = PipelineCache::new();
     let mut pool = FieldPool::new();
     let field = pool
-        .acquire(&ctx, FieldDims::new(4, 4, 4), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(4, 4, 4), FieldFormat::R32Float)
         .unwrap();
 
     fill_constant(&ctx, &mut cache, &field, 0.1).unwrap();
@@ -1194,7 +1224,7 @@ struct Params {
     value: f32,
 };
 
-@group(0) @binding(0) var field: texture_storage_3d<r16float, write>;
+@group(0) @binding(0) var field: texture_storage_3d<r32float, write>;
 @group(0) @binding(1) var<uniform> params: Params;
 
 @compute @workgroup_size(4, 4, 4)
@@ -1413,7 +1443,7 @@ fn noise_values(seed: u64, frequency: f32) -> Vec<f32> {
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
     let field = pool
-        .acquire(&ctx, FieldDims::new(16, 16, 16), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(16, 16, 16), FieldFormat::R32Float)
         .unwrap();
     fill_curl_noise(&ctx, &mut cache, &field, seed, frequency).unwrap();
     field.read_back(&ctx).unwrap()
@@ -1481,7 +1511,7 @@ struct Params {
     _pad1: u32,
 };
 
-@group(0) @binding(0) var field: texture_storage_3d<r16float, write>;
+@group(0) @binding(0) var field: texture_storage_3d<r32float, write>;
 @group(0) @binding(1) var<uniform> params: Params;
 
 fn hash3(p: vec3<i32>, seed: u32) -> f32 {
@@ -1801,7 +1831,7 @@ fn values_report_type_mismatches() {
 #[test]
 fn field_values_carry_their_dims() {
     let (gpu, mut pool, _pipelines) = harness();
-    let field = pool.acquire(&gpu, FieldDims::new(2, 3, 4), FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&gpu, FieldDims::new(2, 3, 4), FieldFormat::R32Float).unwrap();
     let v = Value::Field(field);
     assert_eq!(v.as_field().unwrap().dims(), FieldDims::new(2, 3, 4));
 }
@@ -2729,7 +2759,7 @@ impl Node for ConstantField {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let field = ctx.acquire(FieldFormat::R16Float)?;
+        let field = ctx.acquire(FieldFormat::R32Float)?;
         let value = self.value;
         ctx.with_gpu(|gpu, cache| fill_constant(gpu, cache, &field, value))?;
         Ok(vec![Value::Field(field)])
@@ -2784,7 +2814,7 @@ impl Node for NoiseField {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let field = ctx.acquire(FieldFormat::R16Float)?;
+        let field = ctx.acquire(FieldFormat::R32Float)?;
         let (seed, frequency) = (self.seed, self.frequency);
         ctx.with_gpu(|gpu, cache| fill_curl_noise(gpu, cache, &field, seed, frequency))?;
         Ok(vec![Value::Field(field)])
