@@ -6,12 +6,16 @@ passes the endpoint, channel path and graph path as arguments.
 
 import json
 import pathlib
+import struct
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "addon"))
 
 from blender_elements.client import (  # noqa: E402
+    CHANNEL_HEADER_BYTES,
     CHANNEL_MAGIC,
+    CHANNEL_VERSION,
     PROTOCOL_VERSION,
     ControlClient,
     ElementsError,
@@ -19,7 +23,35 @@ from blender_elements.client import (  # noqa: E402
 )
 
 
+def check_truncated_channel_file_rejected() -> None:
+    """A channel file whose header claims more data than the file holds must
+    raise, not silently return a short/wrong frame (mmap slicing truncates
+    silently rather than raising)."""
+    header = bytearray(CHANNEL_HEADER_BYTES)
+    struct.pack_into("<I", header, 0, CHANNEL_MAGIC)
+    struct.pack_into("<I", header, 4, CHANNEL_VERSION)
+    struct.pack_into("<I", header, 8, 8)  # dims[0]
+    struct.pack_into("<I", header, 12, 8)  # dims[1]
+    struct.pack_into("<I", header, 16, 8)  # dims[2]
+    struct.pack_into("<I", header, 20, 1)  # channels
+    struct.pack_into("<Q", header, 24, 8 * 8 * 8 * 4)  # buffer_bytes (large)
+    struct.pack_into("<Q", header, 32, 0)  # seq
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "truncated.channel"
+        path.write_bytes(bytes(header))  # nothing after the header
+
+        try:
+            FrameReader(str(path))
+        except ElementsError as e:
+            assert e.kind == "io", e.kind
+        else:
+            raise AssertionError("expected ElementsError for a truncated channel file")
+
+
 def main(endpoint: str, channel: str, graph: str) -> None:
+    check_truncated_channel_file_rejected()
+
     with ControlClient(endpoint) as client:
         ack = client.hello()
         assert ack["protocol_version"] == PROTOCOL_VERSION, ack

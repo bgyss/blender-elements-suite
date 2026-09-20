@@ -81,7 +81,11 @@ class ControlClient:
             self._sock = _PipeSocket(self._endpoint)
         else:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(self._endpoint)
+            try:
+                sock.connect(self._endpoint)
+            except Exception:
+                sock.close()
+                raise
             self._sock = sock
 
     def close(self) -> None:
@@ -100,12 +104,12 @@ class ControlClient:
         if self._sock is None:
             raise ElementsError("io", "not connected")
         while b"\n" not in self._buf:
-            if len(self._buf) > MAX_MESSAGE_BYTES:
-                raise ElementsError("io", "engine sent an oversized message")
             chunk = self._sock.recv(65536)
             if not chunk:
                 raise ElementsError("io", "engine closed the connection")
             self._buf += chunk
+            if len(self._buf) > MAX_MESSAGE_BYTES:
+                raise ElementsError("io", "engine sent an oversized message")
 
         line, self._buf = self._buf.split(b"\n", 1)
         try:
@@ -143,7 +147,11 @@ class FrameReader:
         self._map = None
         self._file = None
         self._file = open(path, "rb")  # noqa: SIM115 -- lives with the object
-        self._map = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            self._map = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            self.close()
+            raise
 
         magic = self._u32(_OFF_MAGIC)
         if magic != CHANNEL_MAGIC:
@@ -154,10 +162,21 @@ class FrameReader:
             self.close()
             raise ElementsError("io", f"unsupported channel version {version}")
 
+        self._magic = magic
+        self._version = version
         self._dims = [self._u32(_OFF_DIMS + i * 4) for i in range(3)]
         self._channels = self._u32(_OFF_CHANNELS)
         self._buffer_bytes = self._u64(_OFF_BUFFER_BYTES)
         self._values = self._dims[0] * self._dims[1] * self._dims[2] * self._channels
+
+        expected = CHANNEL_HEADER_BYTES + 2 * self._buffer_bytes
+        actual = len(self._map)
+        if actual < expected:
+            self.close()
+            raise ElementsError(
+                "io",
+                f"truncated channel file: expected at least {expected} bytes, got {actual}",
+            )
 
     def _u32(self, offset: int) -> int:
         return struct.unpack_from("<I", self._map, offset)[0]
@@ -167,8 +186,8 @@ class FrameReader:
 
     def header(self) -> dict:
         return {
-            "magic": self._u32(_OFF_MAGIC),
-            "version": self._u32(_OFF_VERSION),
+            "magic": self._magic,
+            "version": self._version,
             "dims": list(self._dims),
             "channels": self._channels,
             "buffer_bytes": self._buffer_bytes,
