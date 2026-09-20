@@ -7322,6 +7322,12 @@ git commit -m "feat: add Blender extension with engine control panel and packagi
 
 Every box below must be checked with a command that was actually run.
 
+- [ ] **CI has actually run at least once and is green.** Development proceeds
+      local-only on Metal (decided 2026-09-19), so this is deferred to
+      close-out rather than skipped: add a git remote, push `core-v1`, and fix
+      every lavapipe failure. Expect backend divergence — Task 2 established
+      that Metal and software Vulkan disagree about what counts as a validation
+      error, so GPU tests passing locally is not evidence they pass in CI.
 - [ ] `cargo test --workspace` passes on lavapipe in CI.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - [ ] `elements bake` produces a `.vdb` that opens in Blender by hand, not only in `vdb-rs`.
