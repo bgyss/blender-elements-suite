@@ -7,7 +7,13 @@ use crate::IoError;
 /// Write one z-slice as 8-bit greyscale, mapping `range` linearly onto 0..=255.
 ///
 /// Values outside `range` are clamped rather than wrapped, so a blown-up
-/// simulation reads as saturated white instead of noise.
+/// simulation reads as saturated white instead of noise. Non-finite values
+/// (`NaN`, `+inf`, and `-inf`) bypass the clamp entirely and saturate to
+/// white (255): `NaN` and `+inf` clamp to white already, and `-inf` is
+/// mapped to white too rather than black, because these previews exist so a
+/// diverged simulation is visually obvious, and a single, consistent
+/// "non-finite means saturated white" rule is easier to trust at a glance
+/// than a rule that renders some kinds of blow-up as black.
 pub fn write_slice_png(
     path: &Path,
     values: &[f32],
@@ -37,7 +43,13 @@ pub fn write_slice_png(
     let start = z as usize * slice_len;
     let pixels: Vec<u8> = values[start..start + slice_len]
         .iter()
-        .map(|v| (((v - lo) / span).clamp(0.0, 1.0) * 255.0).round() as u8)
+        .map(|v| {
+            if !v.is_finite() {
+                255
+            } else {
+                (((v - lo) / span).clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+        })
         .collect();
 
     let file = std::fs::File::create(path)?;
