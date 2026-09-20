@@ -11,6 +11,8 @@ pub enum NodeError {
     Cycle(NodeId),
     #[error("node {node:?} input {index} is not connected")]
     MissingInput { node: NodeId, index: u32 },
+    #[error("node {node:?} input {index} was already taken by this node")]
+    InputAlreadyTaken { node: NodeId, index: u32 },
     #[error("node {node:?} socket {index} expected {expected:?}")]
     TypeMismatch {
         node: NodeId,
@@ -89,6 +91,9 @@ pub struct EvalCtx<'a> {
     pub(crate) dims: FieldDims,
     pub(crate) node: NodeId,
     pub(crate) inputs: Vec<Option<Value>>,
+    /// Tracks which indices `take_input` has already removed, so `input` can
+    /// report a distinct error for "taken" versus "never connected".
+    pub(crate) taken: Vec<bool>,
 }
 
 impl EvalCtx<'_> {
@@ -110,22 +115,41 @@ impl EvalCtx<'_> {
         self.inputs
             .get(index as usize)
             .and_then(Option::as_ref)
-            .ok_or(NodeError::MissingInput {
-                node: self.node,
-                index,
+            .ok_or_else(|| {
+                if self.taken.get(index as usize).copied().unwrap_or(false) {
+                    NodeError::InputAlreadyTaken {
+                        node: self.node,
+                        index,
+                    }
+                } else {
+                    NodeError::MissingInput {
+                        node: self.node,
+                        index,
+                    }
+                }
             })
     }
 
     /// Take ownership of input `index`, leaving it unavailable to later reads.
     /// This is how pass-through nodes forward a GPU field without copying it.
+    ///
+    /// Trap: calling `input(index)` after this will not report `MissingInput`
+    /// (which would look like a wiring mistake in the graph) but
+    /// `InputAlreadyTaken` (a bug in this node's own `eval`, since it read the
+    /// same input twice).
     pub fn take_input(&mut self, index: u32) -> Result<Value, NodeError> {
-        self.inputs
+        let value = self
+            .inputs
             .get_mut(index as usize)
             .and_then(Option::take)
             .ok_or(NodeError::MissingInput {
                 node: self.node,
                 index,
-            })
+            })?;
+        if let Some(slot) = self.taken.get_mut(index as usize) {
+            *slot = true;
+        }
+        Ok(value)
     }
 
     /// Acquire a pooled field at the current evaluation dims.

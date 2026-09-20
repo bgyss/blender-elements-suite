@@ -41,6 +41,26 @@ impl Node for Add {
     }
 }
 
+/// A node with two output sockets, both fed by a single scalar input, used to
+/// build a genuine diamond: one producer reached by two distinct paths.
+struct Fork;
+
+impl Node for Fork {
+    fn kind(&self) -> &'static str {
+        "test.fork"
+    }
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Scalar],
+            outputs: vec![SocketType::Scalar, SocketType::Scalar],
+        }
+    }
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let v = ctx.take_input(0)?.as_scalar()?;
+        Ok(vec![Value::Scalar(v), Value::Scalar(v)])
+    }
+}
+
 fn harness() -> (GpuContext, FieldPool, PipelineCache) {
     (
         GpuContext::new_headless().expect("no GPU adapter available"),
@@ -50,7 +70,7 @@ fn harness() -> (GpuContext, FieldPool, PipelineCache) {
 }
 
 #[test]
-fn evaluates_a_diamond_in_dependency_order() {
+fn evaluates_two_producers_into_one_consumer() {
     let mut g = Graph::new();
     let two = g.add_node(Box::new(Literal(2.0)));
     let three = g.add_node(Box::new(Literal(3.0)));
@@ -108,6 +128,57 @@ fn detects_cycles() {
         Err(NodeError::Cycle(_)) => {}
         other => panic!("expected a cycle error, got {other:?}"),
     }
+}
+
+#[test]
+fn a_diamond_is_not_reported_as_a_cycle() {
+    let mut g = Graph::new();
+    let lit = g.add_node(Box::new(Literal(3.0)));
+    let fork = g.add_node(Box::new(Fork));
+    let sum = g.add_node(Box::new(Add));
+
+    g.connect(
+        SocketId {
+            node: lit,
+            index: 0,
+        },
+        SocketId {
+            node: fork,
+            index: 0,
+        },
+    )
+    .unwrap();
+    g.connect(
+        SocketId {
+            node: fork,
+            index: 0,
+        },
+        SocketId {
+            node: sum,
+            index: 0,
+        },
+    )
+    .unwrap();
+    g.connect(
+        SocketId {
+            node: fork,
+            index: 1,
+        },
+        SocketId {
+            node: sum,
+            index: 1,
+        },
+    )
+    .unwrap();
+    g.set_output(sum);
+
+    assert!(g.topological_order().is_ok());
+
+    let (gpu, mut pool, mut pipelines) = harness();
+    let value = g
+        .eval(&gpu, &mut pool, &mut pipelines, FieldDims::new(4, 4, 4))
+        .unwrap();
+    assert_eq!(value.as_scalar().unwrap(), 6.0);
 }
 
 #[test]
@@ -207,6 +278,56 @@ fn field_values_carry_their_dims() {
         .unwrap();
     let v = Value::Field(field);
     assert_eq!(v.as_field().unwrap().dims(), FieldDims::new(2, 3, 4));
+}
+
+/// A buggy node: takes its input, then tries to read it again. Used to prove
+/// this is reported distinctly from an input that was never connected.
+struct TakeTwice;
+
+impl Node for TakeTwice {
+    fn kind(&self) -> &'static str {
+        "test.take_twice"
+    }
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Scalar],
+            outputs: vec![SocketType::Scalar],
+        }
+    }
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let _ = ctx.take_input(0)?;
+        let _ = ctx.input(0)?;
+        unreachable!("input(0) should have errored")
+    }
+}
+
+#[test]
+fn input_after_take_input_reports_the_input_was_taken() {
+    let mut g = Graph::new();
+    let lit = g.add_node(Box::new(Literal(1.0)));
+    let bug = g.add_node(Box::new(TakeTwice));
+
+    g.connect(
+        SocketId {
+            node: lit,
+            index: 0,
+        },
+        SocketId {
+            node: bug,
+            index: 0,
+        },
+    )
+    .unwrap();
+    g.set_output(bug);
+
+    let (gpu, mut pool, mut pipelines) = harness();
+    let err = g
+        .eval(&gpu, &mut pool, &mut pipelines, FieldDims::new(4, 4, 4))
+        .unwrap_err();
+    assert!(
+        matches!(err, NodeError::InputAlreadyTaken { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]

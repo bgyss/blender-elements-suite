@@ -214,6 +214,7 @@ impl Graph {
                 inputs.push(value);
             }
 
+            let taken = vec![false; inputs.len()];
             let mut ctx = EvalCtx {
                 gpu,
                 pool,
@@ -221,6 +222,7 @@ impl Graph {
                 dims,
                 node: id,
                 inputs,
+                taken,
             };
             let outputs = node.eval(&mut ctx)?;
             produced.insert(id, outputs.into_iter().map(Some).collect());
