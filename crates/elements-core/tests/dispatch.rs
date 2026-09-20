@@ -19,12 +19,27 @@ fn constant_fill_writes_every_voxel() {
     }
 }
 
+/// This test detects under-dispatch, not the shader's bounds guard.
+///
+/// With `dims = 5` and a workgroup size of 4, using plain integer division
+/// (`5 / 4 == 1`) instead of `div_ceil` (`5.div_ceil(4) == 2`) would launch a
+/// single workgroup per axis, covering only voxels 0..=3 and leaving voxel 4
+/// of each axis unwritten. `read_back` would then observe the padding value
+/// there instead of `1.0`, which this test's per-voxel assertion catches.
+///
+/// It does NOT prove the shader's bounds guard is necessary: WGSL defines an
+/// out-of-bounds `textureStore` as a discarded no-op, so on a storage
+/// *texture* removing the guard leaves this test passing. The guard stays in
+/// the shader anyway, because the moment any shader here writes to a storage
+/// *buffer* instead, out-of-bounds writes are undefined behaviour rather than
+/// a harmless no-op, and the guard also avoids launching pointless
+/// invocations for the excess lanes in each dispatched workgroup.
 #[test]
 fn constant_fill_handles_non_multiple_of_workgroup() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
-    // 5 is not a multiple of the workgroup size 4: the shader must bounds-check.
+    // 5 is not a multiple of the workgroup size 4: dispatch must round up.
     let dims = FieldDims::new(5, 5, 5);
 
     let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
@@ -38,16 +53,27 @@ fn constant_fill_handles_non_multiple_of_workgroup() {
 }
 
 #[test]
-fn pipeline_cache_reuses_compiled_pipelines() {
+fn pipeline_cache_returns_the_same_compiled_pipeline() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
     let mut cache = PipelineCache::new();
-    let mut pool = FieldPool::new();
-    let field = pool
-        .acquire(&ctx, FieldDims::new(4, 4, 4), FieldFormat::R32Float)
+    let source = include_str!("../src/gpu/shaders/constant.wgsl");
+
+    let first = cache
+        .get_or_create(&ctx, "constant", source, "main")
+        .unwrap();
+    let second = cache
+        .get_or_create(&ctx, "constant", source, "main")
         .unwrap();
 
-    fill_constant(&ctx, &mut cache, &field, 0.1).unwrap();
-    fill_constant(&ctx, &mut cache, &field, 0.2).unwrap();
-
-    assert_eq!(cache.len(), 1, "the same shader must compile only once");
+    // `HashMap::insert` on a repeated key leaves `len()` at 1 whether or not
+    // the value was recomputed, so a length check alone cannot tell a cache
+    // hit from a silent recompile on every call. Comparing `Arc::ptr_eq`
+    // instead asserts the second call returned the SAME compiled pipeline
+    // object rather than a fresh one that merely overwrote the map entry.
+    // Do not "simplify" this back to a length-only check.
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "get_or_create must return the same cached pipeline, not recompile it"
+    );
+    assert_eq!(cache.len(), 1);
 }
