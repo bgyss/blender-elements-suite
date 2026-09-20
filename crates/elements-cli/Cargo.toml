@@ -1,0 +1,23 @@
+[package]
+name = "elements-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "elements"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+elements-core = { path = "../elements-core" }
+elements-io = { path = "../elements-io" }
+
+[dev-dependencies]
+approx.workspace = true
+elements-io = { path = "../elements-io" }
+png.workspace = true
+tempfile.workspace = true
+vdb-rs.workspace = true
