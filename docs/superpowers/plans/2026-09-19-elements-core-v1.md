@@ -1164,6 +1164,16 @@ fn constant_fill_writes_every_voxel() {
     }
 }
 
+/// Guards against under-dispatch. With `dims = 5` and a workgroup of 4, using
+/// integer division instead of `div_ceil` launches one workgroup covering only
+/// voxels 0..=3, leaving voxel 4 of each axis unwritten. That is the regression
+/// this test detects.
+///
+/// Note it does NOT prove the shader's bounds guard is necessary: WGSL defines
+/// an out-of-bounds `textureStore` as a discarded no-op, so removing the guard
+/// does not corrupt anything on a storage texture. The guard stays because it
+/// is required the moment a shader writes to a storage *buffer*, where
+/// out-of-bounds behaviour is not benign, and because it avoids pointless work.
 #[test]
 fn constant_fill_handles_non_multiple_of_workgroup() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
@@ -1183,18 +1193,22 @@ fn constant_fill_handles_non_multiple_of_workgroup() {
 }
 
 #[test]
-fn pipeline_cache_reuses_compiled_pipelines() {
+fn pipeline_cache_returns_the_same_compiled_pipeline() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
     let mut cache = PipelineCache::new();
-    let mut pool = FieldPool::new();
-    let field = pool
-        .acquire(&ctx, FieldDims::new(4, 4, 4), FieldFormat::R32Float)
-        .unwrap();
 
-    fill_constant(&ctx, &mut cache, &field, 0.1).unwrap();
-    fill_constant(&ctx, &mut cache, &field, 0.2).unwrap();
+    let source = include_str!("../src/gpu/shaders/constant.wgsl");
+    let first = cache.get_or_create(&ctx, "constant", source, "main").unwrap();
+    let second = cache.get_or_create(&ctx, "constant", source, "main").unwrap();
 
-    assert_eq!(cache.len(), 1, "the same shader must compile only once");
+    // Identity, not count: `HashMap::insert` on a repeated key leaves `len()`
+    // at 1 even if the shader was recompiled, so asserting on `len()` cannot
+    // detect a regression to compile-every-call. Comparing the `Arc` can.
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "a cache hit must return the same pipeline, not an equal one"
+    );
+    assert_eq!(cache.len(), 1);
 }
 ```
 
