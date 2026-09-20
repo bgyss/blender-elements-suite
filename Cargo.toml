@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
+interprocess = "2.4.4"
 memmap2 = "0.9.11"
 ndarray = "0.17.2"
 ndarray-npy = "0.10.0"

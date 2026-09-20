@@ -7,6 +7,7 @@
 
 mod channel;
 mod protocol;
+mod transport;
 
 pub use channel::{
     CHANNEL_HEADER_BYTES, CHANNEL_MAGIC, CHANNEL_VERSION, ChannelError, ChannelHeader, FrameReader,
@@ -16,3 +17,4 @@ pub use protocol::{
     Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, MAX_MESSAGE_BYTES, ProtocolError,
     Response, read_message, write_message,
 };
+pub use transport::{Listener, Stream, default_endpoint};
