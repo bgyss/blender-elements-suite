@@ -4076,6 +4076,12 @@ pub fn write_float_grid(
                     dims[2].saturating_sub(1) as i32,
                 ]),
             ),
+            // The grid's own name, as a metadata entry. This is NOT redundant
+            // with the name in the grid descriptor: vdb-rs reads the descriptor,
+            // but real OpenVDB (and therefore Blender) reads this entry, and
+            // without it the grid loads with an empty name. Every vdb-rs test
+            // passed without it — the oracle could not see the defect.
+            ("name", MetaValue::String(name.to_owned())),
             ("class", MetaValue::String("unknown".to_owned())),
             (
                 "file_voxel_count",
