@@ -32,3 +32,6 @@ jobs:
 
       - name: Test on lavapipe
         run: just ci-test
+
+      - name: Build the Blender extension
+        run: just addon

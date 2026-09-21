@@ -170,6 +170,15 @@ pub fn write_float_grid(
     write_metadata(
         &mut w,
         &[
+            // Readers (Blender's bundled OpenVDB among them) take a grid's
+            // display name from this "name" entry in its own metadata map,
+            // not from the archive's grid descriptor -- the descriptor name
+            // is only a unique key for instancing within the file. Without
+            // this entry a grid opens with an empty name, which is silent in
+            // `vdb-rs` (it reads the descriptor name instead) but breaks any
+            // consumer, such as Blender's Volume object, that looks a grid
+            // up by name after import.
+            ("name", MetaValue::String(name.to_owned())),
             ("file_bbox_min", MetaValue::Vec3i([0, 0, 0])),
             (
                 "file_bbox_max",

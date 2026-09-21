@@ -1,0 +1,160 @@
+"""Getting engine frames into Blender's volume data.
+
+Blender's Python API cannot build an OpenVDB grid in memory, so the frame is
+written to a temporary .vdb through the engine's own writer path and imported.
+Core v1 takes the simple, correct route; a direct in-memory path is an Ember
+optimisation, not a Core v1 requirement.
+"""
+
+import os
+import subprocess
+import tempfile
+
+import bpy
+
+from .client import ElementsError
+
+VOLUME_NAME = "ElementsVolume"
+
+
+def _ensure_volume(context) -> bpy.types.Object:
+    obj = bpy.data.objects.get(VOLUME_NAME)
+    if obj is None or obj.type != "VOLUME":
+        data = bpy.data.volumes.new(VOLUME_NAME)
+        obj = bpy.data.objects.new(VOLUME_NAME, data)
+        context.collection.objects.link(obj)
+    return obj
+
+
+def push_frame_to_volume(context, values, dims) -> bpy.types.Object:
+    """Point the Volume object at a freshly baked .vdb of the current graph.
+
+    `values` and `dims` come from the shared-memory frame and are used for the
+    status readout and sanity checks; the geometry Blender renders comes from
+    the engine's own VDB writer, because the add-on must never reimplement the
+    file format in Python.
+    """
+    obj = _ensure_volume(context)
+
+    expected = dims[0] * dims[1] * dims[2]
+    if len(values) != expected:
+        raise ElementsError("io", f"frame has {len(values)} values, expected {expected}")
+
+    path = os.path.join(tempfile.gettempdir(), f"elements-frame-{os.getpid()}.vdb")
+    _bake_current_graph_to(path)
+
+    obj.data.filepath = path
+    # Volume has no `.reload()` (unlike Image); force the grid cache to
+    # re-read the new file by unloading and reloading it explicitly.
+    obj.data.grids.unload()
+    obj.data.grids.load()
+    return obj
+
+
+def _bake_current_graph_to(path) -> None:
+    """Ask the engine CLI to bake the loaded graph to `path`.
+
+    The CLI lives beside the daemon, since both are built into the same
+    cargo target directory and shipped together.
+    """
+    settings = bpy.context.scene.elements
+    cli = os.path.join(os.path.dirname(bpy.path.abspath(settings.daemon_path)), "elements")
+    if os.name == "nt":
+        cli += ".exe"
+
+    out_dir = os.path.dirname(path)
+    result = subprocess.run(
+        [
+            cli,
+            "bake",
+            bpy.path.abspath(settings.graph_path),
+            "--out",
+            out_dir,
+            "--frames",
+            "1",
+            "--name",
+            "density",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ElementsError("io", f"bake failed: {result.stderr.strip()}")
+
+    os.replace(os.path.join(out_dir, "density.0001.vdb"), path)
+
+
+_draw_handle = None
+_last_seq = -1
+
+
+def _on_draw() -> None:
+    """Runs on every 3D viewport redraw while `live` is enabled.
+
+    Must never raise into Blender's draw loop: an exception here is reported
+    once in the status line and then swallowed, degrading to a stale volume
+    rather than a broken viewport.
+
+    UNVERIFIED by the automated test suite: `blender --background` never
+    redraws a viewport, so this function is unreachable from
+    `tests/blender/test_roundtrip.py`. It must be confirmed by hand in an
+    interactive session (open Blender, Start Engine, enable Live, watch the
+    volume update, then disable Live and confirm updates stop).
+    """
+    global _last_seq
+
+    scene = bpy.context.scene
+    settings = getattr(scene, "elements", None)
+    if settings is None or not settings.live:
+        return
+
+    from . import ops
+
+    reader = ops._state.get("reader")
+    client = ops._state.get("client")
+    if reader is None or client is None:
+        return
+
+    try:
+        try:
+            frame = client.render(scene.frame_current)
+        except ElementsError as e:
+            if e.kind == "device_lost":
+                ops.shutdown_engine()
+            raise
+
+        try:
+            seq, values = reader.read_latest()
+        except ElementsError:
+            # The channel was reallocated with different dims; reopen and
+            # retry once rather than treating this as fatal.
+            from .client import FrameReader
+
+            reader.close()
+            reader = FrameReader(bpy.path.abspath(settings.channel_path))
+            ops._state["reader"] = reader
+            seq, values = reader.read_latest()
+
+        if seq != _last_seq:
+            push_frame_to_volume(bpy.context, values, frame["dims"])
+            _last_seq = seq
+            settings.status = f"Live — frame {seq}"
+    except Exception as e:  # noqa: BLE001 - see the docstring
+        settings.live = False
+        settings.status = f"Live update stopped: {e}"
+
+
+def register() -> None:
+    global _draw_handle
+    if _draw_handle is None:
+        _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _on_draw, (), "WINDOW", "POST_PIXEL"
+        )
+
+
+def unregister() -> None:
+    global _draw_handle, _last_seq
+    if _draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
+        _draw_handle = None
+    _last_seq = -1
