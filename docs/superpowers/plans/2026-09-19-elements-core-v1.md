@@ -33,12 +33,24 @@ Every task's requirements implicitly include this section.
 - **Rust edition 2024.** Workspace `resolver = "3"`.
 - **Engine licence: `Apache-2.0 OR MIT`.** Addon licence: `GPL-3.0-or-later`. No GPL-licensed code may be copied into any `elements-*` crate — published algorithms may be reimplemented, never vendored.
 - **No `unsafe` outside `elements-ipc`.** Every crate root except `elements-ipc` carries `#![forbid(unsafe_code)]`. `elements-ipc` carries `#![deny(unsafe_op_in_unsafe_fn)]` and documents a `# Safety` section on each `unsafe` block.
-- **Field formats for v1:** `R16Float` and `Rgba16Float` only.
+- **Field formats for v1:** `R32Float` (scalar) and `Rgba16Float` (vector) only.
+  **Not `R16Float`:** verified against the wgpu 30.0.1 source, the WebGPU
+  baseline does not permit `R16Float` as a storage texture at all — its allowed
+  usages exclude `STORAGE_BINDING`. Using it requires the optional
+  `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`, which drops the portability
+  guarantee that motivated choosing wgpu and is unlikely to hold on lavapipe.
+  `R32Float` guarantees storage binding including read-write on every conformant
+  adapter; `Rgba16Float` guarantees read-only/write-only storage. Half-precision
+  returns later as a *wire and export* format, where bandwidth actually matters,
+  not as a storage-texture format.
 - **Every stochastic node takes an explicit `seed: u64`.** No implicit entropy anywhere in the engine.
 - **Golden comparisons use tolerance**, never bit equality: absolute tolerance `1e-3` for `f16`-backed fields.
 - **Protocol version constant is `ELEMENTS_PROTOCOL_VERSION: u32 = 1`.** Every control message carries it.
 - **Document format version constant is `ELEMENTS_DOC_VERSION: u32 = 1`.** Any PR changing the `.elements` schema must bump it and add a migration test.
 - **Blender extension packaging:** `__init__.py` and `blender_manifest.toml` at the ZIP root, nothing nested under a package directory; relative imports only inside the addon package.
+- **Never set `WGPU_BACKEND` in a local command.** Development happens on macOS
+  where the backend is Metal; `WGPU_BACKEND=vulkan` makes wgpu fail to find an
+  adapter. Local runs use `just test` or a plain `cargo test` / `cargo nextest`.
 - **CI runs on lavapipe** (software Vulkan) via `just ci-test`, which sets `WGPU_BACKEND=vulkan` and `LIBGL_ALWAYS_SOFTWARE=1`. These variables are CI-only: `WGPU_BACKEND=vulkan` is wrong on macOS, where the backend is Metal. Tests requiring a device call `GpuContext::new_headless()`.
 - **`just check` must pass before every commit.** It runs `cargo fmt --check`, `clippy -D warnings`, `ruff check`, and the full test suite.
 - **All Python targets 3.11**, formatted and linted with `ruff`. Two versions are
@@ -464,10 +476,12 @@ jobs:
 
       - name: Test on lavapipe
         run: just ci-test
-
-      - name: Build the Blender extension
-        run: just addon
 ```
+
+The workflow deliberately does **not** run `just addon` yet: `scripts/build_addon.py`
+does not exist until Task 18, and a step that fails for seventeen tasks trains
+everyone to ignore a red CI, which is how a real regression gets through. Task 18
+adds that step at the same time it adds the script.
 
 `mise-action` installs exactly the tools `mise.toml` pins, so CI and a developer
 machine run the same `ruff`, `python` and `just`. Rust still comes from the
@@ -605,13 +619,18 @@ impl GpuContext {
     }
 
     async fn new_headless_async() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        // Note `InstanceDescriptor` is passed BY VALUE, and the constructor is
+        // `new_without_display_handle_from_env` — verified against the vendored
+        // wgpu 30.0.1 source. There is no `from_env_or_default` in this version.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|_| GpuError::NoAdapter)?;
@@ -623,6 +642,7 @@ impl GpuContext {
                 label: Some("elements-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::downlevel_defaults(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
@@ -689,10 +709,28 @@ pub mod gpu;
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test gpu_context`
+Run: `cargo test -p elements-core --test gpu_context`
 Expected: PASS — three tests ok.
 
-If `scoped_reports_validation_errors` fails because wgpu 30 rejects the zero-size buffer at a different layer, substitute a texture with `size.width = 0` as the invalid resource. The assertion under test is "an invalid call produces `GpuError::Validation`", not the specific invalid call.
+**Verified on this project:** the zero-size `MAP_READ` buffer does *not* trip
+validation on Metal (Apple M1 Max, wgpu 30.0.1). Use a texture with
+`size.width = 0` as the invalid resource instead. The assertion under test is
+"an invalid call produces `GpuError::Validation`", not the specific invalid
+call — but whichever you use, confirm the test fails when `scoped` is stubbed to
+return `Ok`, or it is passing vacuously.
+
+**A note on verifying wgpu APIs.** Three signatures in this task's code were
+wrong when first written from documentation. The reliable check is the vendored
+source, not docs.rs:
+
+```bash
+R=$(find ~/.cargo/registry/src -maxdepth 2 -type d -name 'wgpu-types-30.0.1' | head -1)
+grep -rn 'pub struct DeviceDescriptor' $R/src/
+```
+
+Descriptors used by Tasks 3–5 were verified this way and are correct as written:
+`TextureDescriptor`, `BufferDescriptor`, `TexelCopyBufferLayout` (it does have
+`rows_per_image`), and `ComputePipelineDescriptor`.
 
 - [ ] **Step 6: Commit**
 
@@ -713,7 +751,7 @@ git commit -m "feat: add GpuContext with device-lost and validation error scopes
 - Consumes: `GpuContext`, `GpuError` from Task 2.
 - Produces:
   - `struct FieldDims { pub x: u32, pub y: u32, pub z: u32 }` with `FieldDims::new(x, y, z)` and `voxel_count(&self) -> usize`
-  - `enum FieldFormat { R16Float, Rgba16Float }` with `channels(&self) -> u32` and `bytes_per_voxel(&self) -> u32`
+  - `enum FieldFormat { R32Float, Rgba16Float }` with `channels(&self) -> u32` and `bytes_per_voxel(&self) -> u32`
   - `struct Field { .. }` with `dims()`, `format()`, `texture() -> &wgpu::Texture`, `view() -> &wgpu::TextureView`
   - `struct FieldPool` with `FieldPool::new()`, `acquire(&mut self, ctx, dims, format) -> Result<Field, GpuError>`, `release(&mut self, field: Field)`, `pooled_count(&self) -> usize`
   - `Field::read_back(&self, ctx: &GpuContext) -> Result<Vec<f32>, GpuError>` — returns voxels in x-fastest order, `channels()` values per voxel, `f16` decoded to `f32`.
@@ -733,8 +771,8 @@ fn dims_report_voxel_count() {
 
 #[test]
 fn formats_report_their_size() {
-    assert_eq!(FieldFormat::R16Float.channels(), 1);
-    assert_eq!(FieldFormat::R16Float.bytes_per_voxel(), 2);
+    assert_eq!(FieldFormat::R32Float.channels(), 1);
+    assert_eq!(FieldFormat::R32Float.bytes_per_voxel(), 4);
     assert_eq!(FieldFormat::Rgba16Float.channels(), 4);
     assert_eq!(FieldFormat::Rgba16Float.bytes_per_voxel(), 8);
 }
@@ -745,12 +783,12 @@ fn pool_recycles_identical_fields() {
     let mut pool = FieldPool::new();
     let dims = FieldDims::new(8, 8, 8);
 
-    let first = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let first = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     let first_id = first.texture().global_id();
     pool.release(first);
     assert_eq!(pool.pooled_count(), 1);
 
-    let second = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let second = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     assert_eq!(second.texture().global_id(), first_id, "should reuse the texture");
     assert_eq!(pool.pooled_count(), 0);
 }
@@ -761,13 +799,13 @@ fn pool_does_not_recycle_across_shapes() {
     let mut pool = FieldPool::new();
 
     let a = pool
-        .acquire(&ctx, FieldDims::new(8, 8, 8), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(8, 8, 8), FieldFormat::R32Float)
         .unwrap();
     let a_id = a.texture().global_id();
     pool.release(a);
 
     let b = pool
-        .acquire(&ctx, FieldDims::new(16, 8, 8), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(16, 8, 8), FieldFormat::R32Float)
         .unwrap();
     assert_ne!(b.texture().global_id(), a_id);
     assert_eq!(pool.pooled_count(), 1, "the 8^3 field stays pooled");
@@ -779,7 +817,7 @@ fn fresh_field_reads_back_as_zeros() {
     let mut pool = FieldPool::new();
     let dims = FieldDims::new(4, 4, 4);
 
-    let field = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     let values = field.read_back(&ctx).unwrap();
 
     assert_eq!(values.len(), dims.voxel_count());
@@ -787,11 +825,16 @@ fn fresh_field_reads_back_as_zeros() {
 }
 ```
 
-`global_id()` is how we assert object identity without comparing contents. If `wgpu` 30 does not expose it, compare `Arc::as_ptr` of a cloned texture handle instead, or add a `Field::pool_generation()` counter incremented on allocation and assert it did not change.
+**Verified:** `wgpu::Texture::global_id()` does **not** exist in wgpu 30.0.1.
+Use the fallback: a `FieldPool` allocation counter exposed as
+`Field::pool_generation()`, incremented only when a texture is freshly created
+and never on reuse. Assert it is unchanged across a release/acquire cycle. Make
+sure the test would fail if the pool allocated instead of recycling — a
+recycling test that cannot detect non-recycling is worthless.
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test field_pool`
+Run: `cargo test -p elements-core --test field_pool`
 Expected: FAIL — `unresolved imports FieldDims, FieldFormat, FieldPool`.
 
 - [ ] **Step 3: Add dependencies**
@@ -841,25 +884,28 @@ impl FieldDims {
 /// The storage formats Core v1 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFormat {
-    R16Float,
+    R32Float,
     Rgba16Float,
 }
 
 impl FieldFormat {
     pub fn channels(&self) -> u32 {
         match self {
-            Self::R16Float => 1,
+            Self::R32Float => 1,
             Self::Rgba16Float => 4,
         }
     }
 
     pub fn bytes_per_voxel(&self) -> u32 {
-        self.channels() * 2
+        match self {
+            Self::R32Float => 4,
+            Self::Rgba16Float => 8,
+        }
     }
 
     pub(crate) fn wgpu_format(&self) -> wgpu::TextureFormat {
         match self {
-            Self::R16Float => wgpu::TextureFormat::R16Float,
+            Self::R32Float => wgpu::TextureFormat::R32Float,
             Self::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         }
     }
@@ -939,8 +985,9 @@ impl Field {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // `PollType::Wait` is a struct variant in wgpu 30, not a unit variant.
         ctx.device()
-            .poll(wgpu::PollType::Wait)
+            .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| GpuError::DeviceLost(e.to_string()))?;
         rx.recv()
             .map_err(|e| GpuError::Validation(e.to_string()))?
@@ -949,14 +996,26 @@ impl Field {
         let channels = self.format.channels() as usize;
         let mut out = Vec::with_capacity(self.dims.voxel_count() * channels);
         {
-            let mapped = slice.get_mapped_range();
+            let mapped = slice.get_mapped_range()?;
             let row_values = self.dims.x as usize * channels;
+            let row_bytes = row_values * self.format.bytes_per_voxel() as usize / channels;
+
             for z in 0..self.dims.z as usize {
                 for y in 0..self.dims.y as usize {
                     let start = (z * self.dims.y as usize + y) * padded_row as usize;
-                    let end = start + row_values * 2;
-                    let halves: &[half::f16] = bytemuck::cast_slice(&mapped[start..end]);
-                    out.extend(halves.iter().map(|h| h.to_f32()));
+                    let row = &mapped[start..start + row_bytes];
+
+                    // Decode per storage format. R32Float is already f32, so the
+                    // cast is free; Rgba16Float must be widened from half.
+                    match self.format {
+                        FieldFormat::R32Float => {
+                            out.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
+                        }
+                        FieldFormat::Rgba16Float => {
+                            let halves: &[half::f16] = bytemuck::cast_slice(row);
+                            out.extend(halves.iter().map(|h| h.to_f32()));
+                        }
+                    }
                 }
             }
         }
@@ -1057,7 +1116,7 @@ pub use pool::FieldPool;
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test field_pool`
+Run: `cargo test -p elements-core --test field_pool`
 Expected: PASS — five tests ok.
 
 - [ ] **Step 7: Commit**
@@ -1098,7 +1157,7 @@ fn constant_fill_writes_every_voxel() {
     let mut cache = PipelineCache::new();
     let dims = FieldDims::new(8, 8, 8);
 
-    let field = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     fill_constant(&ctx, &mut cache, &field, 0.75).unwrap();
 
     let values = field.read_back(&ctx).unwrap();
@@ -1108,6 +1167,16 @@ fn constant_fill_writes_every_voxel() {
     }
 }
 
+/// Guards against under-dispatch. With `dims = 5` and a workgroup of 4, using
+/// integer division instead of `div_ceil` launches one workgroup covering only
+/// voxels 0..=3, leaving voxel 4 of each axis unwritten. That is the regression
+/// this test detects.
+///
+/// Note it does NOT prove the shader's bounds guard is necessary: WGSL defines
+/// an out-of-bounds `textureStore` as a discarded no-op, so removing the guard
+/// does not corrupt anything on a storage texture. The guard stays because it
+/// is required the moment a shader writes to a storage *buffer*, where
+/// out-of-bounds behaviour is not benign, and because it avoids pointless work.
 #[test]
 fn constant_fill_handles_non_multiple_of_workgroup() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
@@ -1116,7 +1185,7 @@ fn constant_fill_handles_non_multiple_of_workgroup() {
     // 5 is not a multiple of the workgroup size 4: the shader must bounds-check.
     let dims = FieldDims::new(5, 5, 5);
 
-    let field = pool.acquire(&ctx, dims, FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
     fill_constant(&ctx, &mut cache, &field, 1.0).unwrap();
 
     let values = field.read_back(&ctx).unwrap();
@@ -1127,24 +1196,28 @@ fn constant_fill_handles_non_multiple_of_workgroup() {
 }
 
 #[test]
-fn pipeline_cache_reuses_compiled_pipelines() {
+fn pipeline_cache_returns_the_same_compiled_pipeline() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
     let mut cache = PipelineCache::new();
-    let mut pool = FieldPool::new();
-    let field = pool
-        .acquire(&ctx, FieldDims::new(4, 4, 4), FieldFormat::R16Float)
-        .unwrap();
 
-    fill_constant(&ctx, &mut cache, &field, 0.1).unwrap();
-    fill_constant(&ctx, &mut cache, &field, 0.2).unwrap();
+    let source = include_str!("../src/gpu/shaders/constant.wgsl");
+    let first = cache.get_or_create(&ctx, "constant", source, "main").unwrap();
+    let second = cache.get_or_create(&ctx, "constant", source, "main").unwrap();
 
-    assert_eq!(cache.len(), 1, "the same shader must compile only once");
+    // Identity, not count: `HashMap::insert` on a repeated key leaves `len()`
+    // at 1 even if the shader was recompiled, so asserting on `len()` cannot
+    // detect a regression to compile-every-call. Comparing the `Arc` can.
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "a cache hit must return the same pipeline, not an equal one"
+    );
+    assert_eq!(cache.len(), 1);
 }
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test dispatch`
+Run: `cargo test -p elements-core --test dispatch`
 Expected: FAIL — `unresolved imports fill_constant, PipelineCache`.
 
 - [ ] **Step 3: Add the dev-dependency**
@@ -1168,7 +1241,7 @@ struct Params {
     value: f32,
 };
 
-@group(0) @binding(0) var field: texture_storage_3d<r16float, write>;
+@group(0) @binding(0) var field: texture_storage_3d<r32float, write>;
 @group(0) @binding(1) var<uniform> params: Params;
 
 @compute @workgroup_size(4, 4, 4)
@@ -1351,7 +1424,7 @@ pub use dispatch::{dispatch_over_field, fill_constant, PipelineCache, WORKGROUP}
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test dispatch`
+Run: `cargo test -p elements-core --test dispatch`
 Expected: PASS — three tests ok.
 
 - [ ] **Step 8: Commit**
@@ -1387,7 +1460,7 @@ fn noise_values(seed: u64, frequency: f32) -> Vec<f32> {
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
     let field = pool
-        .acquire(&ctx, FieldDims::new(16, 16, 16), FieldFormat::R16Float)
+        .acquire(&ctx, FieldDims::new(16, 16, 16), FieldFormat::R32Float)
         .unwrap();
     fill_curl_noise(&ctx, &mut cache, &field, seed, frequency).unwrap();
     field.read_back(&ctx).unwrap()
@@ -1407,15 +1480,29 @@ fn different_seeds_produce_different_fields() {
     assert_ne!(a, b);
 }
 
+/// Seeds 7 and 8 above differ in their low bits, so they cannot detect a seed
+/// combination that discards information. These two collide under a bare XOR
+/// of the halves, which is the bug this guards against.
+#[test]
+fn seeds_that_collide_under_xor_produce_different_fields() {
+    let a = noise_values(0x0000_0001_0000_0000, 4.0);
+    let b = noise_values(0x0000_0000_0000_0001, 4.0);
+    assert_ne!(a, b, "distinct u64 seeds must not collapse to one field");
+}
+
 #[test]
 fn noise_stays_in_range_and_is_finite() {
     let values = noise_values(7, 4.0);
     assert_eq!(values.len(), 16 * 16 * 16);
     for v in &values {
         assert!(v.is_finite(), "noise produced a non-finite value: {v}");
+        // The analytic bound, not the clamp's range: three octaves at
+        // 0.5/0.25/0.125 over a hash bounded by [-1, 1] cannot exceed 0.875.
+        // Asserting the loose [-1, 1] would not detect a change to the octave
+        // amplitudes or the hash range; this does.
         assert!(
-            (-1.001..=1.001).contains(v),
-            "noise escaped [-1, 1]: {v}"
+            (-0.876..=0.876).contains(v),
+            "noise escaped its analytic bound of 0.875: {v}"
         );
     }
 }
@@ -1433,7 +1520,7 @@ fn noise_is_not_constant() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test noise`
+Run: `cargo test -p elements-core --test noise`
 Expected: FAIL — `unresolved import fill_curl_noise`.
 
 - [ ] **Step 3: Write the shader**
@@ -1455,7 +1542,7 @@ struct Params {
     _pad1: u32,
 };
 
-@group(0) @binding(0) var field: texture_storage_3d<r16float, write>;
+@group(0) @binding(0) var field: texture_storage_3d<r32float, write>;
 @group(0) @binding(1) var<uniform> params: Params;
 
 fn hash3(p: vec3<i32>, seed: u32) -> f32 {
@@ -1503,7 +1590,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let uvw = (vec3<f32>(gid) + vec3<f32>(0.5)) / vec3<f32>(params.dims);
-    let seed = params.seed_lo ^ params.seed_hi;
+    // Mix with an odd multiplier rather than a bare XOR: `lo ^ hi` collides
+    // for realistic seed-packing patterns such as `(frame << 32) | id`, where
+    // 0x1_0000_0000 and 0x1 both reduce to 1 and yield identical noise.
+    let seed = params.seed_lo ^ (params.seed_hi * 0x9e3779b9u);
 
     var value: f32 = 0.0;
     var amplitude: f32 = 0.5;
@@ -1514,7 +1604,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         freq = freq * 2.0;
     }
 
-    // Three octaves at 0.5/0.25/0.125 sum to at most 0.875; clamp defensively.
+    // Unreachable by construction: hash3 returns [-1, 1], the trilinear
+    // weights are a partition of unity, and three octaves at 0.5/0.25/0.125
+    // bound the sum to [-0.875, 0.875]. Kept because a later change to the
+    // octave count or amplitudes could make it reachable, and it costs nothing.
     textureStore(field, vec3<i32>(gid), vec4<f32>(clamp(value, -1.0, 1.0), 0.0, 0.0, 0.0));
 }
 ```
@@ -1597,7 +1690,7 @@ pub use dispatch::{
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test noise`
+Run: `cargo test -p elements-core --test noise`
 Expected: PASS — four tests ok.
 
 - [ ] **Step 6: Verify the whole workspace still passes**
@@ -1775,7 +1868,7 @@ fn values_report_type_mismatches() {
 #[test]
 fn field_values_carry_their_dims() {
     let (gpu, mut pool, _pipelines) = harness();
-    let field = pool.acquire(&gpu, FieldDims::new(2, 3, 4), FieldFormat::R16Float).unwrap();
+    let field = pool.acquire(&gpu, FieldDims::new(2, 3, 4), FieldFormat::R32Float).unwrap();
     let v = Value::Field(field);
     assert_eq!(v.as_field().unwrap().dims(), FieldDims::new(2, 3, 4));
 }
@@ -1791,7 +1884,7 @@ fn eval_without_an_output_is_an_error() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test graph`
+Run: `cargo test -p elements-core --test graph`
 Expected: FAIL — `error[E0432]: unresolved import elements_core::graph`.
 
 - [ ] **Step 3: Implement sockets**
@@ -1865,6 +1958,10 @@ pub enum NodeError {
 }
 
 /// A value travelling along a connection.
+///
+/// `Debug` is implemented by hand rather than derived: deriving would require
+/// `Field: Debug`, and `Field` deliberately has no `Debug` because printing a
+/// GPU texture handle is meaningless. The tests need `Debug` for `unwrap_err`.
 pub enum Value {
     Field(Field),
     Scalar(f32),
@@ -2217,7 +2314,7 @@ pub mod graph;
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test graph`
+Run: `cargo test -p elements-core --test graph`
 Expected: PASS — nine tests ok.
 
 - [ ] **Step 8: Commit**
@@ -2655,6 +2752,16 @@ fn noise_frequency_defaults_when_omitted() {
     let values = eval_doc(&doc);
     assert_eq!(values.len(), 512);
     assert!(values.iter().all(|v| v.is_finite()));
+
+    // Finiteness alone cannot detect the regression this test exists for. A
+    // plain `#[serde(default)]` yields frequency 0.0, which produces a
+    // perfectly finite CONSTANT field. Only checking that the values vary
+    // distinguishes the correct default from the zero one.
+    let first = values[0];
+    assert!(
+        values.iter().any(|v| (v - first).abs() > 1e-3),
+        "frequency defaulted to 0, producing a constant field"
+    );
 }
 
 #[test]
@@ -2668,7 +2775,7 @@ fn registry_exposes_all_three_builtins() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test nodes`
+Run: `cargo test -p elements-core --test nodes`
 Expected: FAIL — `registry_exposes_all_three_builtins` asserts against an empty list; the others fail with `UnknownKind`.
 
 - [ ] **Step 3: Implement ConstantField**
@@ -2703,7 +2810,7 @@ impl Node for ConstantField {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let field = ctx.acquire(FieldFormat::R16Float)?;
+        let field = ctx.acquire(FieldFormat::R32Float)?;
         let value = self.value;
         ctx.with_gpu(|gpu, cache| fill_constant(gpu, cache, &field, value))?;
         Ok(vec![Value::Field(field)])
@@ -2758,7 +2865,7 @@ impl Node for NoiseField {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let field = ctx.acquire(FieldFormat::R16Float)?;
+        let field = ctx.acquire(FieldFormat::R32Float)?;
         let (seed, frequency) = (self.seed, self.frequency);
         ctx.with_gpu(|gpu, cache| fill_curl_noise(gpu, cache, &field, seed, frequency))?;
         Ok(vec![Value::Field(field)])
@@ -2854,14 +2961,14 @@ pub mod nodes;
 
 - [ ] **Step 6: Run the node tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test nodes`
+Run: `cargo test -p elements-core --test nodes`
 Expected: PASS — four tests ok.
 
 - [ ] **Step 7: Unignore the deferred document tests**
 
 Modify `crates/elements-core/tests/document.rs`, deleting the three `#[ignore]` attributes and their `// unignore in Task 8` comments.
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-core --test document`
+Run: `cargo test -p elements-core --test document`
 Expected: PASS — seven tests ok, none ignored.
 
 - [ ] **Step 8: Commit**
@@ -2897,6 +3004,10 @@ fn ramp(dims: [u32; 3]) -> Vec<f32> {
     let n = (dims[0] * dims[1] * dims[2]) as usize;
     (0..n).map(|i| i as f32 / n as f32).collect()
 }
+
+// Test dimensions are deliberately NON-CUBIC. A transposed axis order still
+// round-trips perfectly through read_npy, so with cubic dims the bug would be
+// undetectable; with [4, 3, 2] the dims assertion catches it.
 
 #[test]
 fn npy_round_trips() {
@@ -2936,7 +3047,7 @@ fn png_writes_the_requested_slice() {
 
     write_slice_png(&path, &values, [8, 8, 4], 2, (0.0, 3.0)).unwrap();
 
-    let decoder = png::Decoder::new(std::fs::File::open(&path).unwrap());
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
     let mut reader = decoder.read_info().unwrap();
     let mut buf = vec![0; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut buf).unwrap();
@@ -2955,7 +3066,7 @@ fn png_clamps_out_of_range_values() {
 
     write_slice_png(&path, &values, [2, 2, 1], 0, (0.0, 1.0)).unwrap();
 
-    let decoder = png::Decoder::new(std::fs::File::open(&path).unwrap());
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
     let mut reader = decoder.read_info().unwrap();
     let mut buf = vec![0; reader.output_buffer_size().unwrap()];
     reader.next_frame(&mut buf).unwrap();
@@ -2993,7 +3104,7 @@ repository.workspace = true
 
 [dependencies]
 half.workspace = true
-ndarray = "0.16"
+ndarray = "0.17.2"  # the version ndarray-npy 0.10.0 requires
 ndarray-npy.workspace = true
 png.workspace = true
 thiserror.workspace = true
@@ -3002,7 +3113,8 @@ thiserror.workspace = true
 tempfile.workspace = true
 ```
 
-If `cargo build -p elements-io` reports that `ndarray-npy` 0.10 needs a different `ndarray` minor, run `cargo add ndarray -p elements-io` and let cargo pick the compatible version. Record whichever version resolves in this manifest.
+**Verified:** `ndarray-npy` 0.10.0 requires `ndarray` 0.17.2. A mismatched pair
+fails with a confusing trait error rather than a clear version message.
 
 - [ ] **Step 4: Implement NPY**
 
@@ -3069,8 +3181,13 @@ use crate::IoError;
 
 /// Write one z-slice as 8-bit greyscale, mapping `range` linearly onto 0..=255.
 ///
-/// Values outside `range` are clamped rather than wrapped, so a blown-up
-/// simulation reads as saturated white instead of noise.
+/// Values outside `range` are clamped rather than wrapped, and **non-finite
+/// values saturate to white**, so a blown-up simulation is visually obvious.
+/// That second rule is load-bearing: `f32::clamp` returns NaN unchanged, and
+/// `NaN as u8` is 0, so without an explicit check a diverged field would render
+/// as a plausible dark region — the opposite of what these previews are for.
+/// `NEG_INFINITY` is white too: one consistent "non-finite is white" rule reads
+/// more reliably at a glance than a physically intuitive split.
 pub fn write_slice_png(
     path: &Path,
     values: &[f32],
@@ -3332,14 +3449,16 @@ Modify `crates/elements-io/Cargo.toml` `[dev-dependencies]`:
 
 ```toml
 [dev-dependencies]
-glam = "0.29"
+glam = "0.24"  # the version vdb-rs 0.6.0 re-exports; 0.29 puts two incompatible glam crates in the graph
 tempfile.workspace = true
 vdb-rs.workspace = true
 ```
 
 `vdb-rs` pulls in `blosc-src`, which needs a C compiler in CI. `ubuntu-24.04` has one. If the build fails for want of `libblosc`, add `sudo apt-get install -y libblosc-dev` to the CI install step. `vdb-rs` is a dev-dependency only and never ships in the engine.
 
-`glam` must match the version `vdb-rs` re-exports in its public API, or the `IVec3` comparison will not type-check. If `cargo test` reports two `glam` versions, run `cargo tree -p vdb-rs | grep glam` and pin this entry to that version.
+**Verified:** `vdb-rs` 0.6.0 re-exports `glam` **0.24.2**. Pinning 0.29 puts two
+incompatible `glam` crates in the graph and the `IVec3` assertions fail to
+type-check.
 
 - [ ] **Step 4: Implement the byte writer**
 
@@ -3518,7 +3637,11 @@ pub fn write_archive_header<W: Write + Seek>(
     w: &mut ByteWriter<W>,
     uuid: &str,
 ) -> Result<(), IoError> {
-    debug_assert_eq!(uuid.len(), 36, "OpenVDB stores a fixed 36-byte UUID");
+    // A real error, not a debug_assert: that would compile out in release and
+    // silently write a corrupt archive for a malformed UUID.
+    if uuid.len() != 36 {
+        return Err(IoError::BadUuid { len: uuid.len() });
+    }
 
     w.u64(OPENVDB_MAGIC)?;
     w.u32(OPENVDB_FILE_VERSION)?;
@@ -3706,6 +3829,44 @@ fn vdb_rs_reads_a_full_tree_from_our_writer() {
     assert_eq!(grid.tree.root_nodes.len(), 1);
     let root = &grid.tree.root_nodes[0];
     assert_eq!(root.child_mask.count_ones(), 1, "one 128^3 internal node");
+}
+
+/// The single-leaf tests above CANNOT detect a two-pass ordering bug: with one
+/// leaf there is only one possible order. Reversing the leaf iteration in the
+/// data pass only — the most likely real defect in this task — passes every
+/// other test in this file. Two leaves with distinct values is the minimum that
+/// catches it.
+#[test]
+fn leaf_values_are_not_scrambled_across_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two_leaves.vdb");
+    // 16 along x spans two leaves; give each a distinct constant value.
+    let dims = [16u32, 8, 8];
+    let mut values = vec![0.0f32; 16 * 8 * 8];
+    for z in 0..8 {
+        for y in 0..8 {
+            for x in 0..16 {
+                let i = (z * 8 + y) * 16 + x;
+                values[i] = if x < 8 { 1.0 } else { 2.0 };
+            }
+        }
+    }
+
+    write_float_grid(&path, "density", &values, dims, 0.1, 0.0).unwrap();
+
+    let file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+    let mut reader = vdb_rs::VdbReader::new(file).unwrap();
+    let grid = reader.read_grid::<f32>("density").unwrap();
+
+    // Every voxel must come back with its own leaf's value, not the other's.
+    for (coord, value) in grid.iter() {
+        let expected = if coord.x < 8 { 1.0 } else { 2.0 };
+        assert_eq!(
+            value, expected,
+            "voxel {coord:?} has the other leaf's value: the two write passes \
+             disagree on leaf order"
+        );
+    }
 }
 
 #[test]
@@ -3915,6 +4076,12 @@ pub fn write_float_grid(
                     dims[2].saturating_sub(1) as i32,
                 ]),
             ),
+            // The grid's own name, as a metadata entry. This is NOT redundant
+            // with the name in the grid descriptor: vdb-rs reads the descriptor,
+            // but real OpenVDB (and therefore Blender) reads this entry, and
+            // without it the grid loads with an empty name. Every vdb-rs test
+            // passed without it — the oracle could not see the defect.
+            ("name", MetaValue::String(name.to_owned())),
             ("class", MetaValue::String("unknown".to_owned())),
             (
                 "file_voxel_count",
@@ -4353,7 +4520,7 @@ fn render_preview_writes_a_png_of_the_right_size() {
         .unwrap();
     assert!(status.success());
 
-    let decoder = png::Decoder::new(std::fs::File::open(&out).unwrap());
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap()));
     let reader = decoder.read_info().unwrap();
     assert_eq!(reader.info().width, 8);
     assert_eq!(reader.info().height, 8);
@@ -4661,7 +4828,7 @@ Open `noise_8_z4.png`. It must look like smooth structured noise, not uniform gr
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elements-cli`
+Run: `cargo test -p elements-cli`
 Expected: PASS — five tests ok.
 
 - [ ] **Step 8: Commit**
@@ -5798,6 +5965,10 @@ use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions, Stream as RawStream,
     ToFsName, ToNsName,
 };
+// `try_clone` is NOT in the local_socket prelude: it is a separate top-level
+// trait implemented on the concrete Stream enum. Verified against
+// interprocess 2.4.4.
+use interprocess::TryClone;
 
 use crate::ProtocolError;
 
@@ -5872,7 +6043,29 @@ impl Listener {
 }
 ```
 
-If `interprocess` 2.4's `try_clone` is not available on `Stream`, keep one `Stream` and construct the `BufReader` over a borrowed `&mut` reference instead, restructuring the daemon loop to read and write through the same handle sequentially. The tests use `try_clone` only for clarity.
+**Verified:** `Stream::try_clone` exists in `interprocess` 2.4.4, but comes from
+the top-level `interprocess::TryClone` trait rather than the `local_socket`
+prelude — importing only the prelude gives a confusing "method not found" error
+on a method that does exist.
+
+**A dropped readiness line makes the session tests HANG, not fail.** A hang is
+not a passing test and not a failing one; it yields no signal and stalls CI.
+Add a bounded test that reads the readiness line on a background thread with
+`mpsc::recv_timeout`, so the failure is deterministic and quick:
+
+```rust
+#[test]
+fn the_readiness_line_arrives_promptly_after_bind() {
+    // A missing or unflushed readiness line would otherwise hang every
+    // consumer indefinitely, including the Blender add-on.
+    let (tx, rx) = std::sync::mpsc::channel();
+    // ... spawn the daemon, read one line on a worker thread, send it ...
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("daemon did not announce readiness within 5s");
+    assert!(line.starts_with("ready "), "daemon said: {line}");
+}
+```
 
 Modify `crates/elements-ipc/src/lib.rs`, adding:
 
@@ -6135,7 +6328,7 @@ fn serve(mut stream: elements_ipc::Stream, channel: &std::path::Path) -> anyhow:
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elementsd`
+Run: `cargo test -p elementsd`
 Expected: PASS — five tests ok.
 
 - [ ] **Step 6: Commit**
@@ -6322,7 +6515,7 @@ fn the_python_client_speaks_the_real_protocol() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elementsd --test python_contract`
+Run: `cargo test -p elementsd --test python_contract`
 Expected: FAIL — python exits non-zero with `ModuleNotFoundError: No module named 'blender_elements'`.
 
 - [ ] **Step 3: Implement the client**
@@ -6539,7 +6732,7 @@ class FrameReader:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `WGPU_BACKEND=vulkan cargo test -p elementsd --test python_contract`
+Run: `cargo test -p elementsd --test python_contract`
 Expected: PASS — `the_python_client_speaks_the_real_protocol ... ok`.
 
 - [ ] **Step 5: Confirm CI runs this on Blender's Python**
@@ -7233,9 +7426,25 @@ python3 -c "import zipfile; ns=zipfile.ZipFile('dist/blender_elements-0.1.0.zip'
 ```
 Expected: `layout ok [...]`.
 
+- [ ] **Step 6b: Add the extension build to CI**
+
+`scripts/build_addon.py` now exists, so CI can build and verify the extension.
+Task 1 deliberately left this step out to avoid seventeen tasks of red CI.
+
+Modify `.github/workflows/ci.yml`, appending to the `test` job's steps:
+
+```yaml
+      - name: Build the Blender extension
+        run: just addon
+```
+
+Run: `just addon`
+Expected: `built .../dist/blender_elements-0.1.0.zip with 7 files`, confirming
+the step CI will now run passes locally first.
+
 - [ ] **Step 7: Run the Blender integration test**
 
-Run: `BLENDER_BIN=$(command -v blender) WGPU_BACKEND=vulkan cargo test -p elementsd --test blender_integration -- --nocapture`
+Run: `BLENDER_BIN=$(command -v blender) cargo test -p elementsd --test blender_integration -- --nocapture`
 Expected: PASS with `blender roundtrip ok` in the output.
 
 Or simply: `just blender-test`, which locates Blender on PATH or in
@@ -7280,6 +7489,12 @@ git commit -m "feat: add Blender extension with engine control panel and packagi
 
 Every box below must be checked with a command that was actually run.
 
+- [ ] **CI has actually run at least once and is green.** Development proceeds
+      local-only on Metal (decided 2026-09-19), so this is deferred to
+      close-out rather than skipped: add a git remote, push `core-v1`, and fix
+      every lavapipe failure. Expect backend divergence — Task 2 established
+      that Metal and software Vulkan disagree about what counts as a validation
+      error, so GPU tests passing locally is not evidence they pass in CI.
 - [ ] `cargo test --workspace` passes on lavapipe in CI.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - [ ] `elements bake` produces a `.vdb` that opens in Blender by hand, not only in `vdb-rs`.
@@ -7288,7 +7503,15 @@ Every box below must be checked with a command that was actually run.
 - [ ] `blender --background` installs the built ZIP and renders one frame.
 - [ ] The built ZIP has `__init__.py` and `blender_manifest.toml` at its root with nothing nested.
 - [ ] A deliberately broken graph produces a typed error in the Blender panel and leaves the engine running.
-- [ ] The **Live** toggle has been verified by hand in an interactive Blender session (it cannot be covered headlessly).
+- [ ] The **Live** toggle has been verified by hand in an interactive Blender
+      session (it cannot be covered headlessly). It is labelled EXPERIMENTAL in
+      the UI: each redraw spawns a full CLI process on Blender's UI thread and
+      the volume update schedules another redraw, so expect it to be rough
+      until Ember provides an in-memory path.
+- [ ] **Do NOT claim the data plane is proven end to end.** The add-on reads the
+      memory-mapped frame and discards it; the viewport geometry comes from the
+      CLI. The channel has no production consumer and is verified only against
+      our own reader implementations. Recorded in `handlers.py` and spec 3.6.
 
 ---
 
@@ -7297,6 +7520,13 @@ Every box below must be checked with a command that was actually run.
 Deliberately deferred here, and the first things Ember will need:
 
 - **Multi-consumer outputs.** Task 6 restricts each output to one input so values can be moved. Ember's graphs branch; this needs reference counting or a copy node.
+- **Partial writes read stale data.** `FieldPool::acquire` returns a recycled
+  texture whose contents are whatever the last user left, and the contract that
+  callers must fully write a field before reading it is enforced only by a doc
+  comment. Every Core v1 node writes every voxel, so this is safe today. The
+  first node that writes only part of a field — a masked or sparse write — will
+  silently read the previous frame's data in the untouched voxels. Whichever
+  task introduces that must either zero on acquire or track written regions.
 - **Cross-frame state.** `FieldPool` recycles within a frame. A solver needs fields that persist between frames, which changes the pool's lifetime model.
 - **Time.** `Command::Render { frame }` carries a frame number the engine currently ignores. Nodes will need it.
 - **In-memory volume handoff.** Task 18 round-trips a `.vdb` through disk. Ember should push grids to Blender without the file.

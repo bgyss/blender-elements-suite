@@ -6,6 +6,17 @@
 specification for **Core v1**, which is the first implementation plan. Each
 product (Ember, Tide, Strata, Weave) gets its own spec later.
 
+> **This is the design as written before implementation, kept as written.**
+> Several decisions changed once the code met reality, and the reasons are
+> recorded in the plan's "Deviations from the spec" section rather than by
+> editing this document into agreement with the outcome. Where the two differ,
+> the plan and the code are authoritative. The substantive changes:
+> the control plane is newline-delimited JSON, not CBOR; the data plane is a
+> memory-mapped file, not POSIX shared memory; the add-on is pure Python with
+> **no wheel**; scalar fields are `R32Float`, not `R16Float`, because the WebGPU
+> baseline forbids `R16Float` as a storage texture; and section 3.6's data flow
+> is not achieved (see the note there).
+
 ---
 
 ## 1. Goal
@@ -199,6 +210,14 @@ afterthought — it is what turns a broken shader into a diffable image.
 in CI.
 
 ### 3.6 Data flow, one frame
+
+> **Not achieved in Core v1.** The diagram below is the intended design. What
+> ships reads the frame for a status readout and a length check and then
+> discards it; the geometry Blender renders comes from shelling out to the
+> `elements` CLI, because bpy cannot build an OpenVDB grid in memory. The frame
+> channel consequently has no production consumer and is exercised only by our
+> own tests. Closing this needs an in-memory volume path, which arrives with
+> Ember. Do not cite this section as delivered.
 
 ```
 addon  --CBOR-->  daemon

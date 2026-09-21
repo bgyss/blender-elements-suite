@@ -1,0 +1,10 @@
+# Requires Xcode Command Line Tools on macOS. See README.md "Development setup".
+# On this machine `~/.nix-profile/bin` precedes `/usr/bin` in PATH, so the
+# default `cc` resolves to nix's GCC/ld, which cannot parse this macOS SDK's
+# libSystem.tbd ("unknown architecture arm64e.x1-macos") and fails every link.
+# Pin the linker to Xcode's own cc on macOS targets only; Linux CI is unaffected.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/cc"

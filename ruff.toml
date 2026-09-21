@@ -1,0 +1,10 @@
+# Blender 5.0 ships Python 3.11; the add-on must import cleanly there.
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[lint.per-file-ignores]
+# Blender's API is injected at runtime; bpy imports resolve only inside Blender.
+"addon/**" = ["E402"]

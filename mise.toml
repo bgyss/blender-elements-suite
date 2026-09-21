@@ -1,0 +1,11 @@
+# Rust is deliberately absent: rustup owns it via rust-toolchain.toml.
+[tools]
+python = "3.11"        # Blender 5.0's Python; the oldest version the add-on must import on
+ruff = "latest"
+uv = "latest"
+just = "latest"
+"cargo:cargo-nextest" = "latest"
+
+[env]
+# Keep cargo's target dir out of the addon tree so build_addon.py never sees it.
+CARGO_TERM_COLOR = "always"
