@@ -29,10 +29,30 @@ def _ensure_volume(context) -> bpy.types.Object:
 def push_frame_to_volume(context, values, dims) -> bpy.types.Object:
     """Point the Volume object at a freshly baked .vdb of the current graph.
 
-    `values` and `dims` come from the shared-memory frame and are used for the
-    status readout and sanity checks; the geometry Blender renders comes from
-    the engine's own VDB writer, because the add-on must never reimplement the
-    file format in Python.
+    KNOWN GAP — the shared-memory frame is NOT the source of the geometry.
+
+    `values` and `dims` arrive over the memory-mapped frame channel and are used
+    here for the status readout and a length sanity check, and then DISCARDED.
+    What Blender actually renders comes from `_bake_current_graph_to()`, which
+    shells out to the `elements` CLI — a third process that creates its own GPU
+    device and re-evaluates the graph from the `.elements` file on disk.
+
+    The workaround is legitimate: bpy cannot build an OpenVDB grid in memory,
+    and the add-on must never reimplement the file format in Python. But the
+    consequence is real and is recorded rather than glossed:
+
+    * The design spec's data-flow diagram (section 3.6), which shows the draw
+      handler copying the frame into the Volume grid, describes an intent, not
+      what ships. Do not cite it as achieved.
+    * The frame channel therefore has no production consumer. It is exercised
+      end to end only by the Rust test suite and `tests/python/contract.py`,
+      both of which are our own model of a reader rather than a real one.
+    * The daemon renders the graph it loaded at Start Engine; the CLI bakes the
+      graph file as it exists NOW. Edit the document after starting the engine
+      and the status line reports the engine's dims while the viewport shows a
+      different evaluation. Nothing checks that the two agree.
+
+    Closing this needs an in-memory volume path, which arrives with Ember.
     """
     obj = _ensure_volume(context)
 

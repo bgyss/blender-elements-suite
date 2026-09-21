@@ -22,7 +22,15 @@ class VIEW3D_PT_elements(bpy.types.Panel):
         row.operator("elements.stop_engine", icon="PAUSE")
 
         layout.operator("elements.render_frame", icon="FILE_REFRESH")
-        layout.prop(settings, "live", toggle=True, icon="REC")
+
+        # Live is EXPERIMENTAL in Core v1 and labelled as such in the UI rather
+        # than only in the docs. Each redraw spawns a full `elements` CLI
+        # process on Blender's UI thread, and updating the volume schedules
+        # another redraw, so it can run away on anything but a tiny graph.
+        # It becomes practical once Ember provides an in-memory volume path.
+        live_row = layout.row(align=True)
+        live_row.prop(settings, "live", toggle=True, icon="REC", text="Live (experimental)")
+
         layout.label(text=settings.status, icon="INFO")
 
 

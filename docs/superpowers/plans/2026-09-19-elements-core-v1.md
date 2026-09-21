@@ -7503,7 +7503,15 @@ Every box below must be checked with a command that was actually run.
 - [ ] `blender --background` installs the built ZIP and renders one frame.
 - [ ] The built ZIP has `__init__.py` and `blender_manifest.toml` at its root with nothing nested.
 - [ ] A deliberately broken graph produces a typed error in the Blender panel and leaves the engine running.
-- [ ] The **Live** toggle has been verified by hand in an interactive Blender session (it cannot be covered headlessly).
+- [ ] The **Live** toggle has been verified by hand in an interactive Blender
+      session (it cannot be covered headlessly). It is labelled EXPERIMENTAL in
+      the UI: each redraw spawns a full CLI process on Blender's UI thread and
+      the volume update schedules another redraw, so expect it to be rough
+      until Ember provides an in-memory path.
+- [ ] **Do NOT claim the data plane is proven end to end.** The add-on reads the
+      memory-mapped frame and discards it; the viewport geometry comes from the
+      CLI. The channel has no production consumer and is verified only against
+      our own reader implementations. Recorded in `handlers.py` and spec 3.6.
 
 ---
 
