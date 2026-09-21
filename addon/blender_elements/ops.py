@@ -74,6 +74,18 @@ class ELEMENTS_OT_start_engine(bpy.types.Operator):
             self.report({"ERROR"}, settings.status)
             return {"CANCELLED"}
 
+        # The bake CLI lives beside the daemon and is only needed later, by
+        # render_frame -> _bake_current_graph_to. Check it here too so a
+        # missing second binary is reported at engine start, not the first
+        # time the user clicks Render.
+        cli = os.path.join(os.path.dirname(daemon), "elements")
+        if os.name == "nt":
+            cli += ".exe"
+        if not os.path.exists(cli):
+            settings.status = f"Engine CLI executable not found: {cli}"
+            self.report({"ERROR"}, settings.status)
+            return {"CANCELLED"}
+
         try:
             process = subprocess.Popen(
                 [
@@ -183,6 +195,14 @@ class ELEMENTS_OT_render_frame(bpy.types.Operator):
             settings.status = f"Frame {seq} — {frame['dims']}"
         except ElementsError as e:
             settings.status = f"{e.kind}: {e.message}"
+            self.report({"ERROR"}, settings.status)
+            return {"CANCELLED"}
+        except OSError as e:
+            # _bake_current_graph_to shells out to the CLI binary beside the
+            # daemon; if it is missing, subprocess.run raises FileNotFoundError
+            # (an OSError subclass), not ElementsError. Surface it the same
+            # way rather than letting it escape as a raw traceback.
+            settings.status = f"io: {e}"
             self.report({"ERROR"}, settings.status)
             return {"CANCELLED"}
 

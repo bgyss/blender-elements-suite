@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use elements_io::vdb::{
     ByteWriter, COMPRESSION_ACTIVE_MASK, MetaValue, OPENVDB_MAGIC, write_archive_header,
-    write_grid_descriptor, write_metadata,
+    write_float_grid, write_grid_descriptor, write_metadata,
 };
 
 /// Build a file containing a header and one grid whose body is metadata only.
@@ -94,6 +94,51 @@ fn write_archive_header_rejects_a_malformed_uuid() {
         matches!(err, elements_io::IoError::BadUuid { len: 10 }),
         "got {err:?}"
     );
+}
+
+/// `vdb_rs_lists_our_grid_by_name` reads the grid name from the archive's grid
+/// DESCRIPTOR, so it would pass identically whether or not the grid's own
+/// metadata map carries a "name" entry -- it is not an oracle for the fix in
+/// `tree.rs`, which adds that entry because real OpenVDB (and Blender's
+/// bundled build) reads a grid's *display* name from its metadata map, not
+/// the descriptor. This test scans the written bytes directly, independent
+/// of `vdb-rs`, for the metadata record that stores it: a length-prefixed key
+/// "name", a length-prefixed type "string", the payload length, and the name
+/// bytes -- exactly the encoding `MetaValue::write` produces, using the same
+/// byte-scanning technique as `archive_header_starts_with_the_openvdb_magic`.
+#[test]
+fn grid_metadata_contains_the_grid_name() {
+    let dir = std::env::temp_dir().join(format!(
+        "elements-io-test-{}-{}",
+        std::process::id(),
+        "grid_metadata_contains_the_grid_name"
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("density.vdb");
+
+    let name = "density";
+    write_float_grid(&path, name, &[0.0f32; 8], [2, 2, 2], 1.0, 0.0).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+
+    let mut expected = Vec::new();
+    let key = b"name";
+    expected.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    expected.extend_from_slice(key);
+    let type_name = b"string";
+    expected.extend_from_slice(&(type_name.len() as u32).to_le_bytes());
+    expected.extend_from_slice(type_name);
+    expected.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    expected.extend_from_slice(name.as_bytes());
+
+    let found = bytes
+        .windows(expected.len())
+        .any(|window| window == expected.as_slice());
+    assert!(
+        found,
+        "did not find a metadata record naming the grid {name:?} in the written file bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -49,7 +49,19 @@ def check_truncated_channel_file_rejected() -> None:
             raise AssertionError("expected ElementsError for a truncated channel file")
 
 
+def check_python_version() -> None:
+    """The Core v1 DoD commits to py311; assert it and print it so a run's
+    log is self-evidencing about which interpreter actually exercised this
+    contract, instead of trusting the caller to have set one up correctly."""
+    assert sys.version_info[:2] == (3, 11), (
+        f"tests/python/contract.py must run on Python 3.11, got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}"
+    )
+    print(f"python version: {sys.version_info[0]}.{sys.version_info[1]}")
+
+
 def main(endpoint: str, channel: str, graph: str) -> None:
+    check_python_version()
     check_truncated_channel_file_rejected()
 
     with ControlClient(endpoint) as client:

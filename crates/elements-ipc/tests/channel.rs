@@ -140,6 +140,89 @@ fn absurd_dims_report_field_too_large_instead_of_overflowing() {
     }
 }
 
+/// Helper: a bare `CHANNEL_HEADER_BYTES`-long header with the given fields,
+/// no buffer data following it. Mirrors `a_truncated_channel_file_is_rejected`.
+fn raw_header(dims: [u32; 3], channels: u32, buffer_bytes: u64) -> Vec<u8> {
+    let mut header = vec![0u8; CHANNEL_HEADER_BYTES];
+    header[0..4].copy_from_slice(&CHANNEL_MAGIC.to_le_bytes());
+    header[4..8].copy_from_slice(&CHANNEL_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&dims[0].to_le_bytes());
+    header[12..16].copy_from_slice(&dims[1].to_le_bytes());
+    header[16..20].copy_from_slice(&dims[2].to_le_bytes());
+    header[20..24].copy_from_slice(&channels.to_le_bytes());
+    header[24..32].copy_from_slice(&buffer_bytes.to_le_bytes());
+    header[32..40].copy_from_slice(&0u64.to_le_bytes());
+    header
+}
+
+// The following three regression tests reproduce panics found by review in
+// `FrameReader::open`/`read_latest` on a malformed channel file: an
+// internally-inconsistent header used to reach `copy_from_slice` (length
+// mismatch) in `read_latest`, and both `buffer_bytes = u64::MAX` and
+// `dims = [u32::MAX; 3]` used to panic on overflowing arithmetic in `open`
+// itself (in debug; silently wrapped in release). `FrameReader::open` now
+// routes through `checked_value_count_and_bytes` and cross-checks
+// `buffer_bytes` against what `dims`/`channels` imply, so all three now
+// return a typed `ChannelError` instead.
+
+#[test]
+fn an_internally_inconsistent_header_is_rejected_not_panicked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inconsistent.bin");
+
+    // dims=[2,2,2], channels=1 implies 8 values (32 bytes), but the header
+    // claims buffer_bytes=64. The file is padded to the *declared* size
+    // (header + 2*64) so the old code's map-length check alone would not
+    // catch this -- only the removed cross-check in `open`, or the
+    // `copy_from_slice` in `read_latest` (64 vs. 32 bytes), would.
+    let header = raw_header([2, 2, 2], 1, 64);
+    let mut bytes = header;
+    bytes.resize(CHANNEL_HEADER_BYTES + 2 * 64, 0);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let reader = match FrameReader::open(&path) {
+        Err(ChannelError::LengthMismatch { .. }) => return,
+        Err(other) => panic!("expected LengthMismatch or Ok, got {other:?}"),
+        Ok(reader) => reader,
+    };
+    match reader.read_latest() {
+        Err(ChannelError::LengthMismatch { .. }) => {}
+        other => panic!("expected LengthMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_buffer_bytes_of_u64_max_is_rejected_not_panicked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge-buffer-bytes.bin");
+
+    // `CHANNEL_HEADER_BYTES + 2 * buffer_bytes` previously overflowed
+    // computing this (panic in debug, silent wraparound in release).
+    let header = raw_header([1, 1, 1], 1, u64::MAX);
+    std::fs::write(&path, &header).unwrap();
+
+    match FrameReader::open(&path) {
+        Err(ChannelError::LengthMismatch { .. }) => {}
+        other => panic!("expected LengthMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn dims_of_u32_max_are_rejected_not_panicked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge-dims.bin");
+
+    // `value_count` previously computed `dims[0] * dims[1] * dims[2] *
+    // channels` in `usize` with a plain multiplication, overflowing.
+    let header = raw_header([u32::MAX, u32::MAX, u32::MAX], 1, 0);
+    std::fs::write(&path, &header).unwrap();
+
+    match FrameReader::open(&path) {
+        Err(ChannelError::FieldTooLarge { .. }) => {}
+        other => panic!("expected FieldTooLarge, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_reader_detects_a_reallocated_channel() {
     let dir = tempfile::tempdir().unwrap();

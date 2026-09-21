@@ -77,10 +77,6 @@ pub struct ChannelHeader {
     pub seq: u64,
 }
 
-fn value_count(dims: [u32; 3], channels: u32) -> usize {
-    dims[0] as usize * dims[1] as usize * dims[2] as usize * channels as usize
-}
-
 /// Compute `(values, buffer_bytes)` for `dims`/`channels` using checked
 /// arithmetic throughout, so a hostile document's dims cannot overflow this
 /// computation into a panic (under `overflow-checks = true`) or a silently
@@ -308,19 +304,44 @@ impl FrameReader {
             read_u32(&map, OFF_DIMS + 8),
         ];
         let channels = read_u32(&map, OFF_CHANNELS);
-        let buffer_bytes = read_u64(&map, OFF_BUFFER_BYTES) as usize;
-        let values = value_count(dims, channels);
+        let buffer_bytes_raw = read_u64(&map, OFF_BUFFER_BYTES);
 
-        // `buffer_bytes` was just read from the file, which this crate did
-        // not necessarily write (a crashed process may have left a truncated
-        // file mid-write, or a test/fixture may hand-build one with a wrong
-        // size). It must be validated against the real mapping length before
-        // it is ever used to slice into `map`, or a malformed file turns
-        // into an out-of-bounds panic in `read_latest` instead of an error.
-        let expected = CHANNEL_HEADER_BYTES + 2 * buffer_bytes;
-        if map.len() < expected {
+        // `dims`/`channels`/`buffer_bytes` were just read from the file,
+        // which this crate did not necessarily write (a crashed process may
+        // have left a truncated file mid-write, or a test/fixture may
+        // hand-build one with inconsistent or malicious values). None of it
+        // can be trusted before it is validated:
+        //
+        // - `dims`/`channels` might overflow the value-count computation
+        //   (e.g. dims = [u32::MAX; 3]) -- route through the same checked
+        //   arithmetic `FrameWriter::create` uses, rather than a plain
+        //   multiplication, so this returns `FieldTooLarge` instead of
+        //   panicking (debug) or wrapping (release).
+        // - `buffer_bytes` alone might overflow `CHANNEL_HEADER_BYTES + 2 *
+        //   buffer_bytes` (e.g. `u64::MAX`) -- do that addition in `u64` with
+        //   checked arithmetic too.
+        // - `buffer_bytes` might simply disagree with what `dims`/`channels`
+        //   imply (internally inconsistent header) -- that mismatch would
+        //   otherwise surface as a `copy_from_slice` length-mismatch panic in
+        //   `read_latest` instead of a typed error here.
+        let (values, expected_buffer_bytes) = checked_value_count_and_bytes(dims, channels)?;
+        if buffer_bytes_raw != expected_buffer_bytes as u64 {
             return Err(ChannelError::LengthMismatch {
-                expected,
+                expected: expected_buffer_bytes,
+                got: buffer_bytes_raw as usize,
+            });
+        }
+        let buffer_bytes = expected_buffer_bytes;
+
+        // Validate against the real mapping length before `buffer_bytes` is
+        // ever used to slice into `map`, or a malformed/truncated file turns
+        // into an out-of-bounds panic in `read_latest` instead of an error.
+        let expected = (CHANNEL_HEADER_BYTES as u64)
+            .checked_add(2 * buffer_bytes as u64)
+            .ok_or(ChannelError::FieldTooLarge { dims, channels })?;
+        if (map.len() as u64) < expected {
+            return Err(ChannelError::LengthMismatch {
+                expected: expected as usize,
                 got: map.len(),
             });
         }

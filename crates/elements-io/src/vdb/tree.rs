@@ -35,7 +35,7 @@ pub fn internal_child_offset(x: u32, y: u32, z: u32) -> usize {
 }
 
 /// Linear index of an internal node within the root child.
-pub fn root_child_offset(x: u32, y: u32, z: u32) -> usize {
+pub fn internal_node_slot_offset(x: u32, y: u32, z: u32) -> usize {
     ((((x & 4095) >> 7) << 10) | (((y & 4095) >> 7) << 5) | ((z & 4095) >> 7)) as usize
 }
 
@@ -122,7 +122,7 @@ fn build_tree(
                     (z as usize * dims[1] as usize + y as usize) * dims[0] as usize + x as usize;
                 let value = values[linear];
 
-                let r = root_child_offset(x, y, z);
+                let r = internal_node_slot_offset(x, y, z);
                 let i = internal_child_offset(x, y, z);
                 let v = leaf_voxel_offset(x, y, z);
 

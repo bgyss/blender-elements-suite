@@ -79,7 +79,6 @@ fn pipeline_cache_returns_the_same_compiled_pipeline() {
 }
 
 #[test]
-#[should_panic(expected = "PipelineCache key collision")]
 fn pipeline_cache_detects_a_key_collision() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
     let mut cache = PipelineCache::new();
@@ -90,7 +89,18 @@ fn pipeline_cache_detects_a_key_collision() {
         .get_or_create(&ctx, "shared-key", constant_source, "main")
         .unwrap();
     // Same key, different source: this must be caught, not silently accepted.
-    let _ = cache.get_or_create(&ctx, "shared-key", noise_source, "main");
+    // A real, always-on `Err` (not a `debug_assert_eq!`, which compiles out
+    // of the release builds `elementsd` ships) so a cache hit can never
+    // silently hand back the wrong compiled pipeline.
+    match cache.get_or_create(&ctx, "shared-key", noise_source, "main") {
+        Err(GpuError::Validation(message)) => {
+            assert!(
+                message.contains("shared-key"),
+                "error should name the colliding key, got: {message}"
+            );
+        }
+        other => panic!("expected GpuError::Validation, got {other:?}"),
+    }
 }
 
 #[test]

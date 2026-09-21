@@ -1,4 +1,6 @@
-use elements_io::vdb::{BitMask, internal_child_offset, leaf_voxel_offset, root_child_offset};
+use elements_io::vdb::{
+    BitMask, internal_child_offset, internal_node_slot_offset, leaf_voxel_offset,
+};
 use elements_io::write_float_grid;
 
 #[test]
@@ -22,11 +24,11 @@ fn internal_child_offsets_index_16_cubed() {
 }
 
 #[test]
-fn root_child_offsets_index_32_cubed() {
-    assert_eq!(root_child_offset(0, 0, 0), 0);
-    assert_eq!(root_child_offset(0, 0, 128), 1);
-    assert_eq!(root_child_offset(0, 128, 0), 32);
-    assert_eq!(root_child_offset(128, 0, 0), 1024);
+fn internal_node_slot_offsets_index_32_cubed() {
+    assert_eq!(internal_node_slot_offset(0, 0, 0), 0);
+    assert_eq!(internal_node_slot_offset(0, 0, 128), 1);
+    assert_eq!(internal_node_slot_offset(0, 128, 0), 32);
+    assert_eq!(internal_node_slot_offset(128, 0, 0), 1024);
 }
 
 #[test]

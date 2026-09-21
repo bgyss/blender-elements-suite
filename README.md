@@ -1,6 +1,6 @@
 # Elements Suite
 
-An open-source, Rust-based suite of real-time VFX authoring tools for Blender. The core engine (`crates/`) is dual-licensed Apache-2.0 OR MIT; the Blender add-on (`addon/`) will be GPL-3.0-or-later.
+An open-source, Rust-based suite of real-time VFX authoring tools for Blender. The core engine (`crates/`) is dual-licensed Apache-2.0 OR MIT; the Blender add-on (`addon/`) is GPL-3.0-or-later.
 
 ## Development setup
 

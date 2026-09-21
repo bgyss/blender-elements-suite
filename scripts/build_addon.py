@@ -16,7 +16,7 @@ SRC = ROOT / "addon" / "blender_elements"
 VERSION = "0.1.0"
 OUT = ROOT / "dist" / f"blender_elements-{VERSION}.zip"
 
-REQUIRED_ROOT_FILES = {"__init__.py", "blender_manifest.toml"}
+REQUIRED_ROOT_FILES = {"__init__.py", "blender_manifest.toml", "LICENSE"}
 
 
 def build() -> pathlib.Path:

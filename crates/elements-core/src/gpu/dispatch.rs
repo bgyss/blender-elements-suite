@@ -50,10 +50,17 @@ impl PipelineCache {
         entry_point: &str,
     ) -> Result<Arc<wgpu::ComputePipeline>, GpuError> {
         if let Some(cached) = self.pipelines.get(key) {
-            debug_assert_eq!(
-                cached.source, source,
-                "PipelineCache key collision: \"{key}\" was registered with different source",
-            );
+            if cached.source != source {
+                // `elementsd` ships release builds, where `debug_assert_eq!`
+                // compiles out entirely -- a promise ("a cache hit cannot
+                // silently return the wrong pipeline") that a debug-only
+                // check cannot keep. This must be a real, always-on check:
+                // a stale or reused key returning the wrong compiled
+                // pipeline would run the wrong shader with no error at all.
+                return Err(GpuError::Validation(format!(
+                    "PipelineCache key collision: \"{key}\" was registered with different source"
+                )));
+            }
             return Ok(Arc::clone(&cached.pipeline));
         }
 

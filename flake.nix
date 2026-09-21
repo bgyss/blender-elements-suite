@@ -29,7 +29,7 @@
           ];
 
           shellHook = ''
-            export RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+            export RUSTUP_TOOLCHAIN=$(sed -n 's/^[[:space:]]*channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           '' + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             export VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json
             export LD_LIBRARY_PATH=${pkgs.vulkan-loader}/lib:$LD_LIBRARY_PATH

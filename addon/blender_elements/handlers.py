@@ -62,7 +62,12 @@ def _bake_current_graph_to(path) -> None:
     if os.name == "nt":
         cli += ".exe"
 
-    out_dir = os.path.dirname(path)
+    # Bake into a pid-qualified subdirectory of the shared temp dir, not the
+    # temp dir itself: two Blender instances baking concurrently would
+    # otherwise both write density.0001.vdb into the same directory and
+    # collide before either side gets to its pid-qualified os.replace target.
+    out_dir = os.path.join(tempfile.gettempdir(), f"elements-bake-{os.getpid()}")
+    os.makedirs(out_dir, exist_ok=True)
     # 60s: a Core v1 bake is one frame of a small graph -- generous enough to
     # absorb a slow disk, but short enough that a hung/pathological graph
     # does not block Blender's UI thread indefinitely (execute() runs on it,
