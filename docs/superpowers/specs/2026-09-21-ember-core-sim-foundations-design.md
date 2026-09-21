@@ -74,7 +74,7 @@ allocates again.
 ### 2.5 Persistent state
 
 - `StateStore` sits beside `FieldPool` in the session. It maps
-  `(NodeId, &'static str slot)` to `StateValue` (`Field`, `VectorField` or
+  `(NodeId, &'static str slot)` to a `Value` (`Field`, `VectorField` or
   `Scalar`), and its contents survive across `Graph::eval` calls.
 - `Node::stateful(&self) -> bool` defaults to `false`. Only stateful nodes can
   call `ctx.state()`, which returns a handle scoped to that node's id. Calling it
@@ -84,8 +84,10 @@ allocates again.
 - If a stored field's dims do not match the current domain,
   `NodeError::StateShape` is raised. The timeline handles it (§2.6).
 - `StateStore::snapshot(&GpuContext, &mut FieldPool) -> Snapshot` GPU-copies
-  every slot into pooled fields. `restore(snapshot)` swaps them back in and
-  releases the fields it replaced. A snapshot reports its size in bytes.
+  every slot into pooled fields. `restore(&snapshot)` releases the store's
+  current fields and **copies** the snapshot back in. It copies rather than
+  moves because the cache keeps the snapshot for the next scrub to that frame.
+  A snapshot reports its size in bytes.
 
 ### 2.6 Timeline
 
@@ -123,7 +125,9 @@ retry. If the error recurs straight after that reset, it is a node bug and is su
 
 ### 2.7 Document
 
-Three new optional fields. Existing Core v1 documents still load unchanged, so `version` stays `1`:
+Three new optional fields. **`ELEMENTS_DOC_VERSION` becomes 2.** Serde ignores
+unknown fields, so without a bump an older engine would accept a new document
+and silently drop `fps`. Version-1 documents still load, with the defaults below:
 
 - `fps: f64`: defaults to 24.0. It must be finite and > 0, otherwise
   `DocError`.
@@ -148,7 +152,15 @@ Three new optional fields. Existing Core v1 documents still load unchanged, so `
   re-simulates from `start_frame` in a fresh process. That is acceptable for
   piece 1's toy graphs, and piece 3's in-memory handoff removes it.
 
-### 2.9 Proof node: `core.accumulate`
+### 2.9 Device limits
+
+`GpuContext` requests `Limits::downlevel_defaults().using_resolution(adapter.limits())`.
+Without it, `max_texture_dimension_3d` is 256, and a staggered face of a 256³
+domain (257 wide) cannot be allocated. This is a limit, not a feature, so
+`required_features` stays empty. The daemon requires each domain axis to be
+strictly below the limit, so faces always fit.
+
+### 2.10 Proof node: `core.accumulate`
 
 Inputs: `Field`. Outputs: `Field`. Stateful, with one slot `"sum"`.
 Each step does `sum += input * dt` and outputs a copy of `sum`. With a
