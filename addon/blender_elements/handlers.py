@@ -63,21 +63,31 @@ def _bake_current_graph_to(path) -> None:
         cli += ".exe"
 
     out_dir = os.path.dirname(path)
-    result = subprocess.run(
-        [
-            cli,
-            "bake",
-            bpy.path.abspath(settings.graph_path),
-            "--out",
-            out_dir,
-            "--frames",
-            "1",
-            "--name",
-            "density",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    # 60s: a Core v1 bake is one frame of a small graph -- generous enough to
+    # absorb a slow disk, but short enough that a hung/pathological graph
+    # does not block Blender's UI thread indefinitely (execute() runs on it,
+    # and there is no way to cancel from the panel while it is blocked).
+    try:
+        result = subprocess.run(
+            [
+                cli,
+                "bake",
+                bpy.path.abspath(settings.graph_path),
+                "--out",
+                out_dir,
+                "--frames",
+                "1",
+                "--name",
+                "density",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as e:
+        # subprocess.run() kills the child (and, on POSIX, waits on it) when
+        # the timeout fires, so nothing is left running.
+        raise ElementsError("io", f"bake timed out after {e.timeout:.0f}s") from e
     if result.returncode != 0:
         raise ElementsError("io", f"bake failed: {result.stderr.strip()}")
 
@@ -103,19 +113,20 @@ def _on_draw() -> None:
     """
     global _last_seq
 
-    scene = bpy.context.scene
-    settings = getattr(scene, "elements", None)
-    if settings is None or not settings.live:
-        return
-
-    from . import ops
-
-    reader = ops._state.get("reader")
-    client = ops._state.get("client")
-    if reader is None or client is None:
-        return
-
+    settings = None
     try:
+        scene = bpy.context.scene
+        settings = getattr(scene, "elements", None)
+        if settings is None or not settings.live:
+            return
+
+        from . import ops
+
+        reader = ops._state.get("reader")
+        client = ops._state.get("client")
+        if reader is None or client is None:
+            return
+
         try:
             frame = client.render(scene.frame_current)
         except ElementsError as e:
@@ -140,8 +151,12 @@ def _on_draw() -> None:
             _last_seq = seq
             settings.status = f"Live — frame {seq}"
     except Exception as e:  # noqa: BLE001 - see the docstring
-        settings.live = False
-        settings.status = f"Live update stopped: {e}"
+        # `settings` may still be None if bpy.context.scene itself (or the
+        # elements PropertyGroup lookup) is what raised -- guard the report
+        # so this except block itself cannot raise back into the draw loop.
+        if settings is not None:
+            settings.live = False
+            settings.status = f"Live update stopped: {e}"
 
 
 def register() -> None:

@@ -1,5 +1,6 @@
 """Operators that drive the engine process."""
 
+import atexit
 import contextlib
 import os
 import subprocess
@@ -44,6 +45,17 @@ def shutdown_engine() -> None:
         except subprocess.TimeoutExpired:
             _state["process"].kill()
         _state["process"] = None
+
+
+# Defence in depth, not a complete guarantee: `atexit` runs on a normal
+# interpreter shutdown, which covers the case that actually orphaned a
+# daemon here -- an exception after start_engine() that skipped Blender's
+# unregister() (Blender does not guarantee unregister() runs on quit either).
+# It does NOT run on `kill -9`, a hard crash, or `os._exit()`. Do not treat
+# this as closing that gap; it only narrows it. shutdown_engine() is
+# idempotent, so this is safe even when unregister() also calls it in the
+# same session.
+atexit.register(shutdown_engine)
 
 
 class ELEMENTS_OT_start_engine(bpy.types.Operator):

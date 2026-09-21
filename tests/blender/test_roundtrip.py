@@ -5,8 +5,9 @@ Installs the built extension, starts the engine, renders one frame, and asserts
 the volume data reached Blender. Exits non-zero with a message on failure.
 """
 
-import os
+import contextlib
 import pathlib
+import shutil
 import sys
 import tempfile
 
@@ -37,27 +38,36 @@ def main() -> None:
     # bl_ext.user_default.blender_elements being in sys.modules yet.
 
     tmp = pathlib.Path(tempfile.mkdtemp())
-    graph = tmp / "noise.elements"
-    graph.write_text(GRAPH)
+    try:
+        graph = tmp / "noise.elements"
+        graph.write_text(GRAPH)
 
-    scene = bpy.context.scene
-    scene.elements.graph_path = str(graph)
-    scene.elements.daemon_path = daemon_path
-    scene.elements.endpoint = str(tmp / "control.sock")
-    scene.elements.channel_path = str(tmp / "frame.bin")
+        scene = bpy.context.scene
+        scene.elements.graph_path = str(graph)
+        scene.elements.daemon_path = daemon_path
+        scene.elements.endpoint = str(tmp / "control.sock")
+        scene.elements.channel_path = str(tmp / "frame.bin")
 
-    result = bpy.ops.elements.start_engine()
-    assert result == {"FINISHED"}, f"start_engine returned {result}: {scene.elements.status}"
+        result = bpy.ops.elements.start_engine()
+        assert result == {"FINISHED"}, f"start_engine returned {result}: {scene.elements.status}"
 
-    result = bpy.ops.elements.render_frame()
-    assert result == {"FINISHED"}, f"render_frame returned {result}: {scene.elements.status}"
+        result = bpy.ops.elements.render_frame()
+        assert result == {"FINISHED"}, f"render_frame returned {result}: {scene.elements.status}"
 
-    volumes = [o for o in bpy.data.objects if o.type == "VOLUME"]
-    assert volumes, "no Volume object was created"
-    assert "density" in {g.name for g in volumes[0].data.grids}, "no density grid"
+        volumes = [o for o in bpy.data.objects if o.type == "VOLUME"]
+        assert volumes, "no Volume object was created"
+        assert "density" in {g.name for g in volumes[0].data.grids}, "no density grid"
 
-    bpy.ops.elements.stop_engine()
-    print("blender roundtrip ok")
+        print("blender roundtrip ok")
+    finally:
+        # This finally must run on BOTH the happy path and any exception, so
+        # the engine daemon and its temp dir never outlive this process. An
+        # `os._exit()` below would skip this block entirely, which is exactly
+        # how a prior run orphaned a daemon holding a GPU device for hours --
+        # so cleanup happens here, before any exit call, not after it.
+        with contextlib.suppress(Exception):
+            bpy.ops.elements.stop_engine()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -65,4 +75,10 @@ if __name__ == "__main__":
         main()
     except Exception as e:  # noqa: BLE001 - must surface through Blender's exit code
         print(f"blender roundtrip FAILED: {e}", file=sys.stderr)
-        os._exit(1)
+        # sys.exit (not os._exit): main()'s finally has already run cleanup,
+        # so there is no more state to bypass. sys.exit still raises
+        # SystemExit through Blender's --python entry point with a non-zero
+        # code, which is all `cargo test` needs to detect the failure; using
+        # the harder os._exit here would buy nothing and risks skipping any
+        # future cleanup added above this line.
+        sys.exit(1)
