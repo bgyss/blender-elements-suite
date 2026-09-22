@@ -4,11 +4,15 @@ mod document;
 mod node;
 mod registry;
 mod socket;
+mod state;
+mod time;
 
 pub use document::{DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION};
 pub use node::{EvalCtx, Node, NodeError, Value};
 pub use registry::{NodeCtor, NodeRegistry};
 pub use socket::{NodeId, SocketId, SocketSpec, SocketType};
+pub use state::StateStore;
+pub use time::{DEFAULT_FPS, DEFAULT_START_FRAME, Time};
 
 use std::collections::HashMap;
 
@@ -42,6 +46,14 @@ impl std::fmt::Debug for Graph {
             .field("output", &self.output)
             .finish()
     }
+}
+
+/// The result of evaluating one frame.
+#[derive(Debug)]
+pub struct Evaluated {
+    /// The output node's first output. The caller owns it and should return it
+    /// to the pool with `Value::release_to` when finished.
+    pub value: Value,
 }
 
 impl Graph {
@@ -200,7 +212,16 @@ impl Graph {
             .collect())
     }
 
-    /// Evaluate the output node and everything it depends on.
+    /// Whether any node in this graph keeps state between frames.
+    pub fn is_stateful(&self) -> bool {
+        self.nodes.iter().any(|node| node.stateful())
+    }
+
+    /// Evaluate one frame with no persistent state: the first frame, at the default rate.
+    ///
+    /// Stateful nodes see an empty store, which is discarded afterwards, so
+    /// repeated calls never accumulate. Anything that needs frames to follow
+    /// one another goes through `eval_frame`, normally via a `Timeline`.
     pub fn eval(
         &self,
         gpu: &GpuContext,
@@ -208,6 +229,24 @@ impl Graph {
         pipelines: &mut PipelineCache,
         dims: FieldDims,
     ) -> Result<Value, NodeError> {
+        let mut scratch = StateStore::new();
+        let time = Time::at(DEFAULT_START_FRAME, DEFAULT_START_FRAME, DEFAULT_FPS);
+        let result = self.eval_frame(gpu, pool, pipelines, &mut scratch, time, dims);
+        scratch.clear(pool);
+        result.map(|evaluated| evaluated.value)
+    }
+
+    /// Evaluate the output node and everything it depends on, as frame `time`,
+    /// reading and writing persistent state in `state`.
+    pub fn eval_frame(
+        &self,
+        gpu: &GpuContext,
+        pool: &mut FieldPool,
+        pipelines: &mut PipelineCache,
+        state: &mut StateStore,
+        time: Time,
+        dims: FieldDims,
+    ) -> Result<Evaluated, NodeError> {
         let output = self.output.ok_or(NodeError::NoOutput)?;
         let order = self.evaluation_order()?;
 
@@ -240,6 +279,9 @@ impl Graph {
                 node: id,
                 inputs,
                 taken,
+                state,
+                stateful: node.stateful(),
+                time,
             };
             let outputs = node
                 .eval(&mut ctx)
@@ -251,6 +293,7 @@ impl Graph {
             .get_mut(&output)
             .and_then(|outs| outs.first_mut())
             .and_then(Option::take)
+            .map(|value| Evaluated { value })
             .ok_or(NodeError::UnknownNode(output))
     }
 }

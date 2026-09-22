@@ -5,6 +5,8 @@ use crate::gpu::{
 };
 
 use super::socket::{NodeId, SocketSpec, SocketType};
+use super::state::StateStore;
+use super::time::Time;
 
 /// Everything that can go wrong building or evaluating a graph.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,10 @@ pub enum NodeError {
     UnknownNode(NodeId),
     #[error("no output node is set on this graph")]
     NoOutput,
+    #[error("node {node:?} is not stateful but tried to use persistent state")]
+    NotStateful { node: NodeId },
+    #[error("node {node:?} state slot {slot:?} does not match the current domain")]
+    StateShape { node: NodeId, slot: &'static str },
     #[error(transparent)]
     Gpu(#[from] GpuError),
 }
@@ -155,6 +161,10 @@ pub struct EvalCtx<'a> {
     /// Tracks which indices `take_input` has already removed, so `input` can
     /// report a distinct error for "taken" versus "never connected".
     pub(crate) taken: Vec<bool>,
+    /// Persistent state. Only a node whose `stateful()` is true may touch it.
+    pub(crate) state: &'a mut StateStore,
+    pub(crate) stateful: bool,
+    pub(crate) time: Time,
 }
 
 impl EvalCtx<'_> {
@@ -252,6 +262,57 @@ impl EvalCtx<'_> {
     ) -> Result<T, NodeError> {
         Ok(f(self.gpu, self.pipelines)?)
     }
+
+    /// When this evaluation is happening.
+    pub fn time(&self) -> Time {
+        self.time
+    }
+
+    /// Take this node's state `slot` out of the store, or `None` on the first
+    /// step or after a reset. Put it back with `put_state` before returning.
+    ///
+    /// A stored field whose dims no longer match the domain is released and
+    /// reported as `StateShape`. The timeline answers that with a reset.
+    pub fn take_state(&mut self, slot: &'static str) -> Result<Option<Value>, NodeError> {
+        if !self.stateful {
+            return Err(NodeError::NotStateful { node: self.node });
+        }
+        let Some(value) = self.state.take(self.node, slot) else {
+            return Ok(None);
+        };
+        let fits = match &value {
+            Value::Field(f) => f.dims() == self.dims,
+            Value::VectorField(v) => v.cells() == self.dims,
+            Value::Scalar(_) => true,
+        };
+        if !fits {
+            value.release_to(self.pool);
+            return Err(NodeError::StateShape {
+                node: self.node,
+                slot,
+            });
+        }
+        Ok(Some(value))
+    }
+
+    /// Store `value` in this node's state `slot`, releasing anything it replaces.
+    pub fn put_state(&mut self, slot: &'static str, value: Value) -> Result<(), NodeError> {
+        if !self.stateful {
+            return Err(NodeError::NotStateful { node: self.node });
+        }
+        self.state.put(self.node, slot, value, self.pool);
+        Ok(())
+    }
+
+    /// Return a value this node is finished with to the pool.
+    pub fn release(&mut self, value: Value) {
+        value.release_to(self.pool);
+    }
+
+    /// A pooled GPU copy of `field`.
+    pub fn duplicate(&mut self, field: &Field) -> Result<Field, NodeError> {
+        Ok(self.pool.duplicate(self.gpu, field)?)
+    }
 }
 
 /// One unit of computation in a graph.
@@ -261,6 +322,13 @@ pub trait Node: Send + Sync {
 
     /// This node's input and output types.
     fn sockets(&self) -> SocketSpec;
+
+    /// Whether this node keeps state between frames. Only stateful nodes may
+    /// call `EvalCtx::take_state` / `put_state`, and a graph containing one is
+    /// stepped frame by frame by a `Timeline`.
+    fn stateful(&self) -> bool {
+        false
+    }
 
     /// Compute this node's outputs. Must return exactly `sockets().outputs.len()` values.
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError>;

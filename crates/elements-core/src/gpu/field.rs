@@ -185,4 +185,40 @@ impl Field {
 
         Ok(out)
     }
+
+    /// Copy this field's contents into `dst` on the GPU.
+    ///
+    /// Both fields must have identical dims and format.
+    /// `copy_texture_to_texture` is core WebGPU, not an optional feature.
+    pub fn copy_to(&self, ctx: &GpuContext, dst: &Field) -> Result<(), GpuError> {
+        if self.dims != dst.dims || self.format != dst.format {
+            return Err(GpuError::Validation(format!(
+                "copy_to: source is {:?} {:?}, destination is {:?} {:?}",
+                self.dims, self.format, dst.dims, dst.format
+            )));
+        }
+        ctx.scoped(|| {
+            let mut encoder =
+                ctx.device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("field-copy"),
+                    });
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &dst.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                self.dims.extent(),
+            );
+            ctx.queue().submit(Some(encoder.finish()));
+        })
+    }
 }

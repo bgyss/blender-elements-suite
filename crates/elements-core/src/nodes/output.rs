@@ -49,7 +49,7 @@ pub(crate) fn build(_params: &serde_json::Value) -> Result<Box<dyn Node>, DocErr
 mod tests {
     use super::*;
     use crate::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
-    use crate::graph::NodeId;
+    use crate::graph::{NodeId, StateStore, Time};
 
     /// The ADDITIONAL REQUIREMENT: when a built-in node reads an input of
     /// the wrong type, the error must name the real node and the real
@@ -66,6 +66,7 @@ mod tests {
         let gpu = GpuContext::new_headless().expect("no GPU adapter available");
         let mut pool = FieldPool::new();
         let mut pipelines = PipelineCache::new();
+        let mut state = StateStore::new();
 
         let mut ctx = EvalCtx {
             gpu: &gpu,
@@ -75,6 +76,9 @@ mod tests {
             node: NodeId(42),
             inputs: vec![Some(Value::Scalar(1.0))],
             taken: vec![false],
+            state: &mut state,
+            stateful: false,
+            time: Time::at(1, 1, 24.0),
         };
 
         let err = Output.eval(&mut ctx).unwrap_err();

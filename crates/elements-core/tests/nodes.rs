@@ -69,12 +69,17 @@ fn noise_frequency_defaults_when_omitted() {
 }
 
 #[test]
-fn registry_exposes_all_three_builtins() {
+fn registry_exposes_every_builtin() {
     let registry = NodeRegistry::with_builtins();
     let mut kinds: Vec<_> = registry.kinds().collect();
     kinds.sort_unstable();
     assert_eq!(
         kinds,
-        ["core.constant_field", "core.noise_field", "core.output"]
+        [
+            "core.accumulate",
+            "core.constant_field",
+            "core.noise_field",
+            "core.output"
+        ]
     );
 }

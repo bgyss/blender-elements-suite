@@ -139,4 +139,11 @@ impl FieldPool {
     pub fn pooled_count(&self) -> usize {
         self.free.values().map(Vec::len).sum()
     }
+
+    /// A pooled field with the same shape as `src`, holding a GPU copy of its contents.
+    pub fn duplicate(&mut self, ctx: &GpuContext, src: &Field) -> Result<Field, GpuError> {
+        let dst = self.acquire(ctx, src.dims(), src.format())?;
+        src.copy_to(ctx, &dst)?;
+        Ok(dst)
+    }
 }

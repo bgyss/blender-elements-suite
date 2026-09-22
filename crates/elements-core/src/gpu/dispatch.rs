@@ -180,6 +180,73 @@ pub fn fill_constant(
     dispatch_over_field(ctx, &pipeline, &bind_group, dims)
 }
 
+/// Parameters for the accumulate shader: `vec3<u32>` then `f32` pack into 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AccumulateParams {
+    dims: [u32; 3],
+    dt: f32,
+}
+
+/// `sum += input * dt`, in place on the GPU.
+pub fn accumulate_into(
+    ctx: &GpuContext,
+    cache: &mut PipelineCache,
+    sum: &Field,
+    input: &Field,
+    dt: f32,
+) -> Result<(), GpuError> {
+    if sum.dims() != input.dims() {
+        return Err(GpuError::Validation(format!(
+            "accumulate_into: sum is {:?}, input is {:?}",
+            sum.dims(),
+            input.dims()
+        )));
+    }
+    let pipeline = cache.get_or_create(
+        ctx,
+        "accumulate",
+        include_str!("shaders/accumulate.wgsl"),
+        "main",
+    )?;
+
+    let dims = sum.dims();
+    let params = AccumulateParams {
+        dims: [dims.x, dims.y, dims.z],
+        dt,
+    };
+
+    let bind_group = ctx.scoped(|| {
+        let uniform = ctx
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("accumulate-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        ctx.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("accumulate-bind-group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(sum.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(input.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        })
+    })?;
+
+    dispatch_over_field(ctx, &pipeline, &bind_group, dims)
+}
+
 /// Parameters for the curl-noise shader. Laid out to match the WGSL struct.
 ///
 /// WGSL alignment/offsets for `Params` (see `shaders/curl_noise.wgsl`):
