@@ -192,6 +192,8 @@ pub struct EvalCtx<'a> {
     pub(crate) pool: &'a mut FieldPool,
     pub(crate) pipelines: &'a mut PipelineCache,
     pub(crate) dims: FieldDims,
+    /// Metres along the domain's longest axis.
+    pub(crate) domain_size: f64,
     pub(crate) node: NodeId,
     /// For each input index, the output socket feeding it, if any.
     pub(crate) sources: Vec<Option<SocketId>>,
@@ -326,6 +328,22 @@ impl EvalCtx<'_> {
     /// When this evaluation is happening.
     pub fn time(&self) -> Time {
         self.time
+    }
+
+    /// Metres per voxel. Voxels are cubic, and the document's `domain_size`
+    /// spans the domain's longest axis.
+    pub fn voxel_size(&self) -> f32 {
+        let longest = self.dims.x.max(self.dims.y).max(self.dims.z).max(1);
+        (self.domain_size / longest as f64) as f32
+    }
+
+    /// Run GPU work that also needs the field pool, such as a solver that
+    /// acquires scratch fields between kernels.
+    pub fn with_gpu_pool<T>(
+        &mut self,
+        f: impl FnOnce(&GpuContext, &mut PipelineCache, &mut FieldPool) -> Result<T, GpuError>,
+    ) -> Result<T, NodeError> {
+        Ok(f(self.gpu, self.pipelines, self.pool)?)
     }
 
     /// Take this node's state `slot` out of the store, or `None` on the first

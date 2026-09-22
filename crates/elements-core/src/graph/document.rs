@@ -13,9 +13,10 @@ use super::timeline::{DEFAULT_CACHE_BUDGET_MB, TimelineConfig};
 
 /// The `.elements` schema version this build writes.
 ///
-/// It also reads version 1, which predates time: see `Document::from_json`.
+/// It also reads versions 1 and 2, which predate time and physical units: see
+/// `Document::from_json`.
 /// Bumping this requires a migration test in `tests/document.rs`.
-pub const ELEMENTS_DOC_VERSION: u32 = 2;
+pub const ELEMENTS_DOC_VERSION: u32 = 3;
 
 fn default_fps() -> f64 {
     DEFAULT_FPS
@@ -27,6 +28,10 @@ fn default_start_frame() -> u32 {
 
 fn default_cache_budget_mb() -> u32 {
     DEFAULT_CACHE_BUDGET_MB
+}
+
+fn default_domain_size() -> f64 {
+    super::DEFAULT_DOMAIN_SIZE
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +78,9 @@ pub struct Document {
     /// GPU memory the frame cache may hold, in MiB.
     #[serde(default = "default_cache_budget_mb")]
     pub cache_budget_mb: u32,
+    /// Metres along the grid's longest axis. Versions 1 and 2 have none and get 2.0.
+    #[serde(default = "default_domain_size")]
+    pub domain_size: f64,
     pub nodes: Vec<DocNode>,
     pub edges: Vec<DocEdge>,
     pub output: u32,
@@ -82,9 +90,9 @@ impl Document {
     pub fn from_json(text: &str) -> Result<Self, DocError> {
         let mut doc: Document = serde_json::from_str(text)?;
         match doc.version {
-            // Version 1 predates time. Its only migration is the defaults serde
-            // has already filled in above.
-            1 => doc.version = ELEMENTS_DOC_VERSION,
+            // Versions 1 and 2 predate time and physical units. Their only
+            // migration is the defaults serde has already filled in above.
+            1 | 2 => doc.version = ELEMENTS_DOC_VERSION,
             ELEMENTS_DOC_VERSION => {}
             // Deliberately exact, not a range: a newer document may rely on
             // fields this build would silently ignore.
@@ -94,6 +102,15 @@ impl Document {
             return Err(DocError::BadParams {
                 kind: "document".to_string(),
                 reason: format!("fps must be a positive, finite number, got {}", doc.fps),
+            });
+        }
+        if !(doc.domain_size.is_finite() && doc.domain_size > 0.0) {
+            return Err(DocError::BadParams {
+                kind: "document".to_string(),
+                reason: format!(
+                    "domain_size must be a positive, finite number of metres, got {}",
+                    doc.domain_size
+                ),
             });
         }
         Ok(doc)
@@ -186,6 +203,7 @@ impl Document {
             )?;
         }
 
+        graph.set_domain_size(self.domain_size);
         graph.set_output(NodeId(self.output));
 
         Ok((
