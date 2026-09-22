@@ -5,6 +5,7 @@
 //! Registers node kinds on top of core's built-ins. Core knows nothing about
 //! smoke; this crate is the seam `NodeRegistry` exists for.
 
+pub mod bench;
 pub mod emitter;
 pub mod kernels;
 pub mod metrics;

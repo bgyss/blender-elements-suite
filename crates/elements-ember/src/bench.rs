@@ -1,0 +1,114 @@
+//! Benchmark scenes and the speed gate's pre-registered rule (spec §4.3, §5.3).
+
+use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION};
+
+use crate::emitter::{self, Sphere};
+use crate::solver::{self, SolverParams};
+
+/// A step must take at most this long at 128³ (≥ 10 fps).
+pub const GATE_STEP_MS: f64 = 100.0;
+/// Projection must leave at most this fraction of the RMS divergence.
+pub const GATE_RATIO: f64 = 0.10;
+
+/// A benchmark scene, defined once (spec §5.3). Piece 2a generates only the
+/// `.elements` document from it; 2b adds the matching Mantaflow script.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scene {
+    pub name: &'static str,
+    pub cells: [u32; 3],
+    /// Metres along the longest axis.
+    pub domain_size: f64,
+    pub fps: f64,
+    pub frames: u32,
+    pub emitter: Sphere,
+    pub solver: SolverParams,
+}
+
+impl Scene {
+    /// A hot, dense sphere at the domain floor, buoyancy only.
+    pub fn plume(resolution: u32) -> Self {
+        Self {
+            name: "plume",
+            cells: [resolution; 3],
+            domain_size: 2.0,
+            fps: 24.0,
+            frames: 120,
+            emitter: Sphere {
+                center: [1.0, 1.0, 0.3],
+                radius: 0.2,
+                density_rate: 1.0,
+                temperature_rate: 1.0,
+            },
+            solver: SolverParams {
+                substeps: 1,
+                pressure_iterations: 80,
+                buoyancy_density: 0.0,
+                buoyancy_temperature: 1.0,
+            },
+        }
+    }
+
+    pub fn with_iterations(mut self, n: u32) -> Self {
+        self.solver.pressure_iterations = n;
+        self
+    }
+
+    /// The scene as an `.elements` document: emitter → solver → output.
+    pub fn document(&self) -> Document {
+        let to_value = |v: serde_json::Result<serde_json::Value>| {
+            v.expect("scene parameters are plain numbers and always serialize")
+        };
+        let edge = |from_node, from_index, to_node, to_index| DocEdge {
+            from_node,
+            from_index,
+            to_node,
+            to_index,
+        };
+        Document {
+            version: ELEMENTS_DOC_VERSION,
+            dims: self.cells,
+            fps: self.fps,
+            start_frame: 1,
+            cache_budget_mb: 0,
+            domain_size: self.domain_size,
+            nodes: vec![
+                DocNode {
+                    id: 0,
+                    kind: emitter::KIND.to_owned(),
+                    params: to_value(serde_json::to_value(self.emitter)),
+                },
+                DocNode {
+                    id: 1,
+                    kind: solver::KIND.to_owned(),
+                    params: to_value(serde_json::to_value(self.solver)),
+                },
+                DocNode {
+                    id: 2,
+                    kind: "core.output".to_owned(),
+                    params: serde_json::json!({}),
+                },
+            ],
+            edges: vec![edge(0, 0, 1, 0), edge(0, 1, 1, 1), edge(1, 0, 2, 0)],
+            output: 2,
+        }
+    }
+}
+
+/// One row of the gate's table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateRow {
+    pub iterations: u32,
+    /// Median over three runs of each run's median step time.
+    pub step_ms_median: f64,
+    /// RMS divergence after projection over RMS divergence before it.
+    pub ratio: f64,
+}
+
+/// Spec §4.3: PASS with the largest N whose step takes at most
+/// `GATE_STEP_MS` and whose ratio is at most `GATE_RATIO`; `None` is FAIL.
+pub fn gate_verdict(rows: &[GateRow]) -> Option<u32> {
+    rows.iter()
+        .filter(|r| r.step_ms_median <= GATE_STEP_MS && r.ratio <= GATE_RATIO)
+        .map(|r| r.iterations)
+        .max()
+}
