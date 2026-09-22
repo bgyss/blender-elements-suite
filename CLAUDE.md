@@ -22,9 +22,9 @@ multi-consumer graph outputs.
 - Ember piece 1 plan: `docs/superpowers/plans/2026-09-21-ember-core-sim-foundations.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
-**Read the progress ledger before starting work.** It records which of the 18
-tasks are complete, the commits that prove it, and decisions already made. Tasks
-listed complete there are done — do not redo them.
+**Read the progress ledger before starting work.** It records which tasks of
+each plan are complete, the commits that prove it, and decisions already made.
+Tasks listed complete there are done — do not redo them.
 
 ## Commands
 
