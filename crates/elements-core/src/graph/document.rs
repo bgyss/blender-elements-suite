@@ -8,11 +8,26 @@ use super::Graph;
 use super::node::NodeError;
 use super::registry::NodeRegistry;
 use super::socket::{NodeId, SocketId};
+use super::time::{DEFAULT_FPS, DEFAULT_START_FRAME};
+use super::timeline::{DEFAULT_CACHE_BUDGET_MB, TimelineConfig};
 
-/// The `.elements` schema version this build reads and writes.
+/// The `.elements` schema version this build writes.
 ///
+/// It also reads version 1, which predates time: see `Document::from_json`.
 /// Bumping this requires a migration test in `tests/document.rs`.
-pub const ELEMENTS_DOC_VERSION: u32 = 1;
+pub const ELEMENTS_DOC_VERSION: u32 = 2;
+
+fn default_fps() -> f64 {
+    DEFAULT_FPS
+}
+
+fn default_start_frame() -> u32 {
+    DEFAULT_START_FRAME
+}
+
+fn default_cache_budget_mb() -> u32 {
+    DEFAULT_CACHE_BUDGET_MB
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -49,6 +64,15 @@ pub struct DocEdge {
 pub struct Document {
     pub version: u32,
     pub dims: [u32; 3],
+    /// Frames per second. Version-1 documents have none and get 24.
+    #[serde(default = "default_fps")]
+    pub fps: f64,
+    /// The first frame of the simulation. Earlier frames produce this one.
+    #[serde(default = "default_start_frame")]
+    pub start_frame: u32,
+    /// GPU memory the frame cache may hold, in MiB.
+    #[serde(default = "default_cache_budget_mb")]
+    pub cache_budget_mb: u32,
     pub nodes: Vec<DocNode>,
     pub edges: Vec<DocEdge>,
     pub output: u32,
@@ -56,19 +80,36 @@ pub struct Document {
 
 impl Document {
     pub fn from_json(text: &str) -> Result<Self, DocError> {
-        let doc: Document = serde_json::from_str(text)?;
-        // Deliberately `!=`, not `>`: this build reads exactly
-        // `ELEMENTS_DOC_VERSION`. An older document may be missing fields a
-        // newer reader assumes exist, so "old" is just as unsupported as
-        // "new" until a migration is written.
-        if doc.version != ELEMENTS_DOC_VERSION {
-            return Err(DocError::UnsupportedVersion(doc.version));
+        let mut doc: Document = serde_json::from_str(text)?;
+        match doc.version {
+            // Version 1 predates time. Its only migration is the defaults serde
+            // has already filled in above.
+            1 => doc.version = ELEMENTS_DOC_VERSION,
+            ELEMENTS_DOC_VERSION => {}
+            // Deliberately exact, not a range: a newer document may rely on
+            // fields this build would silently ignore.
+            other => return Err(DocError::UnsupportedVersion(other)),
+        }
+        if !(doc.fps.is_finite() && doc.fps > 0.0) {
+            return Err(DocError::BadParams {
+                kind: "document".to_string(),
+                reason: format!("fps must be a positive, finite number, got {}", doc.fps),
+            });
         }
         Ok(doc)
     }
 
     pub fn to_json(&self) -> Result<String, DocError> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// How a timeline for this document should run.
+    pub fn timeline_config(&self) -> TimelineConfig {
+        TimelineConfig {
+            fps: self.fps,
+            start_frame: self.start_frame,
+            cache_budget_bytes: self.cache_budget_mb as u64 * 1024 * 1024,
+        }
     }
 
     /// Instantiate the graph this document describes.

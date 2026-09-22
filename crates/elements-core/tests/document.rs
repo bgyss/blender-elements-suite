@@ -1,6 +1,6 @@
 use elements_core::graph::{
     DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION, EvalCtx, Node, NodeError,
-    NodeRegistry, SocketSpec, SocketType, Value,
+    NodeRegistry, SocketSpec, SocketType, TimelineConfig, Value,
 };
 
 const MINIMAL: &str = include_str!("fixtures/v1_minimal.elements");
@@ -97,6 +97,48 @@ fn builds_a_graph_with_the_declared_output() {
     assert_eq!(graph.node_count(), 2);
 }
 
+/// The migration test `ELEMENTS_DOC_VERSION` requires: a version-1 document
+/// loads, and gets the time settings version 1 implied.
+#[test]
+fn a_version_1_document_migrates_with_time_defaults() {
+    let doc = Document::from_json(MINIMAL).unwrap();
+    assert_eq!(doc.version, 2);
+    assert_eq!(doc.fps, 24.0);
+    assert_eq!(doc.start_frame, 1);
+    assert_eq!(doc.cache_budget_mb, 2048);
+}
+
+#[test]
+fn version_2_time_fields_reach_the_timeline_config() {
+    let v2 = MINIMAL.replace(
+        "\"version\": 1,",
+        "\"version\": 2, \"fps\": 30.0, \"start_frame\": 1001, \"cache_budget_mb\": 64,",
+    );
+    let doc = Document::from_json(&v2).unwrap();
+    assert_eq!(
+        doc.timeline_config(),
+        TimelineConfig {
+            fps: 30.0,
+            start_frame: 1001,
+            cache_budget_bytes: 64 * 1024 * 1024,
+        }
+    );
+}
+
+#[test]
+fn rejects_a_non_positive_fps() {
+    for fps in ["0.0", "-24.0"] {
+        let bad = MINIMAL.replace(
+            "\"version\": 1,",
+            &format!("\"version\": 2, \"fps\": {fps},"),
+        );
+        match Document::from_json(&bad) {
+            Err(DocError::BadParams { reason, .. }) => assert!(reason.contains("fps"), "{reason}"),
+            other => panic!("fps {fps}: expected BadParams, got {other:?}"),
+        }
+    }
+}
+
 /// A node with a single scalar output, used to build a document where its
 /// single output feeds both inputs of one consumer.
 struct Producer;
@@ -147,6 +189,9 @@ fn accepts_a_document_wiring_one_output_to_two_inputs() {
     let doc = Document {
         version: ELEMENTS_DOC_VERSION,
         dims: [8, 8, 8],
+        fps: 24.0,
+        start_frame: 1,
+        cache_budget_mb: 2048,
         nodes: vec![
             DocNode {
                 id: 0,
@@ -188,6 +233,9 @@ fn rejects_an_out_of_range_output() {
     let doc = Document {
         version: ELEMENTS_DOC_VERSION,
         dims: [8, 8, 8],
+        fps: 24.0,
+        start_frame: 1,
+        cache_budget_mb: 2048,
         nodes: vec![DocNode {
             id: 0,
             kind: "test.producer".to_string(),
