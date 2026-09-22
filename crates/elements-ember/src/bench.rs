@@ -41,7 +41,7 @@ impl Scene {
             },
             solver: SolverParams {
                 substeps: 1,
-                pressure_iterations: 80,
+                pressure_iterations: 160,
                 buoyancy_density: 0.0,
                 buoyancy_temperature: 1.0,
             },

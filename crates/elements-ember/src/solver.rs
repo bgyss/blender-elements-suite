@@ -29,9 +29,10 @@ fn default_substeps() -> u32 {
     1
 }
 
-/// Provisional until the speed gate records a default (spec §4.3).
+/// Chosen by the user from the speed gate (`docs/bench/speed-gate.md`): 34 ms a
+/// step at 128³, leaving headroom for 2b's stages and the handoff to Blender.
 fn default_pressure_iterations() -> u32 {
-    80
+    160
 }
 
 /// Provisional until 2b maps parameters to Mantaflow's.

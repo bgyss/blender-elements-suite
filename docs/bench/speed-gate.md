@@ -26,4 +26,7 @@ divergence columns do not depend on it, because the solver is deterministic. So 
 verdict holds; the timings are an upper bound, not a clean measurement. Step time
 grows by about 0.2 ms per iteration above roughly 3.6 ms of fixed cost.
 
-Decision (recorded by the user): _pending_
+Decision (recorded by the user, 2026-09-22): **PASS accepted; the default
+`pressure_iterations` is 160.** A follow-up sweep (`iteration-sweep.md`) found the
+100 ms ceiling at 480, but 160 was kept as the interactive default for its roughly
+threefold headroom. Higher counts are for piece 2b's offline presets.

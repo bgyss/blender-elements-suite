@@ -32,10 +32,10 @@ fn the_centroid_is_in_cell_units_at_cell_centres() {
 }
 
 /// Umbrella §6, spec §4.2: projection cuts RMS divergence to at most 10% of
-/// its value before projection, at the provisional iteration count.
+/// its value before projection, at the default iteration count the gate chose.
 #[test]
 fn projection_leaves_at_most_a_tenth_of_the_divergence() {
-    const ITERATIONS: u32 = 80;
+    const ITERATIONS: u32 = 160;
     let gpu = gpu();
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
