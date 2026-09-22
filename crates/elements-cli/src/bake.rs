@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use elements_core::gpu::{FieldPool, GpuContext, PipelineCache};
-use elements_core::graph::{Document, NodeRegistry};
+use elements_core::graph::{Document, NodeRegistry, Timeline};
 
 /// Load a `.elements` document, evaluate it, and read the result back.
 ///
@@ -53,6 +53,10 @@ pub fn parse_frames(spec: &str) -> anyhow::Result<(u32, u32)> {
 /// place `density.10000.vdb` before `density.9999.vdb` (`'1' < '9'`).
 /// Consumers MUST parse the numeric frame out of the filename and sort/compare
 /// numerically rather than relying on string/lexicographic order.
+///
+/// Frames are produced by a timeline, so a stateful graph is simulated from
+/// the document's start frame even when `frames` starts later. Only frames in
+/// `frames` are written.
 pub fn bake(
     graph: &Path,
     out_dir: &Path,
@@ -60,13 +64,38 @@ pub fn bake(
     name: &str,
     voxel_size: f64,
 ) -> anyhow::Result<()> {
-    let (values, dims) = evaluate_document(graph)?;
+    let text =
+        std::fs::read_to_string(graph).with_context(|| format!("reading {}", graph.display()))?;
+    let doc = Document::from_json(&text)?;
+    let config = doc.timeline_config();
+    let registry = NodeRegistry::with_builtins();
+    let (graph, dims) = doc.into_graph(&registry)?;
+
+    let gpu = GpuContext::new_headless().context("acquiring a GPU device")?;
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut timeline = Timeline::new(config);
+
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
     for frame in frames.0..=frames.1 {
+        let evaluated = timeline.goto(&graph, &gpu, &mut pool, &mut pipelines, dims, frame)?;
+        if let Some(warning) = timeline.take_warning() {
+            eprintln!("warning: {warning}");
+        }
+        let values = evaluated.value.as_field()?.read_back(&gpu)?;
+        evaluated.value.release_to(&mut pool);
+
         let path = out_dir.join(format!("{name}.{frame:04}.vdb"));
-        elements_io::write_float_grid(&path, name, &values, dims, voxel_size, 0.0)
-            .with_context(|| format!("writing {}", path.display()))?;
+        elements_io::write_float_grid(
+            &path,
+            name,
+            &values,
+            [dims.x, dims.y, dims.z],
+            voxel_size,
+            0.0,
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
     }
 
     Ok(())

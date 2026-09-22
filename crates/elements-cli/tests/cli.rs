@@ -130,6 +130,53 @@ fn a_malformed_graph_fails_with_a_nonzero_exit_and_a_message() {
     );
 }
 
+fn accumulate_fixture() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/elements-cli is two levels below the root")
+        .join("tests/graphs/accumulate_4.elements")
+}
+
+fn bake(out: &std::path::Path, frames: &str) {
+    let status = cli()
+        .args(["bake", accumulate_fixture().to_str().unwrap()])
+        .args(["--out", out.to_str().unwrap()])
+        .args(["--frames", frames])
+        .status()
+        .unwrap();
+    assert!(status.success(), "bake --frames {frames} failed");
+}
+
+#[test]
+fn bake_steps_a_stateful_graph_frame_by_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("range");
+    bake(&out, "1-3");
+
+    let files: Vec<Vec<u8>> = (1..=3)
+        .map(|f| std::fs::read(out.join(format!("density.{f:04}.vdb"))).unwrap())
+        .collect();
+    assert_ne!(files[0], files[1]);
+    assert_ne!(files[1], files[2]);
+}
+
+/// The VDB writer is deterministic (fixed UUID, no timestamps), so equal
+/// bytes mean equal fields.
+#[test]
+fn baking_one_frame_gives_the_true_frame_not_the_first_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let range = dir.path().join("range");
+    let single = dir.path().join("single");
+    bake(&range, "1-3");
+    bake(&single, "3");
+
+    assert_eq!(
+        std::fs::read(single.join("density.0003.vdb")).unwrap(),
+        std::fs::read(range.join("density.0003.vdb")).unwrap()
+    );
+}
+
 #[test]
 fn an_unsupported_version_names_the_version() {
     let dir = tempfile::tempdir().unwrap();
