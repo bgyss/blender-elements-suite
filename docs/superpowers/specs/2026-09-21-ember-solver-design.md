@@ -1,21 +1,216 @@
 # Ember Piece 2 — Solver Design
 
-**Date:** 2026-09-21
-**Status:** DRAFT. Only §5 (benchmarking against Mantaflow) is written. The rest of
-this spec is written in piece 2's brainstorming session, and §5 constrains it.
+**Date:** 2026-09-21 (§1–4 written 2026-09-22)
+**Status:** §1–4 approved for planning piece 2a. §5 is the benchmark design;
+its Mantaflow half is built in 2b.
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
-## 1. Goal
+## 1. Goal and split
 
-To be written in brainstorming. The umbrella fixes the targets:
+Piece 2 is built in **two spec/plan cycles**, because the speed gate (§4.3) can
+change the design: fewer pressure iterations, multigrid, or a lower interactive
+resolution. Nothing past the gate is planned in detail until the gate has run.
 
-- the solver step sequence (umbrella §3)
-- the validation scenes (umbrella §6)
-- 128³ at 10 fps or better interactively, and 256³–512³ offline
+**2a — to the gate (this spec, §2–4):** the `elements-ember` crate; the
+`ember.smoke_solver` stateful node with emit, buoyancy, velocity advection,
+pressure projection and scalar advection; `ember.sphere_emitter`; the
+still-domain, divergence-free, buoyant-blob and determinism validation scenes;
+the 128³ speed gate and its recorded decision.
 
-## 2–4. Components, data flow, testing
+**2b — after the gate (designed later, with the gate's numbers):** vorticity
+confinement, dissipation, flame, box and noise-modulated emitters, sphere and
+box colliders, animatable transforms, CFL substepping, quality presets, the
+collider validation scene, per-face boundary settings, and the Mantaflow
+benchmark of §5.
 
-To be written in brainstorming.
+The umbrella's targets are unchanged: 128³ at ≥ 10 fps interactively, 256³–512³
+offline, the step order of umbrella §3, and the scenes of umbrella §6.
+
+**Precondition, as the first task of 2a's plan:** CI runs on lavapipe. Umbrella
+§7 requires it before piece 2, and the solver's tolerances would otherwise be
+tuned on Metal only. It needs a git remote, which the user creates or approves.
+
+## 2. Components
+
+### 2.1 Crate
+
+`crates/elements-ember`, `Apache-2.0 OR MIT`, `#![forbid(unsafe_code)]`,
+depending on `elements-core`. It exposes `register(&mut NodeRegistry)`, which
+the CLI and daemon call after `NodeRegistry::with_builtins()`. Core gains no
+solver code; this is the seam the registry exists for.
+
+### 2.2 Physical units
+
+The document gains an optional `domain_size`: metres along the grid's longest
+axis, default `2.0` (Blender's default cube). Voxels are cubic, so
+`voxel_size = domain_size / max(nx, ny, nz)`. `EvalCtx` exposes it. The field is
+optional with a default, so existing documents load unchanged.
+
+Every solver and emitter parameter is in metres and seconds, so a scene
+previewed at 128³ looks the same baked at 512³. Parameters in voxel units would
+break exactly that workflow.
+
+### 2.3 `ember.sphere_emitter` (stateless)
+
+- Params: `center` `[f32; 3]` and `radius` in metres, relative to the domain's
+  minimum corner; `density_rate` and `temperature_rate` per second.
+- Outputs: `[density_source: Field, temperature_source: Field]`, each the rate
+  times an occupancy with a one-voxel smoothed edge, so the emitted total does
+  not depend on resolution.
+- The transform is fixed in 2a. Animation is 2b.
+
+### 2.4 `ember.smoke_solver` (stateful)
+
+| | |
+|---|---|
+| Inputs | `density_source: Field`, `temperature_source: Field` |
+| Outputs | `density: Field`, `temperature: Field`, `velocity: VectorField` |
+| Params | `substeps` (fixed, default 1), `pressure_iterations`, `buoyancy_density` (α, m/s² per unit density, sinks), `buoyancy_temperature` (β, m/s² per unit temperature, rises) |
+| State slots | `velocity` (staggered), `density`, `temperature`, `pressure` |
+
+Buoyancy is Boussinesq and acts along +z: `w += h·(β·T − α·ρ)`, with ambient
+temperature zero. Gravity is the direction of this term, not a separate force.
+
+`pressure` persists between steps as a **warm start** for red-black
+Gauss–Seidel, which converges far faster from last frame's pressure than from
+zero. It lives in the state store, so snapshots include it and scrubbing stays
+bit-deterministic.
+
+**Boundaries in 2a:** solid walls (zero normal velocity, Neumann pressure) on
+five faces; the top face (+z) is open (pressure 0), so a plume leaves the domain
+instead of piling up at the ceiling. Per-face settings are 2b.
+
+The density output feeds the existing `core.output`, so the CLI, daemon and
+viewport need no change beyond registration.
+
+### 2.5 `ComputeBatch` (in `elements-core::gpu`)
+
+Records many dispatches into one command encoder and submits once, inside
+`GpuContext::scoped`. It lives in core because Tide needs it too.
+`dispatch_over_field` submits per dispatch; at 128³ with 160 iterations that is
+over 320 submits per substep, and submit overhead alone could fail the gate for
+reasons unrelated to the solver's maths.
+
+## 3. Data flow
+
+Per substep, with `h = dt / substeps` and `dt` from the document's `fps`:
+
+| # | Stage | Kernel | Storage bindings |
+|---|---|---|---|
+| 1 | Emit | `density += src·h`; same for temperature | 2 (read_write) |
+| 2 | Forces | buoyancy onto z-faces, cell values averaged to faces | 1 |
+| 3 | Advect velocity | semi-Lagrangian backtrace from each face centre, hand trilinear (E2); old faces read as `texture_3d`, new pooled faces written | 3 |
+| 4a | Divergence | per cell from the faces | 1 |
+| 4b | Pressure | N × {red, black} in-place sweeps on `pressure` (read_write) | 1 |
+| 4c | Gradient subtract | faces −= h·∇p; normal velocity on solid walls forced to 0 | 3 |
+| 5 | Advect scalars | density and temperature through the projected velocity | 2 |
+
+- Every kernel stays within the 4-storage-texture limit. Neighbour reads go
+  through `texture_3d<f32>` + `textureLoad`, except the red-black sweep, which
+  reads and writes `pressure` through a single `read_write` binding.
+- Red-black is bit-deterministic: cells of one colour never read each other.
+- One substep is one `ComputeBatch` submit. Red and black are two entry points,
+  so two cached pipelines. Bind groups and one uniform buffer (dims, voxel size,
+  `h`) are built once per substep and reused across all N iterations. Nothing
+  is allocated inside the pressure loop.
+- Scratch fields (new faces, divergence, new scalars) come from the pool and
+  return to it each step. A steady-state step allocates no textures.
+- Vorticity (between 2 and 3) and dissipation (after 5) slot in during 2b.
+
+### 3.1 Errors
+
+- Params are validated at document load: `substeps` in 1..=16,
+  `pressure_iterations` in 1..=1000, every float finite, `radius > 0`,
+  `domain_size > 0`. Violations are `DocError`s. Documents are untrusted, and
+  the daemon must not panic.
+- On any error mid-step, every taken state value and every scratch field goes
+  back to the pool before the error returns.
+- State is written back only after a whole step succeeds, so a failed step
+  leaves the store at the previous frame and the timeline's `discard` path
+  behaves as it does today.
+
+## 4. Testing and the speed gate
+
+Every test records a single-change mutation that makes it fail (CLAUDE.md).
+Solver test grids are ≤ 32³ so `just check` stays fast (the emitter's
+resolution check fills one 64³ field, which is cheap); only the gate runs at 128³.
+Kernel tests use non-cubic grids (e.g. 8×6×5) so an axis swap cannot pass by
+symmetry.
+
+### 4.1 Kernel tests (GPU against a CPU reference, tolerance ~1e-5)
+
+- **Advection:** a uniform velocity of an integer number of voxels shifts a
+  field exactly; a fractional one matches the CPU trilinear reference.
+- **Divergence:** `u = (x, 0, 0)` gives `div = 1` in the interior.
+- **Red-black sweep:** matches a CPU red-black reference; a Neumann wall and the
+  Dirichlet top are each covered.
+- **Gradient subtract:** normal velocity on solid walls is exactly 0 afterwards.
+- **Emit and buoyancy:** face averaging matches the CPU. The sphere emitter's
+  total emitted amount agrees within 5% between 32³ and 64³.
+- **`ComputeBatch`:** a dispatch reading the previous dispatch's output in the
+  same batch sees the updated data.
+- **Doc validation:** `substeps` 0 and 17, a NaN rate, and
+  `pressure_iterations` 0 are each rejected with a `DocError`.
+- **Error path:** a forced mid-step failure returns every field to the pool;
+  pool counts balance before and after.
+
+### 4.2 Validation scenes (umbrella §6, those 2a can reach)
+
+| Scene | Assertion | Example mutation |
+|---|---|---|
+| Still domain | velocity exactly zero after 10 frames | forces kernel adds a constant |
+| Divergence-free | RMS divergence after projection ≤ 10% of before, at N = 80 (moved to the gate's chosen N once it is recorded) | delete the black sweep |
+| Buoyant blob | density centroid z rises strictly every frame for 20 frames | flip the sign of β |
+| Determinism | frame 40 bit-identical in order, after scrubbing, and after eviction | keep `pressure` outside the state store |
+
+The collider scene is 2b.
+
+### 4.3 The speed gate
+
+This refines §5.5, which predates the 2a/2b split and names a "default quality
+preset" that 2a does not have.
+
+**Scene:** §5.3's `plume` at 128³, `substeps = 1`. It is defined once as a Rust
+`Scene` struct in `elements-ember::bench` that serialises to an `.elements`
+document. In 2b the same struct also generates the Mantaflow script.
+
+**Runner:** `just bench-gate` runs
+`cargo run --release -p elements-ember --example speed_gate`. It is not part of
+`just check`.
+
+For each N in {20, 40, 80, 160}:
+
+1. **Warm up:** step frames 1–24 untimed (shader compilation, plume
+   development, pressure warm start).
+2. **Time:** frames 25–48, each measured as `eval` plus a blocking poll, with
+   timeline caching off. Wall clock, because GPU timestamp queries need the
+   optional `TIMESTAMP_QUERY` feature. Median, min and max per run; the reported
+   figure is the median of 3 runs.
+3. **Snapshot cost:** timed separately and reported as its own column. It is
+   real interactive cost, but not the solver's.
+4. **Divergence:** from the frame-48 state, run stages 1–3 through the kernel
+   API, read back the faces and compute divergence; run the projection with N
+   iterations and compute it again. `metrics::divergence` computes max and RMS
+   over all cells on the CPU; it is the same function §5.4 uses in 2b.
+
+**Output:** `docs/bench/speed-gate.md` records the machine, OS, Ember commit,
+date, and:
+
+| N | step ms (median, min–max) | snapshot ms | RMS div before | RMS div after | ratio | max div after |
+|---|---|---|---|---|---|---|
+
+**Pre-registered rule.** It is fixed here, before any number exists, and is not
+revised to fit the results.
+
+- **PASS** if some N has a median step of ≤ 100 ms **and** a ratio of ≤ 0.10.
+  The provisional default `pressure_iterations` is the **largest** passing N:
+  the best quality that fits the budget. The user confirms it, and 2b's presets
+  start from there.
+- **FAIL** otherwise. Work stops, and the table goes to the user with §5.5's
+  three options.
+
+The decision is recorded as a line in `docs/bench/speed-gate.md`. It is a human
+decision, never a CI check.
 
 ---
 
@@ -114,8 +309,8 @@ as a note, not a number.
 This comes first, and decides whether piece 2 continues as designed.
 
 As soon as advection and projection kernels exist, before emitters, colliders
-or add-on work, measure Ember's step time at 128³ with the default quality preset
-on this machine (Apple Silicon, Metal).
+or add-on work, measure Ember's step time at 128³ on this machine (Apple Silicon, Metal).
+The procedure and pass rule are in §4.3.
 
 - **Pass:** a full step, including every substep, takes ≤ 100 ms, which gives
   ≥ 10 fps. Continue.
