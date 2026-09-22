@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use elements_core::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
-use elements_core::graph::{Document, Graph, NodeRegistry};
+use elements_core::graph::{Document, Graph, NodeRegistry, Timeline};
 use elements_ipc::{
     Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, FrameWriter, Response,
 };
@@ -19,6 +19,8 @@ pub struct Session {
     pipelines: PipelineCache,
     registry: NodeRegistry,
     graph: Option<(Graph, FieldDims)>,
+    /// Time and simulation state for the loaded graph.
+    timeline: Option<Timeline>,
     channel_path: std::path::PathBuf,
     writer: Option<FrameWriter>,
     greeted: bool,
@@ -34,6 +36,7 @@ impl Session {
             pipelines: PipelineCache::new(),
             registry: NodeRegistry::with_builtins(),
             graph: None,
+            timeline: None,
             channel_path: channel_path.to_path_buf(),
             writer: None,
             greeted: false,
@@ -76,11 +79,11 @@ pub fn handle(session: &mut Session, command: Command) -> Response {
             }
         }
 
-        Command::Render { frame: _ } => {
+        Command::Render { frame } => {
             if let Err(e) = require_greeted(session) {
                 return Response::Error(e);
             }
-            match render(session) {
+            match render(session, frame) {
                 Ok(response) => response,
                 Err(e) => Response::Error(e),
             }
@@ -106,6 +109,7 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
         .map_err(|e| EngineError::new(ErrorKind::Io, format!("{}: {e}", path.display())))?;
     let doc = Document::from_json(&text)
         .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
+    let config = doc.timeline_config();
     let (graph, dims) = doc
         .into_graph(&session.registry)
         .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
@@ -153,36 +157,68 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
         );
     }
 
+    // A new document invalidates every frame the old one simulated. Its
+    // textures go back to the pool, since the device is still good.
+    if let Some(mut old) = session.timeline.take() {
+        old.reset(&mut session.pool);
+    }
     session.graph = Some((graph, dims));
+    session.timeline = Some(Timeline::new(config));
     Ok(Response::Loaded {
         dims: [dims.x, dims.y, dims.z],
         nodes,
     })
 }
 
-fn render(session: &mut Session) -> Result<Response, EngineError> {
-    let (graph, dims) = session
-        .graph
-        .as_ref()
-        .ok_or_else(|| EngineError::new(ErrorKind::Graph, "no graph is loaded"))?;
+fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
+    let no_graph = || EngineError::new(ErrorKind::Graph, "no graph is loaded");
+    let (graph, dims) = session.graph.as_ref().ok_or_else(no_graph)?;
+    let dims = *dims;
+    let timeline = session.timeline.as_mut().ok_or_else(no_graph)?;
 
-    let value = graph
-        .eval(
-            &session.gpu,
-            &mut session.pool,
-            &mut session.pipelines,
-            *dims,
-        )
-        .map_err(map_node_error)?;
-    let field = value.as_field().map_err(map_node_error)?;
-    let values = field.read_back(&session.gpu).map_err(|e| {
-        let kind = if session.gpu.device_lost().is_some() {
-            ErrorKind::DeviceLost
-        } else {
-            ErrorKind::Gpu
-        };
-        EngineError::new(kind, e.to_string())
-    })?;
+    let evaluated = match timeline.goto(
+        graph,
+        &session.gpu,
+        &mut session.pool,
+        &mut session.pipelines,
+        dims,
+        frame,
+    ) {
+        Ok(evaluated) => evaluated,
+        Err(e) => {
+            let err = map_node_error(e);
+            if err.kind == ErrorKind::DeviceLost {
+                timeline.discard();
+            }
+            return Err(err);
+        }
+    };
+    if let Some(warning) = timeline.take_warning() {
+        // stderr, never stdout: stdout carries the readiness line.
+        eprintln!("elementsd: warning: {warning}");
+    }
+
+    let values = match evaluated.value.as_field() {
+        Ok(field) => field.read_back(&session.gpu).map_err(|e| {
+            let kind = if session.gpu.device_lost().is_some() {
+                ErrorKind::DeviceLost
+            } else {
+                ErrorKind::Gpu
+            };
+            EngineError::new(kind, e.to_string())
+        }),
+        Err(e) => Err(map_node_error(e)),
+    };
+    evaluated.value.release_to(&mut session.pool);
+    let values = match values {
+        Ok(values) => values,
+        Err(e) => {
+            if e.kind == ErrorKind::DeviceLost {
+                timeline.discard();
+            }
+            return Err(e);
+        }
+    };
 
     let writer = session
         .writer

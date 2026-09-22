@@ -494,3 +494,76 @@ fn the_readiness_line_arrives_promptly_after_bind() {
         ),
     }
 }
+
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/elementsd is two levels below the root")
+        .to_path_buf()
+}
+
+/// Render `frame` and read the published values back from the channel.
+fn render_values(
+    stream: &mut elements_ipc::Stream,
+    reader: &mut BufReader<elements_ipc::Stream>,
+    channel: &std::path::Path,
+    frame: u32,
+) -> Vec<f32> {
+    write_message(stream, &Command::Render { frame }).unwrap();
+    match read_message::<_, Response>(reader).unwrap().unwrap() {
+        Response::Frame { .. } => {}
+        other => panic!("expected Frame, got {other:?}"),
+    }
+    let frames = FrameReader::open(channel).unwrap();
+    frames.read_latest().unwrap().1
+}
+
+#[test]
+fn render_produces_the_requested_frame_of_a_stateful_graph() {
+    let daemon = Daemon::start();
+    let graph = repo_root().join("tests/graphs/accumulate_4.elements");
+
+    let mut stream = daemon.connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_message(
+        &mut stream,
+        &Command::Hello {
+            protocol_version: ELEMENTS_PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
+    let _: Response = read_message(&mut reader).unwrap().unwrap();
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: graph.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message::<_, Response>(&mut reader).unwrap().unwrap(),
+        Response::Loaded { .. }
+    ));
+
+    let near = |values: &[f32], frame: u32| {
+        let want = 0.5 * frame as f32 / 24.0;
+        assert!(
+            values.iter().all(|v| (v - want).abs() < 1e-6),
+            "frame {frame}: expected {want}, got {:?}",
+            &values[..4]
+        );
+    };
+
+    let three = render_values(&mut stream, &mut reader, &daemon.channel, 3);
+    near(&three, 3);
+    let one = render_values(&mut stream, &mut reader, &daemon.channel, 1);
+    near(&one, 1);
+    let three_again = render_values(&mut stream, &mut reader, &daemon.channel, 3);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&three_again),
+        bits(&three),
+        "frame 3 must be bit-identical on revisit"
+    );
+}
