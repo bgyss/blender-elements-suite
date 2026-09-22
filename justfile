@@ -56,3 +56,8 @@ blender-test:
 # Takes minutes, needs the real GPU, and is not part of `check`.
 bench-gate:
     cargo run --release -p elements-ember --example speed_gate
+
+# Sweep pressure iterations past the gate's range, for choosing 2b's presets.
+# Writes docs/bench/iteration-sweep.md and leaves the gate's record alone.
+bench-sweep iterations="160,240,320,400,480,560,640":
+    SPEED_GATE_ITERATIONS={{iterations}} cargo run --release -p elements-ember --example speed_gate

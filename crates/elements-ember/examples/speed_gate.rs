@@ -2,6 +2,10 @@
 //!
 //! Writes `docs/bench/speed-gate.md`. The decision line at its end is filled
 //! in by hand after the user decides; this program only applies the rule.
+//!
+//! `just bench-sweep` instead sweeps the counts in `SPEED_GATE_ITERATIONS`
+//! (comma-separated) into `docs/bench/iteration-sweep.md`. That is exploration
+//! for choosing presets, not the gate, so it never touches the gate's record.
 
 use std::error::Error;
 use std::process::Command;
@@ -169,8 +173,17 @@ fn main() -> Res<()> {
     let mut table = String::new();
     let mut rows = Vec::new();
     let scene_substeps = Scene::plume(RESOLUTION).solver.substeps;
+    let sweep: Option<Vec<u32>> = match std::env::var("SPEED_GATE_ITERATIONS") {
+        Ok(list) => Some(
+            list.split(',')
+                .map(|n| n.trim().parse::<u32>())
+                .collect::<Result<_, _>>()?,
+        ),
+        Err(_) => None,
+    };
+    let iterations = sweep.clone().unwrap_or_else(|| ITERATIONS.to_vec());
 
-    for n in ITERATIONS {
+    for n in iterations {
         let scene = Scene::plume(RESOLUTION).with_iterations(n);
         let mut timing = Timing {
             run_medians: Vec::new(),
@@ -217,8 +230,21 @@ fn main() -> Res<()> {
         None => "unknown".to_owned(),
     };
     let substeps = scene_substeps;
+    let (title, file, decision) = if sweep.is_some() {
+        (
+            "Ember pressure-iteration sweep (exploration, not the gate)",
+            "iteration-sweep.md",
+            "The gate's own record is `speed-gate.md`; this sweep only informs 2b's presets.\n",
+        )
+    } else {
+        (
+            "Ember speed gate (piece 2a)",
+            "speed-gate.md",
+            "Decision (recorded by the user): _pending_\n",
+        )
+    };
     let report = format!(
-        "# Ember speed gate (piece 2a)\n\n\
+        "# {title}\n\n\
          - Machine: {cpu} ({adapter})\n\
          - OS: macOS {os}\n\
          - Ember commit: {commit}\n\
@@ -237,7 +263,7 @@ fn main() -> Res<()> {
          Rule applied: {verdict}.\n\n\
          Note: the ratio measures residual divergence, which weights high frequencies. The smooth \
          pressure error Gauss–Seidel leaves behind shows in plume shape, not in this number.\n\n\
-         Decision (recorded by the user): _pending_\n",
+         {decision}",
         cpu = shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
         adapter = gpu.adapter_name(),
         os = shell("sw_vers", &["-productVersion"]),
@@ -245,12 +271,9 @@ fn main() -> Res<()> {
         first = 1 + WARMUP,
         last = WARMUP + TIMED,
     );
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/bench/speed-gate.md"
-    );
-    std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/bench"))?;
-    std::fs::write(path, &report)?;
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/bench");
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(format!("{dir}/{file}"), &report)?;
     println!("{report}");
     Ok(())
 }
