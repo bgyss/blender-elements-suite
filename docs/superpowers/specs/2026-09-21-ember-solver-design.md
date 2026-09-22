@@ -125,9 +125,9 @@ Per substep, with `h = dt / substeps` and `dt` from the document's `fps`:
   the daemon must not panic.
 - On any error mid-step, every taken state value and every scratch field goes
   back to the pool before the error returns.
-- State is written back only after a whole step succeeds, so a failed step
-  leaves the store at the previous frame and the timeline's `discard` path
-  behaves as it does today.
+- State is written back only after a whole step succeeds. A failed step's
+  half-updated state is released, never stored; the timeline already clears
+  its store and cursor on any error and recomputes from its cache next time.
 
 ## 4. Testing and the speed gate
 
