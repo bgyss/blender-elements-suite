@@ -29,6 +29,21 @@ pub enum GpuError {
     DeviceLost(String),
 }
 
+/// The limits Elements asks a device for, given what its adapter supports.
+///
+/// Everything is `downlevel_defaults` except two things taken from the adapter.
+/// The resolution limits, because `downlevel_defaults` caps 3D textures at 256,
+/// which cannot hold a staggered face of a 256³ domain. And `max_buffer_size`,
+/// because at 256 MiB it rejects any domain above about 406³, and read-back of
+/// a 512³ field needs 512 MiB. Both are limits, not features, so
+/// `required_features` stays empty and the portability guarantee is unchanged.
+pub fn required_limits(adapter: &wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits {
+        max_buffer_size: adapter.max_buffer_size,
+        ..wgpu::Limits::downlevel_defaults().using_resolution(adapter.clone())
+    }
+}
+
 /// Owns the `wgpu` device and queue for one engine process.
 pub struct GpuContext {
     device: wgpu::Device,
@@ -61,12 +76,7 @@ impl GpuContext {
 
         let required_features = wgpu::Features::empty();
 
-        // Resolution limits come from the adapter. `downlevel_defaults` caps
-        // 3D textures at 256, which cannot hold a staggered face (n + 1 cells)
-        // of a 256³ domain, let alone a 512³ bake. These are limits, not
-        // features, so `required_features` stays empty and the portability
-        // guarantee is unchanged.
-        let required_limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+        let required_limits = required_limits(&adapter.limits());
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

@@ -57,3 +57,23 @@ fn a_staggered_face_of_a_256_domain_can_be_allocated() {
         face.err()
     );
 }
+
+/// Only the resolution limits and `max_buffer_size` may come from the adapter.
+/// Everything else stays at `downlevel_defaults`, so kernels keep running on
+/// every backend, in particular within 4 storage textures per stage.
+#[test]
+fn required_limits_take_only_resolution_and_buffer_size_from_the_adapter() {
+    let mut adapter = wgpu::Limits::downlevel_defaults();
+    adapter.max_buffer_size = 4 << 30;
+    adapter.max_texture_dimension_3d = 2048;
+    adapter.max_storage_textures_per_shader_stage = 16;
+
+    let got = elements_core::gpu::required_limits(&adapter);
+    let base = wgpu::Limits::downlevel_defaults();
+    assert_eq!(got.max_buffer_size, 4 << 30);
+    assert_eq!(got.max_texture_dimension_3d, 2048);
+    assert_eq!(
+        got.max_storage_textures_per_shader_stage,
+        base.max_storage_textures_per_shader_stage
+    );
+}

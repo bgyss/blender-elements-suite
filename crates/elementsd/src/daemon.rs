@@ -124,10 +124,12 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
     // Reject a document whose implied fields would not fit this device's
     // `max_buffer_size`, before the frame channel or any GPU texture is
     // allocated. This is a distinct check from the `max_texture_dimension_3d`
-    // loop below: `max_buffer_size` (256 MiB) is reachable well inside the
-    // adapter's texture-dimension limit (2048 on Apple Silicon), since a
-    // padded R32Float readback of a domain far under 2048^3 is already
-    // gigabytes. See `Document::validate_for`'s doc comment.
+    // loop below: `max_buffer_size` (requested from the adapter itself, via
+    // `elements_core::gpu::required_limits`, not a fixed 256 MiB) is still
+    // reachable well inside the adapter's texture-dimension limit (2048 on
+    // Apple Silicon), since a padded R32Float readback of a domain far under
+    // 2048^3 is already tens of gigabytes. See `Document::validate_for`'s doc
+    // comment.
     doc.validate_for(&session.gpu.device().limits())
         .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
 

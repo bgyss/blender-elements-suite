@@ -136,11 +136,12 @@ impl Document {
     ///
     /// `max_texture_dimension_3d` alone is not enough: `Field::read_back`
     /// (`elements_core::gpu::field`) allocates a staging BUFFER, and
-    /// `max_buffer_size` (256 MiB on every adapter Core v1 has seen; it is not
-    /// raised by `using_resolution`, unlike the texture-dimension limit) is
-    /// reachable well inside the texture-dimension limit — a 2047^3 domain is
-    /// far under a 2048-wide texture cap but its padded R32Float readback is
-    /// gigabytes. Call this before any texture or the frame channel is
+    /// `max_buffer_size` (now requested from the adapter itself, via
+    /// `elements_core::gpu::required_limits`, rather than fixed at the
+    /// `downlevel_defaults` 256 MiB) is still reachable well inside the
+    /// texture-dimension limit — a 2047^3 domain is far under a 2048-wide
+    /// texture cap but its padded R32Float readback is tens of gigabytes.
+    /// Call this before any texture or the frame channel is
     /// allocated, so an oversized document is a typed, load-time
     /// `DocError::BadParams` rather than a `GpuError::Validation` from
     /// `Field::read_back` (which a caller may treat as transient) or an
