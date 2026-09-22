@@ -6,14 +6,13 @@
 //! `shaders/common.wgsl`.
 
 mod advect;
+mod forces;
 
 pub use advect::{advect_scalar, advect_velocity};
+pub use forces::{buoyancy, emit};
 
 use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError};
 use wgpu::util::DeviceExt;
-
-#[allow(dead_code)]
-pub(crate) const COMMON: &str = include_str!("shaders/common.wgsl");
 
 /// Values every kernel in one substep shares.
 #[derive(Debug, Clone, Copy, PartialEq)]
