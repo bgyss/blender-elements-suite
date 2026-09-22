@@ -12,6 +12,17 @@ use elements_ipc::{
     Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, FrameWriter, Response,
 };
 
+/// The most a requested frame may exceed the timeline's `start_frame` by.
+///
+/// `Timeline::goto` on a stateful graph steps forward one evaluation per
+/// frame between the held/cached state and the target, so an unbounded
+/// `Render { frame }` from untrusted IPC (`frame: u32::MAX` is about 4.3e9)
+/// hangs the daemon evaluating billions of frames. Frames below
+/// `start_frame` are unaffected: `Timeline::goto` clamps them, it never
+/// steps for them. Value matches Blender's own `MAXFRAME`, so any frame a
+/// real Blender timeline could name is always allowed.
+const MAX_FRAME_SPAN: u64 = 1_048_574;
+
 /// One client's engine state.
 pub struct Session {
     gpu: GpuContext,
@@ -186,6 +197,23 @@ fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
     let (graph, dims) = session.graph.as_ref().ok_or_else(no_graph)?;
     let dims = *dims;
     let timeline = session.timeline.as_mut().ok_or_else(no_graph)?;
+
+    // Reject a frame far past `start_frame` before it ever reaches
+    // `Timeline::goto`, which would otherwise step forward one evaluation per
+    // frame in between. Frames below `start_frame` are unaffected: `goto`
+    // clamps them rather than stepping. Saturating/`u64` throughout so no
+    // `u32` value from IPC can overflow this check.
+    let start_frame = timeline.config().start_frame as u64;
+    let span = (frame as u64).saturating_sub(start_frame);
+    if span > MAX_FRAME_SPAN {
+        return Err(EngineError::new(
+            ErrorKind::Graph,
+            format!(
+                "requested frame {frame} is {span} frames past the timeline's start frame \
+                 {start_frame}, more than the {MAX_FRAME_SPAN}-frame limit"
+            ),
+        ));
+    }
 
     let evaluated = match timeline.goto(
         graph,

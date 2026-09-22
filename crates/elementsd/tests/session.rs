@@ -594,6 +594,59 @@ fn render_values(
     frames.read_latest().unwrap().1
 }
 
+/// `Render { frame: u32::MAX }` on a stateful graph would make
+/// `Timeline::goto` step forward from `start_frame` almost 4.3 billion times,
+/// hanging the daemon on untrusted IPC input. The daemon must reject a frame
+/// more than `MAX_FRAME_SPAN` past the timeline's `start_frame` promptly,
+/// with a typed error, and keep the session usable afterwards. Frames below
+/// `start_frame` are unaffected by this check: they clamp, so they never
+/// reach `goto` at all here to matter.
+#[test]
+fn render_of_a_frame_far_past_start_is_rejected_promptly() {
+    let daemon = Daemon::start();
+    let graph = repo_root().join("tests/graphs/accumulate_4.elements");
+
+    let mut stream = daemon.connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_message(
+        &mut stream,
+        &Command::Hello {
+            protocol_version: ELEMENTS_PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
+    let _: Response = read_message(&mut reader).unwrap().unwrap();
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: graph.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message::<_, Response>(&mut reader).unwrap().unwrap(),
+        Response::Loaded { .. }
+    ));
+
+    let start = std::time::Instant::now();
+    write_message(&mut stream, &Command::Render { frame: u32::MAX }).unwrap();
+    match read_message::<_, Response>(&mut reader).unwrap().unwrap() {
+        Response::Error(_) => {}
+        other => panic!("expected Error, got {other:?}"),
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "rejecting an absurd frame must be prompt, not run ~4 billion evaluations first"
+    );
+
+    // The session must still be usable: a normal render afterwards succeeds.
+    write_message(&mut stream, &Command::Render { frame: 1 }).unwrap();
+    assert!(matches!(
+        read_message::<_, Response>(&mut reader).unwrap().unwrap(),
+        Response::Frame { .. }
+    ));
+}
+
 #[test]
 fn render_produces_the_requested_frame_of_a_stateful_graph() {
     let daemon = Daemon::start();
