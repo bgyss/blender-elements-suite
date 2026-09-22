@@ -17,6 +17,8 @@ pub struct SocketId {
 pub enum SocketType {
     Field,
     Scalar,
+    /// A staggered (face-centred) vector field. See `gpu::StaggeredField`.
+    VectorField,
 }
 
 /// A node's input and output signature.

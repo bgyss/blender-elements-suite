@@ -1,6 +1,8 @@
 //! The `Node` trait, the values that flow between nodes, and node errors.
 
-use crate::gpu::{Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache};
+use crate::gpu::{
+    Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache, StaggeredField,
+};
 
 use super::socket::{NodeId, SocketSpec, SocketType};
 
@@ -35,9 +37,16 @@ pub enum NodeError {
 /// would alias or double-free the underlying GPU resource. `Value` therefore
 /// cannot be `Clone` either, and the evaluator moves values between producer
 /// and consumer instead of sharing them.
+///
+/// `VectorField` is three `Field`s and so is much larger than `Scalar`, but
+/// values only move at graph evaluation boundaries (a handful of times per
+/// frame), so the copy is not a hot path. Boxing it would add an indirection
+/// to every call site that matches on `Value` for no measurable benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum Value {
     Field(Field),
     Scalar(f32),
+    VectorField(StaggeredField),
 }
 
 impl std::fmt::Debug for Value {
@@ -45,6 +54,7 @@ impl std::fmt::Debug for Value {
         match self {
             Self::Field(field) => f.debug_tuple("Field").field(&field.dims()).finish(),
             Self::Scalar(s) => f.debug_tuple("Scalar").field(s).finish(),
+            Self::VectorField(v) => f.debug_tuple("VectorField").field(&v.cells()).finish(),
         }
     }
 }
@@ -80,7 +90,7 @@ impl Value {
     pub fn as_field(&self) -> Result<&Field, NodeError> {
         match self {
             Self::Field(f) => Ok(f),
-            Self::Scalar(_) => Err(NodeError::TypeMismatch {
+            _ => Err(NodeError::TypeMismatch {
                 node: NodeId(u32::MAX),
                 index: 0,
                 expected: SocketType::Field,
@@ -91,10 +101,21 @@ impl Value {
     pub fn as_scalar(&self) -> Result<f32, NodeError> {
         match self {
             Self::Scalar(s) => Ok(*s),
-            Self::Field(_) => Err(NodeError::TypeMismatch {
+            _ => Err(NodeError::TypeMismatch {
                 node: NodeId(u32::MAX),
                 index: 0,
                 expected: SocketType::Scalar,
+            }),
+        }
+    }
+
+    pub fn as_vector_field(&self) -> Result<&StaggeredField, NodeError> {
+        match self {
+            Self::VectorField(v) => Ok(v),
+            _ => Err(NodeError::TypeMismatch {
+                node: NodeId(u32::MAX),
+                index: 0,
+                expected: SocketType::VectorField,
             }),
         }
     }
@@ -103,6 +124,19 @@ impl Value {
         match self {
             Self::Field(_) => SocketType::Field,
             Self::Scalar(_) => SocketType::Scalar,
+            Self::VectorField(_) => SocketType::VectorField,
+        }
+    }
+
+    /// Return every GPU texture this value owns to `pool`.
+    ///
+    /// Dropping a `Value` frees its textures instead, forcing the next frame to
+    /// allocate again. Code that is finished with a value calls this.
+    pub fn release_to(self, pool: &mut FieldPool) {
+        match self {
+            Self::Field(f) => pool.release(f),
+            Self::VectorField(v) => pool.release_staggered(v),
+            Self::Scalar(_) => {}
         }
     }
 }
@@ -192,6 +226,20 @@ impl EvalCtx<'_> {
     pub fn acquire_zeroed(&mut self) -> Result<Field, NodeError> {
         let dims = self.dims;
         Ok(self.pool.acquire_zeroed(self.gpu, self.pipelines, dims)?)
+    }
+
+    /// Acquire a staggered vector field for the current domain, contents unspecified.
+    pub fn acquire_vector_uninit(&mut self) -> Result<StaggeredField, NodeError> {
+        let dims = self.dims;
+        Ok(self.pool.acquire_staggered_uninit(self.gpu, dims)?)
+    }
+
+    /// Acquire a staggered vector field for the current domain with every face zeroed.
+    pub fn acquire_vector_zeroed(&mut self) -> Result<StaggeredField, NodeError> {
+        let dims = self.dims;
+        Ok(self
+            .pool
+            .acquire_staggered_zeroed(self.gpu, self.pipelines, dims)?)
     }
 
     /// Run GPU work with the device and pipeline cache borrowed together.

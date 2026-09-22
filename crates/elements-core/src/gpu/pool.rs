@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
-use super::{Field, FieldDims, FieldFormat, GpuContext, GpuError, PipelineCache, fill_constant};
+use super::{
+    Axis, Field, FieldDims, FieldFormat, GpuContext, GpuError, PipelineCache, StaggeredField,
+    fill_constant,
+};
 
 /// Pools fields keyed by `(dims, format)`.
 #[derive(Default)]
@@ -78,6 +81,50 @@ impl FieldPool {
         let field = self.acquire(ctx, dims, FieldFormat::R32Float)?;
         fill_constant(ctx, cache, &field, 0.0)?;
         Ok(field)
+    }
+
+    /// Take a staggered field for a domain of `cells`, contents unspecified.
+    pub fn acquire_staggered_uninit(
+        &mut self,
+        ctx: &GpuContext,
+        cells: FieldDims,
+    ) -> Result<StaggeredField, GpuError> {
+        let x = self.acquire(
+            ctx,
+            StaggeredField::face_dims(cells, Axis::X),
+            FieldFormat::R32Float,
+        )?;
+        let y = self.acquire(
+            ctx,
+            StaggeredField::face_dims(cells, Axis::Y),
+            FieldFormat::R32Float,
+        )?;
+        let z = self.acquire(
+            ctx,
+            StaggeredField::face_dims(cells, Axis::Z),
+            FieldFormat::R32Float,
+        )?;
+        StaggeredField::from_faces(cells, [x, y, z])
+    }
+
+    /// Take a staggered field for a domain of `cells` with every face zeroed.
+    pub fn acquire_staggered_zeroed(
+        &mut self,
+        ctx: &GpuContext,
+        cache: &mut PipelineCache,
+        cells: FieldDims,
+    ) -> Result<StaggeredField, GpuError> {
+        let x = self.acquire_zeroed(ctx, cache, StaggeredField::face_dims(cells, Axis::X))?;
+        let y = self.acquire_zeroed(ctx, cache, StaggeredField::face_dims(cells, Axis::Y))?;
+        let z = self.acquire_zeroed(ctx, cache, StaggeredField::face_dims(cells, Axis::Z))?;
+        StaggeredField::from_faces(cells, [x, y, z])
+    }
+
+    /// Return all three faces for reuse.
+    pub fn release_staggered(&mut self, field: StaggeredField) {
+        for face in field.into_faces() {
+            self.release(face);
+        }
     }
 
     /// Return a field for reuse.
