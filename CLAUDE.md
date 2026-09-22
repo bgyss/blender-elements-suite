@@ -11,15 +11,22 @@ for solvers. JangaFX product names are trademarks and appear in the docs only to
 identify prior art — never name a component after one.
 
 The suite is being built product by product. **Core v1** is merged. **Ember**
-(grid gas) is in progress in four pieces; piece 1, core sim foundations, adds
+(grid gas) is built in four pieces. Piece 1, core sim foundations, is merged:
 persistent state, a timeline with a frame cache, staggered vector fields, and
-multi-consumer graph outputs.
+multi-consumer graph outputs. Piece 2 is split at a speed gate. **2a** is
+complete: the `elements-ember` crate, a GPU smoke solver that passed the 128³
+gate at 34 ms a step with 160 pressure iterations. **2b** is next: vorticity,
+dissipation, colliders, CFL substepping, quality presets and the Mantaflow
+benchmark. Its known risks are listed in §6 of the piece 2 spec.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
 - Ember umbrella spec: `docs/superpowers/specs/2026-09-21-ember-design.md`
 - Ember piece 1 spec: `docs/superpowers/specs/2026-09-21-ember-core-sim-foundations-design.md`
 - Ember piece 1 plan: `docs/superpowers/plans/2026-09-21-ember-core-sim-foundations.md`
+- Ember piece 2 spec: `docs/superpowers/specs/2026-09-21-ember-solver-design.md`
+- Ember piece 2a plan: `docs/superpowers/plans/2026-09-22-ember-solver-2a.md`
+- Speed gate and iteration sweep: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
 **Read the progress ledger before starting work.** It records which tasks of
@@ -38,6 +45,8 @@ just lint         # cargo fmt --check, clippy -D warnings, ruff check
 just addon        # build + verify the Blender extension ZIP
 just blender-test # Blender integration test; finds the macOS app bundle
 just golden       # regenerate golden files (review the PNG by eye first)
+just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
+just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
 ```
 
 Single test: `cargo nextest run -p elements-core --test noise` (a test *file*),
@@ -69,6 +78,8 @@ One long-lived engine process; Blender is a thin client. The engine never links
 
 ```
 elements-core/  wgpu device, fields, field pool, compute dispatch, node graph
+elements-ember/ smoke solver; registers node kinds, and the CLI and daemon
+                build their registry with `elements_ember::registry()`
 elements-io/    OpenVDB write, npy golden output, png previews
 elements-ipc/   NDJSON control plane + mmap'd double-buffered data plane
 elementsd/      the daemon binary
@@ -164,9 +175,9 @@ Other things that matter here:
 - Bit-exact assertions are legitimate **within one backend on one machine**
   (determinism). Cross-backend comparisons use tolerance — Metal and software
   Vulkan genuinely disagree about what counts as a validation error.
-- **CI has never run.** There is no git remote. Everything is verified on Metal
-  only; passing locally is not evidence of passing on lavapipe. Adding a remote
-  and fixing the resulting failures is a mandatory close-out step.
+- **CI runs on every push**, on llvmpipe (software Vulkan, named in the log), at
+  https://github.com/bgyss/blender-elements-suite. Passing on Metal locally is
+  not evidence of passing on lavapipe, so check the run: `gh run list`.
 
 ## Commits
 

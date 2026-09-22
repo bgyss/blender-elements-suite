@@ -11,5 +11,3 @@ elements-core = { path = "../elements-core" }
 serde.workspace = true
 serde_json.workspace = true
 wgpu.workspace = true
-
-[dev-dependencies]

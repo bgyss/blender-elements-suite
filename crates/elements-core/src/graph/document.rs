@@ -30,6 +30,14 @@ fn default_cache_budget_mb() -> u32 {
     DEFAULT_CACHE_BUDGET_MB
 }
 
+/// The range of `domain_size`, in metres, that a document may ask for.
+///
+/// Positive and finite as an f64 is not enough: nodes see the voxel size as an
+/// f32, and a size like 1e-300 or 1e300 makes it 0 or infinity, which turns
+/// every field NaN with no error. A millimetre to 100 km keeps the voxel size a
+/// normal f32 at any grid a device can hold.
+const DOMAIN_SIZE_RANGE: std::ops::RangeInclusive<f64> = 1e-3..=1e5;
+
 fn default_domain_size() -> f64 {
     super::DEFAULT_DOMAIN_SIZE
 }
@@ -104,11 +112,14 @@ impl Document {
                 reason: format!("fps must be a positive, finite number, got {}", doc.fps),
             });
         }
-        if !(doc.domain_size.is_finite() && doc.domain_size > 0.0) {
+        // `contains` is false for NaN and infinities, so this is also the finite check.
+        if !DOMAIN_SIZE_RANGE.contains(&doc.domain_size) {
             return Err(DocError::BadParams {
                 kind: "document".to_string(),
                 reason: format!(
-                    "domain_size must be a positive, finite number of metres, got {}",
+                    "domain_size must be {} to {} metres, got {}",
+                    DOMAIN_SIZE_RANGE.start(),
+                    DOMAIN_SIZE_RANGE.end(),
                     doc.domain_size
                 ),
             });

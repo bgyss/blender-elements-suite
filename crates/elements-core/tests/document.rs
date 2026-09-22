@@ -335,3 +335,23 @@ fn rejects_a_domain_size_that_is_not_positive() {
         }
     }
 }
+
+/// A size that is positive and finite as an f64 can still give an f32 voxel
+/// size of 0 or infinity, which turns every field NaN without any error.
+#[test]
+fn rejects_a_domain_size_that_f32_voxels_cannot_hold() {
+    for size in ["1e-300", "1e300"] {
+        let text = probe_doc(&format!(r#""version": 3, "domain_size": {size},"#));
+        match Document::from_json(&text) {
+            Err(DocError::BadParams { .. }) => {}
+            other => panic!("domain_size {size}: expected BadParams, got {other:?}"),
+        }
+    }
+    for size in ["1e-3", "1e5"] {
+        let text = probe_doc(&format!(r#""version": 3, "domain_size": {size},"#));
+        assert!(
+            Document::from_json(&text).is_ok(),
+            "domain_size {size} is inside the range and must load"
+        );
+    }
+}

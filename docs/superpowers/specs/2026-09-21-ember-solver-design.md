@@ -1,8 +1,9 @@
 # Ember Piece 2 — Solver Design
 
 **Date:** 2026-09-21 (§1–4 written 2026-09-22)
-**Status:** §1–4 approved for planning piece 2a. §5 is the benchmark design;
-its Mantaflow half is built in 2b.
+**Status:** Piece 2a (§1–4) is complete. The 128³ gate passed, and the default is
+160 pressure iterations (`docs/bench/speed-gate.md`). §5 is the benchmark design,
+whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
 ## 1. Goal and split
@@ -159,7 +160,7 @@ symmetry.
 | Scene | Assertion | Example mutation |
 |---|---|---|
 | Still domain | velocity exactly zero after 10 frames | forces kernel adds a constant |
-| Divergence-free | RMS divergence after projection ≤ 10% of before, at N = 80 (moved to the gate's chosen N once it is recorded) | delete the black sweep |
+| Divergence-free | RMS divergence after projection ≤ 10% of before, at N = 160 (the default the user chose from the gate, 2026-09-22) | delete the black sweep |
 | Buoyant blob | density centroid z rises strictly every frame for 20 frames | flip the sign of β |
 | Determinism | frame 40 bit-identical in order, after scrubbing, and after eviction | keep `pressure` outside the state store |
 
@@ -340,3 +341,47 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 - Comparisons against JangaFX EmberGen. It is closed-source, and its output
   cannot be driven headlessly under the same fairness rules.
 - Automatic statistical significance testing beyond medians of 3 runs.
+
+---
+
+## 6. Risks carried into piece 2b
+
+Found by piece 2a's whole-branch review. (a), (b) and (g) should be the first
+things 2b's plan addresses.
+
+- **(a) 512³ is impossible today.** `GpuContext` takes only the adapter's
+  resolution limits, so `max_buffer_size` stays at the downlevel 256 MiB and
+  `Document::validate_for` rejects domains above about 406³. Either raise
+  `max_buffer_size` from the adapter (a limit, not a feature, so allowed), or
+  chunk read-back and snapshots.
+- **(b) The warm start assumes a fixed `h`.** The pressure slot stores
+  φ = h·p. CFL substepping changes `h`, so it must rescale the stored φ by
+  h_new/h_old before each solve, or store p and multiply by `h` in the kernels.
+- **(c) There is no CFL limit and no dissipation.** Sampling is bounded, so
+  nothing blows up, but temperature and buoyancy accumulate near a constant
+  emitter and the backtrace is a single Euler step. At 128³ every 1 m/s is
+  about 2.7 cells per step. 2b needs CFL substeps, an RK2 backtrace and
+  dissipation.
+- **(d) The open top admits inflow.** A backtrace that leaves through the top
+  clamps to the top layer instead of taking the ambient value, so smoke is
+  drawn back in. When per-face boundaries arrive, a fully closed domain makes
+  the Neumann system singular and needs mean removal or pinning.
+- **(e) Pressure stays unconverged at low frequencies.** The residual falls
+  about as N^-1.5 (`docs/bench/iteration-sweep.md`), so expect plume shape to
+  differ from Mantaflow's PCG. Multigrid is the stretch goal, and the warm start
+  is load-bearing.
+- **(f) Long single submissions.** One substep is one submission, up to 2000
+  dispatches. At 256³–512³ with offline iteration counts that can run for
+  seconds and trip GPU watchdogs, which surface as `DeviceLost`. Split
+  submissions every K iterations on large grids.
+- **(g) Out-of-memory is uncaptured.** `GpuContext::scoped` pushes only a
+  Validation scope, so an out-of-memory error from texture creation reaches
+  wgpu's default handler and panics the daemon. The solver holds about 17 live
+  fields per step, plus snapshots. Add an OutOfMemory scope, and estimate the
+  working set when a document is validated.
+- **(h) Unused outputs are copied every frame.** All three solver outputs are
+  duplicated even when only density is consumed: free at 128³, real bandwidth
+  at 512³.
+- **(i) No test checks absolute emitted mass through the solver.** Swapping
+  density and temperature would pass every test. Add a one-frame check that
+  total density and temperature match rate × volume × `h`.
