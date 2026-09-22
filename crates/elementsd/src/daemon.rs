@@ -110,23 +110,23 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
         .into_graph(&session.registry)
         .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
 
-    // `GpuContext` requests `Limits::downlevel_defaults()`, which caps
-    // `max_texture_dimension_3d` well below what some adapters could
-    // actually support -- 256, on a downlevel profile. Without this check, a
-    // document whose dims exceed that limit answers `Loaded` here (nothing
-    // above touches the GPU) and only fails later, on every render, as a
-    // generic `ErrorKind::Gpu` -- which the add-on treats as transient and
-    // retries, when the document can in fact never render. Read the limit
-    // from the device actually in use rather than hardcoding the 256 default,
-    // so this keeps working if the requested limits ever change.
+    // `GpuContext` requests the adapter's own resolution limits, so this is
+    // the real hardware cap (2048 on Apple Silicon). Without this check, a
+    // document whose dims exceed it answers `Loaded` here (nothing above
+    // touches the GPU) and only fails later, on every render, as a generic
+    // `ErrorKind::Gpu`, which the add-on treats as transient and retries.
+    //
+    // The comparison is `>=`, not `>`: staggered vector fields store one more
+    // face than cells along each axis, so a domain axis must stay strictly
+    // below the limit for its faces to fit.
     let max_dim = session.gpu.device().limits().max_texture_dimension_3d;
     for (axis, value) in [("x", dims.x), ("y", dims.y), ("z", dims.z)] {
-        if value > max_dim {
+        if value >= max_dim {
             return Err(EngineError::new(
                 ErrorKind::Document,
                 format!(
-                    "dims {:?}: {axis} = {value} exceeds this device's max_texture_dimension_3d \
-                     of {max_dim}",
+                    "dims {:?}: {axis} = {value} must be below this device's \
+                     max_texture_dimension_3d of {max_dim} (staggered faces need one extra cell)",
                     [dims.x, dims.y, dims.z]
                 ),
             ));

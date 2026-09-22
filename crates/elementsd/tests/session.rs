@@ -304,15 +304,15 @@ fn a_graph_with_absurd_dimensions_is_an_error_not_a_crash() {
     ));
 }
 
-/// `GpuContext` requests `Limits::downlevel_defaults()`, which caps
-/// `max_texture_dimension_3d` at 256 on many adapters. Before this fix,
-/// `dims = [300, 300, 300]` (well under the `FieldTooLarge` overflow bound
-/// exercised by `a_graph_with_absurd_dimensions_is_an_error_not_a_crash`,
-/// but over the device's actual 3D texture limit) answered `Loaded`
-/// successfully and only failed on the first `Render`, as a generic
-/// `ErrorKind::Gpu` the add-on treats as transient and worth retrying --
-/// when the document could never have rendered at all. This must now fail at
-/// `LoadGraph` with a `Document` error naming the offending dimension.
+/// `GpuContext` now requests the adapter's own resolution limits, so
+/// `max_texture_dimension_3d` is the real hardware cap (2048 on Apple
+/// Silicon) rather than the `downlevel_defaults` 256. `dims = [65536, 4, 4]`
+/// (well under the `FieldTooLarge` overflow bound exercised by
+/// `a_graph_with_absurd_dimensions_is_an_error_not_a_crash`, but over any
+/// real adapter's 3D limit) must fail at `LoadGraph` with a `Document` error
+/// naming the offending dimension, not answer `Loaded` and fail later on the
+/// first `Render` as a generic `ErrorKind::Gpu` the add-on treats as
+/// transient and worth retrying.
 #[test]
 fn dims_exceeding_the_devices_texture_limit_are_rejected_at_load_not_render() {
     let daemon = Daemon::start();
@@ -322,7 +322,7 @@ fn dims_exceeding_the_devices_texture_limit_are_rejected_at_load_not_render() {
         &bad,
         r#"{
           "version": 1,
-          "dims": [300, 300, 300],
+          "dims": [65536, 4, 4],
           "nodes": [
             { "id": 0, "kind": "core.noise_field", "params": { "seed": 7 } },
             { "id": 1, "kind": "core.output", "params": {} }
@@ -355,7 +355,7 @@ fn dims_exceeding_the_devices_texture_limit_are_rejected_at_load_not_render() {
         Response::Error(e) => {
             assert_eq!(e.kind, ErrorKind::Document);
             assert!(
-                e.message.contains("300"),
+                e.message.contains("65536"),
                 "message should name the offending dimension: {}",
                 e.message
             );

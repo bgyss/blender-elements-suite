@@ -1,4 +1,4 @@
-use elements_core::gpu::{GpuContext, GpuError};
+use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, GpuError};
 
 #[test]
 fn acquires_a_headless_device() {
@@ -41,4 +41,19 @@ fn scoped_passes_through_success() {
     let ctx = GpuContext::new_headless().expect("no GPU adapter available");
     let value = ctx.scoped(|| 41 + 1).expect("valid work should not error");
     assert_eq!(value, 42);
+}
+
+/// A staggered velocity face of a 256³ domain is 257 cells along its own axis.
+/// `Limits::downlevel_defaults()` caps 3D textures at 256, so this allocation
+/// is the capability Ember needs, tested directly.
+#[test]
+fn a_staggered_face_of_a_256_domain_can_be_allocated() {
+    let ctx = GpuContext::new_headless().expect("no GPU adapter available");
+    let mut pool = FieldPool::new();
+    let face = pool.acquire(&ctx, FieldDims::new(257, 4, 4), FieldFormat::R32Float);
+    assert!(
+        face.is_ok(),
+        "257-wide 3D texture was refused: {:?}",
+        face.err()
+    );
 }

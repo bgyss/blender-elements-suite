@@ -55,11 +55,18 @@ impl GpuContext {
 
         let required_features = wgpu::Features::empty();
 
+        // Resolution limits come from the adapter. `downlevel_defaults` caps
+        // 3D textures at 256, which cannot hold a staggered face (n + 1 cells)
+        // of a 256³ domain, let alone a 512³ bake. These are limits, not
+        // features, so `required_features` stays empty and the portability
+        // guarantee is unchanged.
+        let required_limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("elements-device"),
                 required_features,
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
