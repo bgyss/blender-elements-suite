@@ -7,9 +7,11 @@
 
 mod advect;
 mod forces;
+mod project;
 
 pub use advect::{advect_scalar, advect_velocity};
 pub use forces::{buoyancy, emit};
+pub use project::{divergence, pressure, subtract_gradient};
 
 use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError};
 use wgpu::util::DeviceExt;

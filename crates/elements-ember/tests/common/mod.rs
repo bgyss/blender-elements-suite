@@ -181,3 +181,91 @@ pub fn velocity_pattern(cells: FieldDims) -> [Vec<f32>; 3] {
             .collect()
     })
 }
+
+/// Mirrors `relax` in `pressure.wgsl`: red (even i+j+k) then black, per iteration.
+pub fn cpu_red_black(phi: &mut [f32], div: &[f32], cells: FieldDims, dx2: f32, iterations: u32) {
+    let (nx, ny, nz) = (cells.x, cells.y, cells.z);
+    for _ in 0..iterations {
+        for colour in [0, 1] {
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        if (i + j + k) % 2 != colour {
+                            continue;
+                        }
+                        let mut sum = 0.0f32;
+                        let mut count = 0.0f32;
+                        if i > 0 {
+                            sum += phi[index(cells, i - 1, j, k)];
+                            count += 1.0;
+                        }
+                        if i < nx - 1 {
+                            sum += phi[index(cells, i + 1, j, k)];
+                            count += 1.0;
+                        }
+                        if j > 0 {
+                            sum += phi[index(cells, i, j - 1, k)];
+                            count += 1.0;
+                        }
+                        if j < ny - 1 {
+                            sum += phi[index(cells, i, j + 1, k)];
+                            count += 1.0;
+                        }
+                        if k > 0 {
+                            sum += phi[index(cells, i, j, k - 1)];
+                            count += 1.0;
+                        }
+                        if k < nz - 1 {
+                            sum += phi[index(cells, i, j, k + 1)];
+                        }
+                        count += 1.0;
+                        phi[index(cells, i, j, k)] =
+                            (sum - dx2 * div[index(cells, i, j, k)]) / count;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Max |div| over every cell of `faces`, computed on the CPU.
+pub fn cpu_max_divergence(faces: &[Vec<f32>; 3], cells: FieldDims, dx: f32) -> f32 {
+    let mut worst = 0.0f32;
+    for k in 0..cells.z {
+        for j in 0..cells.y {
+            for i in 0..cells.x {
+                let (xd, yd, zd) = (
+                    face_dims(cells, 0),
+                    face_dims(cells, 1),
+                    face_dims(cells, 2),
+                );
+                let d = (faces[0][index(xd, i + 1, j, k)] - faces[0][index(xd, i, j, k)]
+                    + faces[1][index(yd, i, j + 1, k)]
+                    - faces[1][index(yd, i, j, k)]
+                    + faces[2][index(zd, i, j, k + 1)]
+                    - faces[2][index(zd, i, j, k)])
+                    / dx;
+                worst = worst.max(d.abs());
+            }
+        }
+    }
+    worst
+}
+
+/// `velocity_pattern` with every solid-wall face set to zero, as advection leaves it.
+pub fn walled_velocity_pattern(cells: FieldDims) -> [Vec<f32>; 3] {
+    let mut faces = velocity_pattern(cells);
+    for (a, face) in faces.iter_mut().enumerate() {
+        let d = face_dims(cells, a);
+        for k in 0..d.z {
+            for j in 0..d.y {
+                for i in 0..d.x {
+                    if is_wall(cells, a, [i, j, k][a]) {
+                        face[index(d, i, j, k)] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+    faces
+}
