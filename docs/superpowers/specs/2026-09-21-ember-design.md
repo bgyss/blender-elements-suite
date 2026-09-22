@@ -95,7 +95,7 @@ eviction. Comparisons across backends (Metal against lavapipe) use a tolerance.
 | # | Piece | Delivers | Proof it works |
 |---|---|---|---|
 | 1 | **Core sim foundations** | persistent state, timeline and frame cache, time reaching nodes, staggered vector fields, several consumers per output, explicit acquire contract, fields released after their last use | `core.accumulate` steps, resets and scrubs deterministically against a CPU closed form |
-| 2 | **Solver** (new crate `elements-ember`) | `ember.smoke_solver`; analytic emitters (sphere, box, noise-modulated) and colliders (sphere, box) with animatable transforms; forces | the validation scenes in §6 |
+| 2 | **Solver** (new crate `elements-ember`) | `ember.smoke_solver`; analytic emitters (sphere, box, noise-modulated) and colliders (sphere, box) with animatable transforms; forces; a benchmark against Mantaflow (`2026-09-21-ember-solver-design.md` §5) | the validation scenes in §6; the 128³ speed gate and a committed benchmark results table |
 | 3 | **Export and handoff** | multi-grid VDB (density, temperature, flame, and velocity as vec3 resampled to cell centres); bake sequences; in-memory volume handoff to Blender; f16 on the wire; disk-backed cache if RAM is not enough | a VDB sequence opens in Blender by hand; Live preview with no disk round-trip |
 | 4 | **Blender UX** | emitters and colliders from Blender objects (the add-on voxelizes to an SDF); playback of the cache; Live preview done properly | manual verification in an interactive Blender session |
 
