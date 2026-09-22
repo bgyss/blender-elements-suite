@@ -13,10 +13,20 @@ pub fn evaluate_document(path: &Path) -> anyhow::Result<(Vec<f32>, [u32; 3])> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let doc = Document::from_json(&text)?;
+
+    let gpu = GpuContext::new_headless().context("acquiring a GPU device")?;
+
+    // Reject a document whose implied fields would not fit this device's
+    // `max_buffer_size` before any GPU texture is allocated. See
+    // `Document::validate_for`'s doc comment: this is what turns an
+    // oversized document into a clean error instead of a panic from
+    // `Field::read_back` or `Queue`'s staging-buffer allocation.
+    doc.validate_for(&gpu.device().limits())
+        .context("validating document dimensions against this device's limits")?;
+
     let registry = NodeRegistry::with_builtins();
     let (graph, dims) = doc.into_graph(&registry)?;
 
-    let gpu = GpuContext::new_headless().context("acquiring a GPU device")?;
     let mut pool = FieldPool::new();
     let mut pipelines = PipelineCache::new();
 
@@ -67,11 +77,17 @@ pub fn bake(
     let text =
         std::fs::read_to_string(graph).with_context(|| format!("reading {}", graph.display()))?;
     let doc = Document::from_json(&text)?;
+
+    let gpu = GpuContext::new_headless().context("acquiring a GPU device")?;
+
+    // See the matching check in `evaluate_document`.
+    doc.validate_for(&gpu.device().limits())
+        .context("validating document dimensions against this device's limits")?;
+
     let config = doc.timeline_config();
     let registry = NodeRegistry::with_builtins();
     let (graph, dims) = doc.into_graph(&registry)?;
 
-    let gpu = GpuContext::new_headless().context("acquiring a GPU device")?;
     let mut pool = FieldPool::new();
     let mut pipelines = PipelineCache::new();
     let mut timeline = Timeline::new(config);

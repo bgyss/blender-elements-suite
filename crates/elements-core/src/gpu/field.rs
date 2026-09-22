@@ -28,6 +28,50 @@ impl FieldDims {
     }
 }
 
+/// Check that a field of `dims` would fit inside `max_buffer_size`, both as a
+/// texture (`x * y * z * 4` bytes, `R32Float`) and as `Field::read_back`'s
+/// padded staging buffer (rows aligned to `COPY_BYTES_PER_ROW_ALIGNMENT`).
+///
+/// `dims` comes from an untrusted document, and a document with 3-million-cube
+/// dims is exactly the kind of input this exists to reject: `x * y * z * 4`
+/// for such a document overflows even `u64` (3,000,000^3 * 4 ~= 1.08e20 versus
+/// `u64::MAX` ~= 1.8e19). So every multiplication here is done in `u128`,
+/// which cannot overflow for any `u32` dims, and the final comparison against
+/// `max_buffer_size` (a `u64`) is done by widening the limit, never by
+/// narrowing the computed byte count.
+///
+/// Returns `Err` with a human-readable reason naming the offending size, or
+/// `Ok(())` if both fit.
+pub fn validate_dims_fit_buffer_limit(dims: FieldDims, max_buffer_size: u64) -> Result<(), String> {
+    let x = dims.x as u128;
+    let y = dims.y as u128;
+    let z = dims.z as u128;
+    let max_buffer_size = max_buffer_size as u128;
+
+    let texture_bytes = x * y * z * 4;
+    if texture_bytes > max_buffer_size {
+        return Err(format!(
+            "dims {:?}: an R32Float texture would need {texture_bytes} bytes, more than this \
+             device's max_buffer_size of {max_buffer_size}",
+            [dims.x, dims.y, dims.z]
+        ));
+    }
+
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u128;
+    let unpadded_row = x * 4;
+    let padded_row = unpadded_row.div_ceil(align) * align;
+    let readback_bytes = padded_row * y * z;
+    if readback_bytes > max_buffer_size {
+        return Err(format!(
+            "dims {:?}: the padded R32Float readback buffer would need {readback_bytes} bytes, \
+             more than this device's max_buffer_size of {max_buffer_size}",
+            [dims.x, dims.y, dims.z]
+        ));
+    }
+
+    Ok(())
+}
+
 /// The storage formats Core v1 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFormat {
@@ -111,14 +155,19 @@ impl Field {
         let padded_row = unpadded_row.div_ceil(align) * align;
         let buffer_size = padded_row as u64 * self.dims.y as u64 * self.dims.z as u64;
 
-        let staging = ctx.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("field-readback"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        // The staging buffer's `size` is untrusted-input-derived (it scales with
+        // the document's `dims`), so it must be created INSIDE the error scope.
+        // `create_buffer` validates `size` against `device.limits().max_buffer_size`
+        // and, outside a scope, an over-limit request goes to wgpu's
+        // uncaptured-error handler, which panics rather than returning an error.
+        let staging = ctx.scoped(|| {
+            let staging = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("field-readback"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
 
-        ctx.scoped(|| {
             let mut encoder =
                 ctx.device()
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -142,6 +191,7 @@ impl Field {
                 self.dims.extent(),
             );
             ctx.queue().submit(Some(encoder.finish()));
+            staging
         })?;
 
         let slice = staging.slice(..);

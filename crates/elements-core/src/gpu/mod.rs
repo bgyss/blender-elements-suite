@@ -8,7 +8,7 @@ mod staggered;
 pub use dispatch::{
     PipelineCache, WORKGROUP, accumulate_into, dispatch_over_field, fill_constant, fill_curl_noise,
 };
-pub use field::{Field, FieldDims, FieldFormat};
+pub use field::{Field, FieldDims, FieldFormat, validate_dims_fit_buffer_limit};
 pub use pool::FieldPool;
 pub use staggered::{Axis, StaggeredField};
 

@@ -378,6 +378,81 @@ fn dims_exceeding_the_devices_texture_limit_are_rejected_at_load_not_render() {
     ));
 }
 
+/// A 512^3 `R32Float` field is 512 MiB unpadded, well over the 256 MiB
+/// `max_buffer_size` every adapter reports (`using_resolution` raises
+/// `max_texture_dimension_3d` to the adapter's real cap, but never raises
+/// `max_buffer_size`). Before the byte-cap check in `Document::validate_for`,
+/// this dodged the `max_texture_dimension_3d` loop entirely (512 is far under
+/// 2048) and answered `Loaded`, only to crash `Field::read_back`'s staging
+/// buffer allocation on the first `Render`. It must instead fail right here,
+/// at `LoadGraph`, with a `Document` error naming the size — and load costs
+/// nothing (no texture is touched), so this is cheap. Do not render a 512^3
+/// graph in any test.
+#[test]
+fn a_512_cubed_document_is_rejected_at_load_with_the_size_named() {
+    let daemon = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("huge.elements");
+    std::fs::write(
+        &bad,
+        r#"{
+          "version": 1,
+          "dims": [512, 512, 512],
+          "nodes": [
+            { "id": 0, "kind": "core.noise_field", "params": { "seed": 7 } },
+            { "id": 1, "kind": "core.output", "params": {} }
+          ],
+          "edges": [{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }],
+          "output": 1
+        }"#,
+    )
+    .unwrap();
+
+    let mut stream = daemon.connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_message(
+        &mut stream,
+        &Command::Hello {
+            protocol_version: ELEMENTS_PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
+    let _: Response = read_message(&mut reader).unwrap().unwrap();
+
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: bad.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    match read_message::<_, Response>(&mut reader).unwrap().unwrap() {
+        Response::Error(e) => {
+            assert_eq!(e.kind, ErrorKind::Document);
+            assert!(
+                e.message.contains("512"),
+                "message should name the offending size: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // The session must still be usable: a valid graph loads normally.
+    let good = graph_file(dir.path());
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: good.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message::<_, Response>(&mut reader).unwrap().unwrap(),
+        Response::Loaded { .. }
+    ));
+}
+
 #[test]
 fn rendering_before_hello_is_refused() {
     let daemon = Daemon::start();

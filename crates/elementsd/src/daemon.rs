@@ -109,6 +109,17 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
         .map_err(|e| EngineError::new(ErrorKind::Io, format!("{}: {e}", path.display())))?;
     let doc = Document::from_json(&text)
         .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
+
+    // Reject a document whose implied fields would not fit this device's
+    // `max_buffer_size`, before the frame channel or any GPU texture is
+    // allocated. This is a distinct check from the `max_texture_dimension_3d`
+    // loop below: `max_buffer_size` (256 MiB) is reachable well inside the
+    // adapter's texture-dimension limit (2048 on Apple Silicon), since a
+    // padded R32Float readback of a domain far under 2048^3 is already
+    // gigabytes. See `Document::validate_for`'s doc comment.
+    doc.validate_for(&session.gpu.device().limits())
+        .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
+
     let config = doc.timeline_config();
     let (graph, dims) = doc
         .into_graph(&session.registry)

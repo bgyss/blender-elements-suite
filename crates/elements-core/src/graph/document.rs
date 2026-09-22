@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::gpu::FieldDims;
+use crate::gpu::{FieldDims, validate_dims_fit_buffer_limit};
 
 use super::Graph;
 use super::node::NodeError;
@@ -101,6 +101,34 @@ impl Document {
 
     pub fn to_json(&self) -> Result<String, DocError> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// Reject a document whose implied fields would not fit this device's
+    /// buffer limit.
+    ///
+    /// `max_texture_dimension_3d` alone is not enough: `Field::read_back`
+    /// (`elements_core::gpu::field`) allocates a staging BUFFER, and
+    /// `max_buffer_size` (256 MiB on every adapter Core v1 has seen; it is not
+    /// raised by `using_resolution`, unlike the texture-dimension limit) is
+    /// reachable well inside the texture-dimension limit — a 2047^3 domain is
+    /// far under a 2048-wide texture cap but its padded R32Float readback is
+    /// gigabytes. Call this before any texture or the frame channel is
+    /// allocated, so an oversized document is a typed, load-time
+    /// `DocError::BadParams` rather than a `GpuError::Validation` from
+    /// `Field::read_back` (which a caller may treat as transient) or an
+    /// out-of-memory abort that `GpuContext::scoped` cannot catch at all
+    /// (`scoped` only captures validation errors, not device-timeline OOM).
+    ///
+    /// Everything here is computed in `u64` so a document with absurd `dims`
+    /// can never overflow the check meant to catch it.
+    pub fn validate_for(&self, limits: &wgpu::Limits) -> Result<(), DocError> {
+        let dims = FieldDims::new(self.dims[0], self.dims[1], self.dims[2]);
+        validate_dims_fit_buffer_limit(dims, limits.max_buffer_size).map_err(|reason| {
+            DocError::BadParams {
+                kind: "document".to_string(),
+                reason,
+            }
+        })
     }
 
     /// How a timeline for this document should run.
