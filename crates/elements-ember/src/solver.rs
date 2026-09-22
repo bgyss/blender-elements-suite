@@ -342,6 +342,16 @@ impl SmokeSolver {
         let missing = SLOTS
             .into_iter()
             .find(|slot| !taken.iter().any(|(name, _)| name == slot));
+        // When every slot is present, name the first one whose value holds
+        // the wrong `Value` variant, rather than always blaming `velocity`.
+        let wrong_shape = taken.iter().find_map(|(slot, value)| {
+            let matches_shape = if *slot == VELOCITY {
+                matches!(value, Value::VectorField(_))
+            } else {
+                matches!(value, Value::Field(_))
+            };
+            if matches_shape { None } else { Some(*slot) }
+        });
         let mut values = taken.into_iter().map(|(_, value)| value);
         match (values.next(), values.next(), values.next(), values.next()) {
             (
@@ -361,7 +371,7 @@ impl SmokeSolver {
                 }
                 Err(NodeError::StateShape {
                     node,
-                    slot: missing.unwrap_or(VELOCITY),
+                    slot: missing.or(wrong_shape).unwrap_or(VELOCITY),
                 })
             }
         }

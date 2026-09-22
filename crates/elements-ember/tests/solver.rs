@@ -255,3 +255,53 @@ fn a_failed_step_returns_every_field_to_the_pool() {
         "every allocated texture must be back in the pool"
     );
 }
+
+/// A substep that fails after `pre_projection` has already retired fields
+/// (the three old velocity faces) and `project` has acquired `div` must
+/// still return every one of them to the pool. Unlike
+/// `a_failed_step_returns_every_field_to_the_pool`, which fails at the very
+/// first `emit` before `Substep::retired` holds anything, this exercises the
+/// release loop in `Substep::abandon` itself.
+#[test]
+fn a_substep_failing_after_retiring_fields_returns_them_all() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(8, 6, 5);
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+
+    // Replace `pressure` with a field one cell larger along x. `project`
+    // acquires `div` at the domain's dims and only then discovers `phi`
+    // (state.pressure) is the wrong size, in `kernels::pressure`'s dims check.
+    let wrong_dims = FieldDims::new(cells.x + 1, cells.y, cells.z);
+    let wrong_pressure = pool.acquire_zeroed(&gpu, &mut cache, wrong_dims).unwrap();
+    let old_pressure = std::mem::replace(&mut state.pressure, wrong_pressure);
+    pool.release(old_pressure);
+
+    let zero = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
+    let constants = StepConstants {
+        cells,
+        h: 1.0 / 24.0,
+        dx: 0.25,
+        alpha: 0.5,
+        beta: 2.0,
+    };
+    let sources = Sources {
+        density: &zero,
+        temperature: &zero,
+    };
+
+    let err = substep(
+        &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
+    )
+    .unwrap_err();
+    assert!(matches!(err, GpuError::Validation(_)), "got {err:?}");
+
+    state.release_to(&mut pool);
+    pool.release(zero);
+    assert_eq!(
+        pool.pooled_count() as u64,
+        pool.allocation_count(),
+        "every allocated texture must be back in the pool"
+    );
+}
