@@ -1,4 +1,6 @@
-use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext};
+use elements_core::gpu::{
+    FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache, fill_constant,
+};
 
 #[test]
 fn dims_report_voxel_count() {
@@ -63,4 +65,30 @@ fn fresh_field_reads_back_as_zeros() {
 
     assert_eq!(values.len(), dims.voxel_count());
     assert!(values.iter().all(|v| *v == 0.0), "a new texture is zeroed");
+}
+
+/// `acquire_zeroed` must clear a recycled texture, not just a fresh one.
+/// Fresh allocations are already zero, so this test dirties a texture, returns
+/// it to the pool, and asserts that the zeroed acquire got the SAME texture back.
+/// Otherwise it would prove nothing.
+#[test]
+fn acquire_zeroed_clears_a_dirty_recycled_field() {
+    let ctx = GpuContext::new_headless().expect("no GPU adapter available");
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let dims = FieldDims::new(4, 4, 4);
+
+    let dirty = pool.acquire(&ctx, dims, FieldFormat::R32Float).unwrap();
+    fill_constant(&ctx, &mut cache, &dirty, 5.0).unwrap();
+    let generation = dirty.pool_generation();
+    pool.release(dirty);
+
+    let field = pool.acquire_zeroed(&ctx, &mut cache, dims).unwrap();
+    assert_eq!(
+        field.pool_generation(),
+        generation,
+        "must reuse the dirty texture, or this test proves nothing"
+    );
+    let values = field.read_back(&ctx).unwrap();
+    assert!(values.iter().all(|&v| v == 0.0), "got {values:?}");
 }

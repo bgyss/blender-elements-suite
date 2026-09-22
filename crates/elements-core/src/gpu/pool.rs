@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{Field, FieldDims, FieldFormat, GpuContext, GpuError};
+use super::{Field, FieldDims, FieldFormat, GpuContext, GpuError, PipelineCache, fill_constant};
 
 /// Pools fields keyed by `(dims, format)`.
 #[derive(Default)]
@@ -61,6 +61,23 @@ impl FieldPool {
                 generation,
             }
         })
+    }
+
+    /// Take an `R32Float` field of these dims and fill it with zeros.
+    ///
+    /// Use this whenever a caller may write only part of a field, such as an
+    /// emitter, or a state slot on its first step. The zeroing is a compute pass
+    /// (`constant.wgsl` at 0), because `CommandEncoder::clear_texture` needs
+    /// the optional `Features::CLEAR_TEXTURE`, and the engine enables no optional features.
+    pub fn acquire_zeroed(
+        &mut self,
+        ctx: &GpuContext,
+        cache: &mut PipelineCache,
+        dims: FieldDims,
+    ) -> Result<Field, GpuError> {
+        let field = self.acquire(ctx, dims, FieldFormat::R32Float)?;
+        fill_constant(ctx, cache, &field, 0.0)?;
+        Ok(field)
     }
 
     /// Return a field for reuse.

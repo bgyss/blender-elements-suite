@@ -31,7 +31,7 @@ impl Node for NoiseField {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let field = ctx.acquire(FieldFormat::R32Float)?;
+        let field = ctx.acquire_uninit(FieldFormat::R32Float)?;
         let (seed, frequency) = (self.seed, self.frequency);
         ctx.with_gpu(|gpu, cache| fill_curl_noise(gpu, cache, &field, seed, frequency))?;
         Ok(vec![Value::Field(field)])

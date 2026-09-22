@@ -25,7 +25,7 @@ impl Node for ConstantField {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let field = ctx.acquire(FieldFormat::R32Float)?;
+        let field = ctx.acquire_uninit(FieldFormat::R32Float)?;
         let value = self.value;
         ctx.with_gpu(|gpu, cache| fill_constant(gpu, cache, &field, value))?;
         Ok(vec![Value::Field(field)])

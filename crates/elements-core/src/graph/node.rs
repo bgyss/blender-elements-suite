@@ -179,10 +179,19 @@ impl EvalCtx<'_> {
         Ok(value)
     }
 
-    /// Acquire a pooled field at the current evaluation dims.
-    pub fn acquire(&mut self, format: FieldFormat) -> Result<Field, NodeError> {
+    /// Acquire a pooled field at the current evaluation dims WITHOUT clearing it.
+    ///
+    /// The contents are whatever the texture's last user left. Use this only
+    /// when the node writes every voxel before anything reads the field.
+    pub fn acquire_uninit(&mut self, format: FieldFormat) -> Result<Field, NodeError> {
         let dims = self.dims;
         Ok(self.pool.acquire(self.gpu, dims, format)?)
+    }
+
+    /// Acquire a pooled `R32Float` field at the current evaluation dims, filled with zeros.
+    pub fn acquire_zeroed(&mut self) -> Result<Field, NodeError> {
+        let dims = self.dims;
+        Ok(self.pool.acquire_zeroed(self.gpu, self.pipelines, dims)?)
     }
 
     /// Run GPU work with the device and pipeline cache borrowed together.
