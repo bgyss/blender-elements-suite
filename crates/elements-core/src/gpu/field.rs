@@ -186,6 +186,38 @@ impl Field {
         Ok(out)
     }
 
+    /// Upload `values` (x-fastest, one `f32` per voxel) into an `R32Float` field.
+    ///
+    /// `Queue::write_texture` has no row-alignment requirement, unlike
+    /// buffer-to-texture copies, so no padding is needed.
+    pub fn write(&self, ctx: &GpuContext, values: &[f32]) -> Result<(), GpuError> {
+        if self.format != FieldFormat::R32Float || values.len() != self.dims.voxel_count() {
+            return Err(GpuError::Validation(format!(
+                "write: {} values into a {:?} {:?} field",
+                values.len(),
+                self.dims,
+                self.format
+            )));
+        }
+        ctx.scoped(|| {
+            ctx.queue().write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(values),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.dims.x * 4),
+                    rows_per_image: Some(self.dims.y),
+                },
+                self.dims.extent(),
+            );
+        })
+    }
+
     /// Copy this field's contents into `dst` on the GPU.
     ///
     /// Both fields must have identical dims and format.
