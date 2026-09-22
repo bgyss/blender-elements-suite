@@ -6,6 +6,7 @@ mod registry;
 mod socket;
 mod state;
 mod time;
+mod timeline;
 
 pub use document::{DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION};
 pub use node::{EvalCtx, EvalStats, Node, NodeError, Value};
@@ -13,6 +14,7 @@ pub use registry::{NodeCtor, NodeRegistry};
 pub use socket::{NodeId, SocketId, SocketSpec, SocketType};
 pub use state::{Snapshot, StateStore};
 pub use time::{DEFAULT_FPS, DEFAULT_START_FRAME, Time};
+pub use timeline::{DEFAULT_CACHE_BUDGET_MB, Timeline, TimelineConfig};
 
 use std::collections::{HashMap, HashSet};
 
