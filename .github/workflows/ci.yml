@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1 libblosc-dev
-          vulkaninfo --summary | head -40
+          vulkaninfo --summary | grep -iE 'deviceName|driverName|apiVersion'
 
       - name: Lint
         run: just lint
