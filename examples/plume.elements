@@ -1,0 +1,20 @@
+{
+  "version": 3,
+  "dims": [128, 128, 128],
+  "fps": 24.0,
+  "start_frame": 1,
+  "domain_size": 2.0,
+  "nodes": [
+    { "id": 0, "kind": "ember.sphere_emitter",
+      "params": { "center": [1.0, 1.0, 0.3], "radius": 0.2, "density_rate": 1.0, "temperature_rate": 1.0 } },
+    { "id": 1, "kind": "ember.smoke_solver",
+      "params": { "substeps": 1, "pressure_iterations": 160, "buoyancy_density": 0.0, "buoyancy_temperature": 1.0 } },
+    { "id": 2, "kind": "core.output", "params": {} }
+  ],
+  "edges": [
+    { "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 },
+    { "from_node": 0, "from_index": 1, "to_node": 1, "to_index": 1 },
+    { "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 0 }
+  ],
+  "output": 2
+}

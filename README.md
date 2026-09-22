@@ -2,6 +2,55 @@
 
 An open-source, Rust-based suite of real-time VFX authoring tools for Blender. The core engine (`crates/`) is dual-licensed Apache-2.0 OR MIT; the Blender add-on (`addon/`) is GPL-3.0-or-later.
 
+![A buoyant smoke plume rising from a sphere at frames 24, 48, 72 and 96, simulated at 256³ and rendered in Cycles](docs/media/plume-frames.jpg)
+
+## Status
+
+Early. The engine and the first milestone of its smoke solver work; most of what makes smoke look like smoke is still to come.
+
+**What exists today**
+
+- **The engine** runs as its own process next to Blender, so a solver crash shows a disconnect banner instead of costing you your `.blend`. It is Rust on [wgpu](https://wgpu.rs) and uses no optional GPU features, so the same code runs on Metal and Vulkan. CI runs the full test suite on software Vulkan (llvmpipe) on every push.
+- **A node graph and a headless CLI** that bake a scene to an OpenVDB sequence without Blender.
+- **A GPU smoke solver** (`crates/elements-ember`) on a dense grid:
+  - staggered (MAC) velocity;
+  - semi-Lagrangian advection with trilinear sampling done by hand;
+  - Boussinesq buoyancy;
+  - red-black Gauss–Seidel pressure projection, warm-started from the previous frame, with solid walls and an open top;
+  - a sphere emitter.
+
+  A frame is bit-identical however you reach it: playing forward, scrubbing back, or restoring from the cache.
+
+**How fast it is.** A 128³ grid on an Apple M1 Max (Metal), with the pass/fail rule fixed before anything was measured:
+
+| Pressure iterations | ms per step | Divergence left after projection |
+|---|---|---|
+| 80 | 19.9 | 11.8% |
+| **160 (default)** | **34.1** | **4.3%** |
+| 480 | 94.4 | 0.76% |
+
+The full tables and conditions are in [`docs/bench/speed-gate.md`](docs/bench/speed-gate.md) and [`docs/bench/iteration-sweep.md`](docs/bench/iteration-sweep.md). The images above are a 256³ run: 120 frames simulated in 93 seconds, including writing every frame to OpenVDB, then rendered offline in Cycles.
+
+**Not yet**
+
+- Fire, vorticity confinement, dissipation, colliders and animated emitters. The plume above is smooth and laminar because of this.
+- Substeps chosen from the flow speed (CFL), and quality presets.
+- A live preview in the Blender viewport. Today you bake to VDB and load the sequence.
+- A benchmark against Blender's built-in Mantaflow solver. That is next, and it will report where Mantaflow wins.
+
+The design documents are in [`docs/superpowers/specs/`](docs/superpowers/specs/), and the risks the next milestone starts from are in §6 of [the solver spec](docs/superpowers/specs/2026-09-21-ember-solver-design.md).
+
+## Try the smoke solver
+
+After the [development setup](#development-setup) below, bake the example plume:
+
+```bash
+cargo run --release -p elements-cli -- bake examples/plume.elements \
+    --out plume-vdb --frames 1-120 --voxel-size 0.015625
+```
+
+This simulates a 128³ plume in a 2 m domain and writes `plume-vdb/density.0001.vdb` onwards, about 8.5 MB per frame. The voxel size, 2 m / 128, makes the VDB the same size in Blender as the simulated domain. In Blender, use **File → Import → OpenVDB (.vdb)**, select the first file, and keep **Detect Sequences** enabled to import the whole range.
+
 ## Development setup
 
 ### Prerequisites
