@@ -7,6 +7,7 @@
 
 pub mod emitter;
 pub mod kernels;
+pub mod metrics;
 mod params;
 pub mod solver;
 
