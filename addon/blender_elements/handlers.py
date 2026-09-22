@@ -12,6 +12,7 @@ import tempfile
 
 import bpy
 
+from .bakecmd import bake_command
 from .client import ElementsError
 
 VOLUME_NAME = "ElementsVolume"
@@ -26,8 +27,11 @@ def _ensure_volume(context) -> bpy.types.Object:
     return obj
 
 
-def push_frame_to_volume(context, values, dims) -> bpy.types.Object:
+def push_frame_to_volume(context, values, dims, frame: int) -> bpy.types.Object:
     """Point the Volume object at a freshly baked .vdb of the current graph.
+
+    `frame` is the scene frame the volume must show. The CLI bake re-simulates
+    up to it.
 
     KNOWN GAP — the shared-memory frame is NOT the source of the geometry.
 
@@ -61,7 +65,7 @@ def push_frame_to_volume(context, values, dims) -> bpy.types.Object:
         raise ElementsError("io", f"frame has {len(values)} values, expected {expected}")
 
     path = os.path.join(tempfile.gettempdir(), f"elements-frame-{os.getpid()}.vdb")
-    _bake_current_graph_to(path)
+    _bake_current_graph_to(path, frame)
 
     obj.data.filepath = path
     # Volume has no `.reload()` (unlike Image); force the grid cache to
@@ -71,7 +75,7 @@ def push_frame_to_volume(context, values, dims) -> bpy.types.Object:
     return obj
 
 
-def _bake_current_graph_to(path) -> None:
+def _bake_current_graph_to(path, frame: int) -> None:
     """Ask the engine CLI to bake the loaded graph to `path`.
 
     The CLI lives beside the daemon, since both are built into the same
@@ -88,23 +92,16 @@ def _bake_current_graph_to(path) -> None:
     # collide before either side gets to its pid-qualified os.replace target.
     out_dir = os.path.join(tempfile.gettempdir(), f"elements-bake-{os.getpid()}")
     os.makedirs(out_dir, exist_ok=True)
-    # 60s: a Core v1 bake is one frame of a small graph -- generous enough to
-    # absorb a slow disk, but short enough that a hung/pathological graph
-    # does not block Blender's UI thread indefinitely (execute() runs on it,
-    # and there is no way to cancel from the panel while it is blocked).
+    args, baked = bake_command(cli, bpy.path.abspath(settings.graph_path), out_dir, frame)
+    # 60s: a bake of a stateful graph now re-simulates from the start frame, so
+    # the timeout bounds the whole run up to `frame`, not one evaluation --
+    # generous enough to absorb a slow disk, but short enough that a
+    # hung/pathological graph does not block Blender's UI thread indefinitely
+    # (execute() runs on it, and there is no way to cancel from the panel
+    # while it is blocked).
     try:
         result = subprocess.run(
-            [
-                cli,
-                "bake",
-                bpy.path.abspath(settings.graph_path),
-                "--out",
-                out_dir,
-                "--frames",
-                "1",
-                "--name",
-                "density",
-            ],
+            args,
             capture_output=True,
             text=True,
             timeout=60,
@@ -116,7 +113,7 @@ def _bake_current_graph_to(path) -> None:
     if result.returncode != 0:
         raise ElementsError("io", f"bake failed: {result.stderr.strip()}")
 
-    os.replace(os.path.join(out_dir, "density.0001.vdb"), path)
+    os.replace(baked, path)
 
 
 _draw_handle = None
@@ -172,7 +169,7 @@ def _on_draw() -> None:
             seq, values = reader.read_latest()
 
         if seq != _last_seq:
-            push_frame_to_volume(bpy.context, values, frame["dims"])
+            push_frame_to_volume(bpy.context, values, frame["dims"], scene.frame_current)
             _last_seq = seq
             settings.status = f"Live — frame {seq}"
     except Exception as e:  # noqa: BLE001 - see the docstring

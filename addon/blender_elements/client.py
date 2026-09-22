@@ -134,7 +134,11 @@ class ControlClient:
         return self._round_trip({"type": "load_graph", "path": os.fspath(path)})
 
     def render(self, frame: int) -> dict:
-        return self._round_trip({"type": "render", "frame": int(frame)})
+        # `Command::Render { frame: u32 }`: Blender allows negative frames, and a
+        # negative number would be rejected as a malformed command. The engine
+        # clamps anything below the document's start frame to the start frame,
+        # so 0 behaves the same.
+        return self._round_trip({"type": "render", "frame": max(0, int(frame))})
 
     def shutdown(self) -> dict:
         return self._round_trip({"type": "shutdown"})

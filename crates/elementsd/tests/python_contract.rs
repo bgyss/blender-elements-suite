@@ -62,6 +62,7 @@ fn the_python_client_speaks_the_real_protocol() {
         .arg(&endpoint)
         .arg(channel.to_str().unwrap())
         .arg(graph.to_str().unwrap())
+        .arg(repo_root().join("tests/graphs/accumulate_4.elements"))
         .output()
         .expect("python3 must be on PATH");
 

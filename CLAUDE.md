@@ -10,12 +10,16 @@ procedural assets) and using ML where it is proven rather than as a replacement
 for solvers. JangaFX product names are trademarks and appear in the docs only to
 identify prior art — never name a component after one.
 
-The suite is being built product by product. Only **Core v1** exists so far: a
-thin vertical slice proving every architectural seam before any solver is
-written.
+The suite is being built product by product. **Core v1** is merged. **Ember**
+(grid gas) is in progress in four pieces; piece 1, core sim foundations, adds
+persistent state, a timeline with a frame cache, staggered vector fields, and
+multi-consumer graph outputs.
 
-- Design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
-- Implementation plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
+- Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
+- Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
+- Ember umbrella spec: `docs/superpowers/specs/2026-09-21-ember-design.md`
+- Ember piece 1 spec: `docs/superpowers/specs/2026-09-21-ember-core-sim-foundations-design.md`
+- Ember piece 1 plan: `docs/superpowers/plans/2026-09-21-ember-core-sim-foundations.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
 **Read the progress ledger before starting work.** It records which of the 18
@@ -115,6 +119,12 @@ parser, with `vdb-rs` used as the read-back oracle in tests.
 - **Crate manifests use `dep.workspace = true`.** Versions live only in the
   workspace `Cargo.toml`.
 - **Every stochastic node takes an explicit `seed: u64`.** No implicit entropy.
+- **`GpuContext` requests the adapter's resolution limits** on top of
+  `downlevel_defaults`, which otherwise caps 3D textures at 256. Everything else
+  in `downlevel_defaults` still applies. Notably, **4 storage textures per shader
+  stage**: read fields through `texture_3d<f32>` + `textureLoad`, and write through storage.
+- **A snapshot for frame N is the state entering N.** Producing N is always
+  "restore or reach the entering state, then one `eval`". Never cache outputs.
 - Blender extension ZIPs put `__init__.py` and `blender_manifest.toml` at the
   **archive root**, with nothing nested under a package directory, and the addon
   package uses relative imports only.

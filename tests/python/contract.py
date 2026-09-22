@@ -5,6 +5,7 @@ passes the endpoint, channel path and graph path as arguments.
 """
 
 import json
+import os
 import pathlib
 import struct
 import sys
@@ -12,6 +13,7 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "addon"))
 
+from blender_elements.bakecmd import bake_command  # noqa: E402
 from blender_elements.client import (  # noqa: E402
     CHANNEL_HEADER_BYTES,
     CHANNEL_MAGIC,
@@ -49,6 +51,18 @@ def check_truncated_channel_file_rejected() -> None:
             raise AssertionError("expected ElementsError for a truncated channel file")
 
 
+def check_bake_command() -> None:
+    """The viewport bake must ask for the scene's frame, and read back the file
+    the CLI actually names. Blender allows negative frames; the engine does not."""
+    args, path = bake_command("elements", "g.elements", "out", 7)
+    assert args[args.index("--frames") + 1] == "7", args
+    assert path == os.path.join("out", "density.0007.vdb"), path
+
+    args, path = bake_command("elements", "g.elements", "out", -3)
+    assert args[args.index("--frames") + 1] == "0", args
+    assert path == os.path.join("out", "density.0000.vdb"), path
+
+
 def check_python_version() -> None:
     """The Core v1 DoD commits to py311; assert it and print it so a run's
     log is self-evidencing about which interpreter actually exercised this
@@ -60,9 +74,10 @@ def check_python_version() -> None:
     print(f"python version: {sys.version_info[0]}.{sys.version_info[1]}")
 
 
-def main(endpoint: str, channel: str, graph: str) -> None:
+def main(endpoint: str, channel: str, graph: str, stateful_graph: str) -> None:
     check_python_version()
     check_truncated_channel_file_rejected()
+    check_bake_command()
 
     with ControlClient(endpoint) as client:
         ack = client.hello()
@@ -152,8 +167,22 @@ def main(endpoint: str, channel: str, graph: str) -> None:
         # The session must still work.
         assert client.load_graph(graph)["nodes"] == 2
 
+        # A stateful graph: the frame number must reach the timeline, and a
+        # negative Blender frame must clamp rather than fail.
+        loaded_stateful = client.load_graph(stateful_graph)
+        assert loaded_stateful["dims"] == [4, 4, 4], loaded_stateful
+        stateful_reader = FrameReader(channel)
+        try:
+            for frame in (3, 1, -5):
+                client.render(frame)
+                _, values = stateful_reader.read_latest()
+                want = 0.5 * max(frame, 1) / 24.0
+                assert all(abs(v - want) < 1e-6 for v in values), (frame, values[:4])
+        finally:
+            stateful_reader.close()
+
     print("python contract ok")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])

@@ -191,7 +191,7 @@ class ELEMENTS_OT_render_frame(bpy.types.Operator):
                 _state["reader"] = reader
                 seq, values = reader.read_latest()
 
-            push_frame_to_volume(context, values, frame["dims"])
+            push_frame_to_volume(context, values, frame["dims"], context.scene.frame_current)
             settings.status = f"Frame {seq} — {frame['dims']}"
         except ElementsError as e:
             settings.status = f"{e.kind}: {e.message}"
