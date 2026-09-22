@@ -6,6 +6,7 @@
 //! smoke; this crate is the seam `NodeRegistry` exists for.
 
 pub mod emitter;
+pub mod kernels;
 mod params;
 
 use elements_core::graph::NodeRegistry;
