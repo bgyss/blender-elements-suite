@@ -1,10 +1,12 @@
 //! GPU device acquisition and error-scope handling.
 
+mod batch;
 mod dispatch;
 mod field;
 mod pool;
 mod staggered;
 
+pub use batch::ComputeBatch;
 pub use dispatch::{
     PipelineCache, WORKGROUP, accumulate_into, dispatch_over_field, fill_constant, fill_curl_noise,
 };
