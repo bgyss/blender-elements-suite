@@ -152,11 +152,23 @@ fn shell(program: &str, args: &[&str]) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Like `shell`, but distinguishes "the command failed" from "it printed
+/// nothing", so callers can tell a real empty result from a failure.
+fn shell_checked(program: &str, args: &[&str]) -> Option<String> {
+    Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
 fn main() -> Res<()> {
     let gpu = GpuContext::new_headless()?;
     let registry = elements_ember::registry();
     let mut table = String::new();
     let mut rows = Vec::new();
+    let scene_substeps = Scene::plume(RESOLUTION).solver.substeps;
 
     for n in ITERATIONS {
         let scene = Scene::plume(RESOLUTION).with_iterations(n);
@@ -175,43 +187,53 @@ fn main() -> Res<()> {
         let ratio = after.rms / before.rms;
         let min = timing.all.iter().copied().fold(f64::INFINITY, f64::min);
         let max = timing.all.iter().copied().fold(0.0, f64::max);
+        let gate_row = GateRow {
+            iterations: n,
+            step_ms_median: step,
+            ratio,
+        };
         table.push_str(&format!(
-            "| {n} | {step:.1} ({min:.1}–{max:.1}) | {:.2} | {:.3e} | {:.3e} | {ratio:.3} | {:.3e} |\n",
+            "| {n} | {step:.2} ({min:.2}–{max:.2}) | {:.2} | {:.3e} | {:.3e} | {ratio:.4} | {:.3e} | {} |\n",
             median(&timing.snapshots),
             before.rms,
             after.rms,
             after.max_abs,
+            if gate_row.passes() { "yes" } else { "no" },
         ));
-        rows.push(GateRow {
-            iterations: n,
-            step_ms_median: step,
-            ratio,
-        });
+        rows.push(gate_row);
     }
 
     let verdict = match gate_verdict(&rows) {
         Some(n) => format!("**PASS**, provisional `pressure_iterations` = {n}"),
         None => "**FAIL**: no N meets both limits".to_owned(),
     };
-    let mut commit = shell("git", &["rev-parse", "--short", "HEAD"]);
-    if !shell("git", &["status", "--porcelain"]).is_empty() {
-        commit.push_str("-dirty");
-    }
+    let commit = match shell_checked("git", &["rev-parse", "--short", "HEAD"]) {
+        Some(hash) => match shell_checked("git", &["status", "--porcelain"]) {
+            Some(status) if !status.is_empty() => format!("{hash}-dirty"),
+            Some(_) => hash,
+            // `git status` failed to run: don't claim a clean tree we didn't verify.
+            None => format!("{hash} (dirty status unknown)"),
+        },
+        None => "unknown".to_owned(),
+    };
+    let substeps = scene_substeps;
     let report = format!(
         "# Ember speed gate (piece 2a)\n\n\
          - Machine: {cpu} ({adapter})\n\
          - OS: macOS {os}\n\
          - Ember commit: {commit}\n\
          - Date: {date}\n\
-         - Scene: `plume`, {RESOLUTION}³, substeps 1. Frames {first}–{last} timed after {WARMUP} \
-         warm-up frames, as `eval` plus a blocking poll; median of {RUNS} runs' medians. \
-         Divergence from the frame-{last} state.\n\n\
-         | N | step ms (median, min–max) | snapshot ms | RMS div before | RMS div after | ratio | max div after |\n\
-         |---|---|---|---|---|---|---|\n\
+         - Scene: `plume`, {RESOLUTION}³, substeps {substeps}. Frames {first}–{last} timed after \
+         {WARMUP} warm-up frames, as `eval` plus a blocking poll; median of {RUNS} runs' medians. \
+         The step ms min–max range is pooled over all timed frames of all {RUNS} runs, not a \
+         single run. Divergence from the frame-{last} state.\n\n\
+         | N | step ms (median, min–max) | snapshot ms | RMS div before | RMS div after | ratio | max div after | pass |\n\
+         |---|---|---|---|---|---|---|---|\n\
          {table}\n\
          Pre-registered rule (spec §4.3): PASS if some N has a median step of at most \
          {GATE_STEP_MS} ms and a ratio of at most {GATE_RATIO}; the provisional default is the \
-         largest passing N.\n\n\
+         largest passing N. The `pass` column applies this same per-row rule \
+         (`GateRow::passes`).\n\n\
          Rule applied: {verdict}.\n\n\
          Note: the ratio measures residual divergence, which weights high frequencies. The smooth \
          pressure error Gauss–Seidel leaves behind shows in plume shape, not in this number.\n\n\

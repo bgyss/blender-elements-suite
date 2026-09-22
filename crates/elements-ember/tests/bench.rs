@@ -30,6 +30,12 @@ fn the_gate_limits_are_inclusive() {
 }
 
 #[test]
+fn a_row_that_misses_the_ratio_limit_does_not_pass() {
+    // step is within GATE_STEP_MS, but ratio 0.1004 > GATE_RATIO (0.10).
+    assert!(!row(40, 50.0, 0.1004).passes());
+}
+
+#[test]
 fn the_gate_fails_when_no_n_meets_both_limits() {
     // Fast enough but too divergent, or accurate enough but too slow.
     assert_eq!(

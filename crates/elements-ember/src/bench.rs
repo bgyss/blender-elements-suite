@@ -104,11 +104,19 @@ pub struct GateRow {
     pub ratio: f64,
 }
 
+impl GateRow {
+    /// Spec §4.3's per-row pass rule: the step and ratio both within limits.
+    /// `gate_verdict` uses this too, so the rule exists in exactly one place.
+    pub fn passes(&self) -> bool {
+        self.step_ms_median <= GATE_STEP_MS && self.ratio <= GATE_RATIO
+    }
+}
+
 /// Spec §4.3: PASS with the largest N whose step takes at most
 /// `GATE_STEP_MS` and whose ratio is at most `GATE_RATIO`; `None` is FAIL.
 pub fn gate_verdict(rows: &[GateRow]) -> Option<u32> {
     rows.iter()
-        .filter(|r| r.step_ms_median <= GATE_STEP_MS && r.ratio <= GATE_RATIO)
+        .filter(|r| r.passes())
         .map(|r| r.iterations)
         .max()
 }
