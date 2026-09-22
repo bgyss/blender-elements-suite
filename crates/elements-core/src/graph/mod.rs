@@ -20,18 +20,34 @@ use std::collections::{HashMap, HashSet};
 
 use crate::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
 
+/// Metres spanned by the grid's longest axis when a document does not say.
+/// Matches Blender's default cube.
+pub const DEFAULT_DOMAIN_SIZE: f64 = 2.0;
+
 /// A directed acyclic graph of nodes with one designated output.
 ///
 /// Each input socket accepts exactly one edge (`connect` enforces this). An
 /// output socket may feed any number of inputs: the evaluator lends the value
 /// to each consumer, moves it to the last, and copies it for any earlier
 /// consumer that takes ownership. See `EvalCtx::take_input`.
-#[derive(Default)]
 pub struct Graph {
     nodes: Vec<Box<dyn Node>>,
     /// Maps a destination input socket to the source output socket feeding it.
     edges: HashMap<SocketId, SocketId>,
     output: Option<NodeId>,
+    /// Metres along the domain's longest axis. See `EvalCtx::voxel_size`.
+    domain_size: f64,
+}
+
+impl Default for Graph {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: HashMap::new(),
+            output: None,
+            domain_size: DEFAULT_DOMAIN_SIZE,
+        }
+    }
 }
 
 // `Node` trait objects don't implement `Debug`, so this can't be derived.
@@ -64,6 +80,7 @@ struct Run<'a> {
     state: &'a mut StateStore,
     time: Time,
     dims: FieldDims,
+    domain_size: f64,
     produced: HashMap<SocketId, Value>,
     remaining: HashMap<SocketId, u32>,
     stats: EvalStats,
@@ -164,6 +181,15 @@ impl Graph {
 
     pub fn output(&self) -> Option<NodeId> {
         self.output
+    }
+
+    /// Set how many metres the domain's longest axis spans.
+    pub fn set_domain_size(&mut self, metres: f64) {
+        self.domain_size = metres;
+    }
+
+    pub fn domain_size(&self) -> f64 {
+        self.domain_size
     }
 
     /// All nodes in dependency order. Errors if the graph contains a cycle.
@@ -290,6 +316,7 @@ impl Graph {
             state,
             time,
             dims,
+            domain_size: self.domain_size,
             produced: HashMap::new(),
             remaining: HashMap::new(),
             stats: EvalStats::default(),
@@ -330,6 +357,7 @@ impl Graph {
                 pool: &mut *run.pool,
                 pipelines: &mut *run.pipelines,
                 dims: run.dims,
+                domain_size: run.domain_size,
                 node: id,
                 sources: sources.clone(),
                 taken: vec![false; sources.len()],

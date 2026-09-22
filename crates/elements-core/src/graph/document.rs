@@ -13,9 +13,10 @@ use super::timeline::{DEFAULT_CACHE_BUDGET_MB, TimelineConfig};
 
 /// The `.elements` schema version this build writes.
 ///
-/// It also reads version 1, which predates time: see `Document::from_json`.
+/// It also reads versions 1 and 2, which predate time and physical units: see
+/// `Document::from_json`.
 /// Bumping this requires a migration test in `tests/document.rs`.
-pub const ELEMENTS_DOC_VERSION: u32 = 2;
+pub const ELEMENTS_DOC_VERSION: u32 = 3;
 
 fn default_fps() -> f64 {
     DEFAULT_FPS
@@ -27,6 +28,18 @@ fn default_start_frame() -> u32 {
 
 fn default_cache_budget_mb() -> u32 {
     DEFAULT_CACHE_BUDGET_MB
+}
+
+/// The range of `domain_size`, in metres, that a document may ask for.
+///
+/// Positive and finite as an f64 is not enough: nodes see the voxel size as an
+/// f32, and a size like 1e-300 or 1e300 makes it 0 or infinity, which turns
+/// every field NaN with no error. A millimetre to 100 km keeps the voxel size a
+/// normal f32 at any grid a device can hold.
+const DOMAIN_SIZE_RANGE: std::ops::RangeInclusive<f64> = 1e-3..=1e5;
+
+fn default_domain_size() -> f64 {
+    super::DEFAULT_DOMAIN_SIZE
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +86,9 @@ pub struct Document {
     /// GPU memory the frame cache may hold, in MiB.
     #[serde(default = "default_cache_budget_mb")]
     pub cache_budget_mb: u32,
+    /// Metres along the grid's longest axis. Versions 1 and 2 have none and get 2.0.
+    #[serde(default = "default_domain_size")]
+    pub domain_size: f64,
     pub nodes: Vec<DocNode>,
     pub edges: Vec<DocEdge>,
     pub output: u32,
@@ -82,9 +98,9 @@ impl Document {
     pub fn from_json(text: &str) -> Result<Self, DocError> {
         let mut doc: Document = serde_json::from_str(text)?;
         match doc.version {
-            // Version 1 predates time. Its only migration is the defaults serde
-            // has already filled in above.
-            1 => doc.version = ELEMENTS_DOC_VERSION,
+            // Versions 1 and 2 predate time and physical units. Their only
+            // migration is the defaults serde has already filled in above.
+            1 | 2 => doc.version = ELEMENTS_DOC_VERSION,
             ELEMENTS_DOC_VERSION => {}
             // Deliberately exact, not a range: a newer document may rely on
             // fields this build would silently ignore.
@@ -94,6 +110,18 @@ impl Document {
             return Err(DocError::BadParams {
                 kind: "document".to_string(),
                 reason: format!("fps must be a positive, finite number, got {}", doc.fps),
+            });
+        }
+        // `contains` is false for NaN and infinities, so this is also the finite check.
+        if !DOMAIN_SIZE_RANGE.contains(&doc.domain_size) {
+            return Err(DocError::BadParams {
+                kind: "document".to_string(),
+                reason: format!(
+                    "domain_size must be {} to {} metres, got {}",
+                    DOMAIN_SIZE_RANGE.start(),
+                    DOMAIN_SIZE_RANGE.end(),
+                    doc.domain_size
+                ),
             });
         }
         Ok(doc)
@@ -186,6 +214,7 @@ impl Document {
             )?;
         }
 
+        graph.set_domain_size(self.domain_size);
         graph.set_output(NodeId(self.output));
 
         Ok((

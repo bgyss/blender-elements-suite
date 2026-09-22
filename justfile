@@ -51,3 +51,13 @@ blender-test:
     fi
     echo "using $BLENDER_BIN ($("$BLENDER_BIN" --version | head -1))"
     BLENDER_BIN="$BLENDER_BIN" cargo test -p elementsd --test blender_integration -- --nocapture
+
+# The piece 2a speed gate: step time and divergence at 128³ (spec §4.3).
+# Takes minutes, needs the real GPU, and is not part of `check`.
+bench-gate:
+    cargo run --release -p elements-ember --example speed_gate
+
+# Sweep pressure iterations past the gate's range, for choosing 2b's presets.
+# Writes docs/bench/iteration-sweep.md and leaves the gate's record alone.
+bench-sweep iterations="160,240,320,400,480,560,640":
+    SPEED_GATE_ITERATIONS={{iterations}} cargo run --release -p elements-ember --example speed_gate

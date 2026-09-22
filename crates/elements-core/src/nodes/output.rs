@@ -82,6 +82,7 @@ mod tests {
             pool: &mut pool,
             pipelines: &mut pipelines,
             dims: FieldDims::new(2, 2, 2),
+            domain_size: crate::graph::DEFAULT_DOMAIN_SIZE,
             node: NodeId(42),
             sources: vec![Some(src)],
             taken: vec![false],

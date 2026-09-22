@@ -1,3 +1,4 @@
+use elements_core::gpu::{FieldFormat, FieldPool, GpuContext, PipelineCache, fill_constant};
 use elements_core::graph::{
     DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION, EvalCtx, Node, NodeError,
     NodeRegistry, SocketSpec, SocketType, TimelineConfig, Value,
@@ -102,7 +103,7 @@ fn builds_a_graph_with_the_declared_output() {
 #[test]
 fn a_version_1_document_migrates_with_time_defaults() {
     let doc = Document::from_json(MINIMAL).unwrap();
-    assert_eq!(doc.version, 2);
+    assert_eq!(doc.version, ELEMENTS_DOC_VERSION);
     assert_eq!(doc.fps, 24.0);
     assert_eq!(doc.start_frame, 1);
     assert_eq!(doc.cache_budget_mb, 2048);
@@ -192,6 +193,7 @@ fn accepts_a_document_wiring_one_output_to_two_inputs() {
         fps: 24.0,
         start_frame: 1,
         cache_budget_mb: 2048,
+        domain_size: elements_core::graph::DEFAULT_DOMAIN_SIZE,
         nodes: vec![
             DocNode {
                 id: 0,
@@ -236,6 +238,7 @@ fn rejects_an_out_of_range_output() {
         fps: 24.0,
         start_frame: 1,
         cache_budget_mb: 2048,
+        domain_size: elements_core::graph::DEFAULT_DOMAIN_SIZE,
         nodes: vec![DocNode {
             id: 0,
             kind: "test.producer".to_string(),
@@ -252,5 +255,103 @@ fn rejects_an_out_of_range_output() {
             assert!(reason.contains('1'), "got {reason}");
         }
         other => panic!("expected BadParams, got {other:?}"),
+    }
+}
+
+/// Fills its output with `EvalCtx::voxel_size()`.
+struct VoxelSizeProbe;
+
+impl Node for VoxelSizeProbe {
+    fn kind(&self) -> &'static str {
+        "test.voxel_size_probe"
+    }
+
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![],
+            outputs: vec![SocketType::Field],
+        }
+    }
+
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let field = ctx.acquire_uninit(FieldFormat::R32Float)?;
+        let size = ctx.voxel_size();
+        ctx.with_gpu(|gpu, cache| fill_constant(gpu, cache, &field, size))?;
+        Ok(vec![Value::Field(field)])
+    }
+}
+
+fn probe_doc(version_and_size: &str) -> String {
+    format!(
+        r#"{{
+          {version_and_size}
+          "dims": [8, 4, 2],
+          "nodes": [
+            {{ "id": 0, "kind": "test.voxel_size_probe", "params": {{}} }},
+            {{ "id": 1, "kind": "core.output", "params": {{}} }}
+          ],
+          "edges": [{{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }}],
+          "output": 1
+        }}"#
+    )
+}
+
+#[test]
+fn a_version_2_document_migrates_with_the_default_domain_size() {
+    let doc = Document::from_json(&probe_doc(r#""version": 2,"#)).unwrap();
+    assert_eq!(doc.version, ELEMENTS_DOC_VERSION);
+    assert_eq!(doc.version, 3);
+    assert_eq!(doc.domain_size, 2.0);
+}
+
+#[test]
+fn domain_size_reaches_nodes_as_metres_per_voxel_along_the_longest_axis() {
+    let mut registry = NodeRegistry::with_builtins();
+    registry.register("test.voxel_size_probe", |_| {
+        Ok(Box::new(VoxelSizeProbe) as Box<dyn Node>)
+    });
+    let (graph, dims) = Document::from_json(&probe_doc(r#""version": 3, "domain_size": 4.0,"#))
+        .unwrap()
+        .into_graph(&registry)
+        .unwrap();
+    assert_eq!(graph.domain_size(), 4.0);
+
+    let gpu = GpuContext::new_headless().expect("no GPU adapter available");
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let value = graph.eval(&gpu, &mut pool, &mut pipelines, dims).unwrap();
+    let voxels = value.as_field().unwrap().read_back(&gpu).unwrap();
+    // 4 m along the longest axis, which has 8 cells.
+    assert!(voxels.iter().all(|&v| v == 0.5), "got {:?}", &voxels[..4]);
+}
+
+#[test]
+fn rejects_a_domain_size_that_is_not_positive() {
+    for size in ["0.0", "-1.0"] {
+        let text = probe_doc(&format!(r#""version": 3, "domain_size": {size},"#));
+        match Document::from_json(&text) {
+            Err(DocError::BadParams { .. }) => {}
+            other => panic!("domain_size {size}: expected BadParams, got {other:?}"),
+        }
+    }
+}
+
+/// A size that is positive and finite as an f64 can still give an f32 voxel
+/// size of 0 or infinity, which turns every field NaN without any error.
+#[test]
+fn rejects_a_domain_size_that_f32_voxels_cannot_hold() {
+    for size in ["1e-300", "1e300"] {
+        let text = probe_doc(&format!(r#""version": 3, "domain_size": {size},"#));
+        match Document::from_json(&text) {
+            Err(DocError::BadParams { .. }) => {}
+            other => panic!("domain_size {size}: expected BadParams, got {other:?}"),
+        }
+    }
+    for size in ["1e-3", "1e5"] {
+        let text = probe_doc(&format!(r#""version": 3, "domain_size": {size},"#));
+        assert!(
+            Document::from_json(&text).is_ok(),
+            "domain_size {size} is inside the range and must load"
+        );
     }
 }
