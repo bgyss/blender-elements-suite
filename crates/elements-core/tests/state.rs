@@ -220,3 +220,51 @@ fn time_reaches_nodes() {
         .unwrap();
     assert_eq!(evaluated.value.as_scalar().unwrap(), 2.0);
 }
+
+#[test]
+fn a_restored_snapshot_resumes_exactly_where_it_was_taken() {
+    let mut h = Harness::new();
+    let (graph, dims) = accumulate_graph();
+    let mut state = StateStore::new();
+    for frame in 1..=3 {
+        h.frame(&graph, &mut state, frame, dims);
+    }
+
+    let snapshot = state.snapshot(&h.gpu, &mut h.pool).unwrap();
+    let frame_4: Vec<u32> = h
+        .frame(&graph, &mut state, 4, dims)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    h.frame(&graph, &mut state, 5, dims);
+    h.frame(&graph, &mut state, 6, dims);
+
+    // Restoring twice proves the snapshot survives being restored.
+    for _ in 0..2 {
+        state.restore(&snapshot, &h.gpu, &mut h.pool).unwrap();
+        let again: Vec<u32> = h
+            .frame(&graph, &mut state, 4, dims)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(
+            again, frame_4,
+            "frame 4 after restore must be bit-identical"
+        );
+    }
+    snapshot.release_to(&mut h.pool);
+}
+
+#[test]
+fn a_snapshot_counts_every_stored_texel() {
+    let mut h = Harness::new();
+    let (graph, dims) = accumulate_graph();
+    let mut state = StateStore::new();
+
+    let empty = state.snapshot(&h.gpu, &mut h.pool).unwrap();
+    assert_eq!(empty.bytes(), 0);
+
+    h.frame(&graph, &mut state, 1, dims);
+    let one = state.snapshot(&h.gpu, &mut h.pool).unwrap();
+    assert_eq!(one.bytes(), 4 * 4 * 4 * 4, "one 4³ R32Float field");
+}

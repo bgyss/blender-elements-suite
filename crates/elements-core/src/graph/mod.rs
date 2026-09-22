@@ -11,7 +11,7 @@ pub use document::{DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION};
 pub use node::{EvalCtx, EvalStats, Node, NodeError, Value};
 pub use registry::{NodeCtor, NodeRegistry};
 pub use socket::{NodeId, SocketId, SocketSpec, SocketType};
-pub use state::StateStore;
+pub use state::{Snapshot, StateStore};
 pub use time::{DEFAULT_FPS, DEFAULT_START_FRAME, Time};
 
 use std::collections::{HashMap, HashSet};

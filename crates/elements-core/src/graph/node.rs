@@ -157,6 +157,17 @@ impl Value {
         }
     }
 
+    /// Bytes of GPU memory this value's textures occupy (4 for a scalar).
+    pub fn gpu_bytes(&self) -> u64 {
+        let field_bytes =
+            |f: &Field| f.dims().voxel_count() as u64 * f.format().bytes_per_voxel() as u64;
+        match self {
+            Self::Field(f) => field_bytes(f),
+            Self::Scalar(_) => std::mem::size_of::<f32>() as u64,
+            Self::VectorField(v) => Axis::ALL.iter().map(|&a| field_bytes(v.face(a))).sum(),
+        }
+    }
+
     /// A copy of this value, with GPU contents copied into pooled textures.
     pub fn duplicate(&self, gpu: &GpuContext, pool: &mut FieldPool) -> Result<Value, GpuError> {
         Ok(match self {
