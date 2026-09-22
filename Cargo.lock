@@ -349,6 +349,7 @@ dependencies = [
  "approx",
  "clap",
  "elements-core",
+ "elements-ember",
  "elements-io",
  "png",
  "tempfile",
@@ -366,6 +367,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "wgpu",
+]
+
+[[package]]
+name = "elements-ember"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "elements-core",
+ "serde",
+ "serde_json",
  "wgpu",
 ]
 
@@ -403,6 +415,7 @@ dependencies = [
  "anyhow",
  "clap",
  "elements-core",
+ "elements-ember",
  "elements-ipc",
  "tempfile",
 ]

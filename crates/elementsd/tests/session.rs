@@ -695,3 +695,48 @@ fn render_produces_the_requested_frame_of_a_stateful_graph() {
         "frame 3 must be bit-identical on revisit"
     );
 }
+
+#[test]
+fn the_daemon_knows_ember_node_kinds() {
+    let daemon = Daemon::start();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sphere.elements");
+    std::fs::write(
+        &path,
+        r#"{
+          "version": 3,
+          "dims": [8, 8, 8],
+          "nodes": [
+            { "id": 0, "kind": "ember.sphere_emitter",
+              "params": { "center": [1.0, 1.0, 1.0], "radius": 0.5 } },
+            { "id": 1, "kind": "core.output", "params": {} }
+          ],
+          "edges": [{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }],
+          "output": 1
+        }"#,
+    )
+    .unwrap();
+
+    let mut stream = daemon.connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_message(
+        &mut stream,
+        &Command::Hello {
+            protocol_version: ELEMENTS_PROTOCOL_VERSION,
+        },
+    )
+    .unwrap();
+    let _ack: Response = read_message(&mut reader).unwrap().unwrap();
+    write_message(
+        &mut stream,
+        &Command::LoadGraph {
+            path: path.to_string_lossy().into_owned(),
+        },
+    )
+    .unwrap();
+    match read_message::<_, Response>(&mut reader).unwrap().unwrap() {
+        Response::Loaded { nodes, .. } => assert_eq!(nodes, 2),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    write_message(&mut stream, &Command::Shutdown).unwrap();
+}

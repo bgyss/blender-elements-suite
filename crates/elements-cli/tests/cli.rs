@@ -196,3 +196,34 @@ fn an_unsupported_version_names_the_version() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("42"));
 }
+
+const SPHERE_GRAPH: &str = r#"{
+  "version": 3,
+  "dims": [8, 8, 8],
+  "nodes": [
+    { "id": 0, "kind": "ember.sphere_emitter",
+      "params": { "center": [1.0, 1.0, 1.0], "radius": 0.5, "density_rate": 1.0 } },
+    { "id": 1, "kind": "core.output", "params": {} }
+  ],
+  "edges": [{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }],
+  "output": 1
+}"#;
+
+#[test]
+fn the_cli_knows_ember_node_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join("sphere.elements");
+    std::fs::write(&graph, SPHERE_GRAPH).unwrap();
+    let out = dir.path().join("sphere.npy");
+    let output = cli()
+        .args(["dump-npy", graph.to_str().unwrap()])
+        .args(["--out", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out.exists());
+}

@@ -45,7 +45,7 @@ impl Session {
             gpu,
             pool: FieldPool::new(),
             pipelines: PipelineCache::new(),
-            registry: NodeRegistry::with_builtins(),
+            registry: elements_ember::registry(),
             graph: None,
             timeline: None,
             channel_path: channel_path.to_path_buf(),

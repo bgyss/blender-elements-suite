@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use elements_core::gpu::{FieldPool, GpuContext, PipelineCache};
-use elements_core::graph::{Document, NodeRegistry, Timeline};
+use elements_core::graph::{Document, Timeline};
 
 /// Load a `.elements` document, evaluate it, and read the result back.
 ///
@@ -24,7 +24,7 @@ pub fn evaluate_document(path: &Path) -> anyhow::Result<(Vec<f32>, [u32; 3])> {
     doc.validate_for(&gpu.device().limits())
         .context("validating document dimensions against this device's limits")?;
 
-    let registry = NodeRegistry::with_builtins();
+    let registry = elements_ember::registry();
     let (graph, dims) = doc.into_graph(&registry)?;
 
     let mut pool = FieldPool::new();
@@ -85,7 +85,7 @@ pub fn bake(
         .context("validating document dimensions against this device's limits")?;
 
     let config = doc.timeline_config();
-    let registry = NodeRegistry::with_builtins();
+    let registry = elements_ember::registry();
     let (graph, dims) = doc.into_graph(&registry)?;
 
     let mut pool = FieldPool::new();
