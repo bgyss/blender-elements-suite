@@ -49,7 +49,8 @@ pub(crate) fn build(_params: &serde_json::Value) -> Result<Box<dyn Node>, DocErr
 mod tests {
     use super::*;
     use crate::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
-    use crate::graph::{NodeId, StateStore, Time};
+    use crate::graph::{EvalStats, NodeId, SocketId, StateStore, Time};
+    use std::collections::HashMap;
 
     /// The ADDITIONAL REQUIREMENT: when a built-in node reads an input of
     /// the wrong type, the error must name the real node and the real
@@ -59,8 +60,8 @@ mod tests {
     /// This bypasses `Graph::connect` (which already rejects a
     /// type-mismatched wire at document-build time) to exercise the
     /// defense inside `Output::eval` itself: an `EvalCtx` built by hand
-    /// with a `Scalar` sitting in the `Field` input slot, as if a future
-    /// bug elsewhere ever let one through.
+    /// with a `Scalar` produced into the source feeding the `Field` input,
+    /// as if a future bug elsewhere ever let one through.
     #[test]
     fn type_mismatch_on_input_names_node_and_socket() {
         let gpu = GpuContext::new_headless().expect("no GPU adapter available");
@@ -68,14 +69,25 @@ mod tests {
         let mut pipelines = PipelineCache::new();
         let mut state = StateStore::new();
 
+        let src = SocketId {
+            node: NodeId(0),
+            index: 0,
+        };
+        let mut produced = HashMap::from([(src, Value::Scalar(1.0))]);
+        let mut remaining = HashMap::from([(src, 1u32)]);
+        let mut stats = EvalStats::default();
+
         let mut ctx = EvalCtx {
             gpu: &gpu,
             pool: &mut pool,
             pipelines: &mut pipelines,
             dims: FieldDims::new(2, 2, 2),
             node: NodeId(42),
-            inputs: vec![Some(Value::Scalar(1.0))],
+            sources: vec![Some(src)],
             taken: vec![false],
+            produced: &mut produced,
+            remaining: &mut remaining,
+            stats: &mut stats,
             state: &mut state,
             stateful: false,
             time: Time::at(1, 1, 24.0),

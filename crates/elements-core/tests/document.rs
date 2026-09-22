@@ -97,8 +97,8 @@ fn builds_a_graph_with_the_declared_output() {
     assert_eq!(graph.node_count(), 2);
 }
 
-/// A node with a single scalar output, used to build a document that wires
-/// one output to two inputs.
+/// A node with a single scalar output, used to build a document where its
+/// single output feeds both inputs of one consumer.
 struct Producer;
 
 impl Node for Producer {
@@ -116,8 +116,8 @@ impl Node for Producer {
     }
 }
 
-/// A node with two scalar inputs, used as the two competing consumers of one
-/// producer's output.
+/// A node with two scalar inputs, used as a consumer whose two inputs are
+/// both fed by one producer's single output.
 struct Consumer;
 
 impl Node for Consumer {
@@ -143,7 +143,7 @@ fn test_registry() -> NodeRegistry {
 }
 
 #[test]
-fn rejects_a_document_wiring_one_output_to_two_inputs() {
+fn accepts_a_document_wiring_one_output_to_two_inputs() {
     let doc = Document {
         version: ELEMENTS_DOC_VERSION,
         dims: [8, 8, 8],
@@ -177,10 +177,10 @@ fn rejects_a_document_wiring_one_output_to_two_inputs() {
     };
 
     let registry = test_registry();
-    match doc.into_graph(&registry) {
-        Err(DocError::Graph(NodeError::AlreadyConsumed { .. })) => {}
-        other => panic!("expected DocError::Graph(AlreadyConsumed), got {other:?}"),
-    }
+    assert!(
+        doc.into_graph(&registry).is_ok(),
+        "one output may now feed several inputs"
+    );
 }
 
 #[test]

@@ -1,10 +1,13 @@
 //! The `Node` trait, the values that flow between nodes, and node errors.
 
+use std::collections::HashMap;
+
 use crate::gpu::{
-    Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache, StaggeredField,
+    Axis, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache,
+    StaggeredField,
 };
 
-use super::socket::{NodeId, SocketSpec, SocketType};
+use super::socket::{NodeId, SocketId, SocketSpec, SocketType};
 use super::state::StateStore;
 use super::time::Time;
 
@@ -23,8 +26,8 @@ pub enum NodeError {
         index: u32,
         expected: SocketType,
     },
-    #[error("node {node:?} output {index} already feeds another input")]
-    AlreadyConsumed { node: NodeId, index: u32 },
+    #[error("node {node:?} input {index} is already connected")]
+    InputAlreadyConnected { node: NodeId, index: u32 },
     #[error("no such node: {0:?}")]
     UnknownNode(NodeId),
     #[error("no output node is set on this graph")]
@@ -92,6 +95,14 @@ impl NodeError {
     }
 }
 
+/// Counters describing one evaluation, for tests and profiling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvalStats {
+    /// GPU copies made because a field fed more than one input, and a
+    /// consumer that was not the last one took ownership of it.
+    pub copies: u32,
+}
+
 impl Value {
     pub fn as_field(&self) -> Result<&Field, NodeError> {
         match self {
@@ -145,22 +156,42 @@ impl Value {
             Self::Scalar(_) => {}
         }
     }
+
+    /// A copy of this value, with GPU contents copied into pooled textures.
+    pub fn duplicate(&self, gpu: &GpuContext, pool: &mut FieldPool) -> Result<Value, GpuError> {
+        Ok(match self {
+            Self::Field(f) => Self::Field(pool.duplicate(gpu, f)?),
+            Self::Scalar(s) => Self::Scalar(*s),
+            Self::VectorField(v) => {
+                let x = pool.duplicate(gpu, v.face(Axis::X))?;
+                let y = pool.duplicate(gpu, v.face(Axis::Y))?;
+                let z = pool.duplicate(gpu, v.face(Axis::Z))?;
+                Self::VectorField(StaggeredField::from_faces(v.cells(), [x, y, z])?)
+            }
+        })
+    }
 }
 
 /// What a node is handed when it evaluates.
 ///
-/// Inputs are owned: the evaluator moves each producer's value into the
-/// consumer, which is why an output may feed only one input.
+/// Inputs are lent, not given: `input` borrows, and `take_input` moves only
+/// when this node is the value's last outstanding use (otherwise it copies).
 pub struct EvalCtx<'a> {
     pub(crate) gpu: &'a GpuContext,
     pub(crate) pool: &'a mut FieldPool,
     pub(crate) pipelines: &'a mut PipelineCache,
     pub(crate) dims: FieldDims,
     pub(crate) node: NodeId,
-    pub(crate) inputs: Vec<Option<Value>>,
+    /// For each input index, the output socket feeding it, if any.
+    pub(crate) sources: Vec<Option<SocketId>>,
     /// Tracks which indices `take_input` has already removed, so `input` can
     /// report a distinct error for "taken" versus "never connected".
     pub(crate) taken: Vec<bool>,
+    /// Every value produced so far this evaluation, keyed by output socket.
+    pub(crate) produced: &'a mut HashMap<SocketId, Value>,
+    /// Input uses of each produced value that have not finished yet.
+    pub(crate) remaining: &'a mut HashMap<SocketId, u32>,
+    pub(crate) stats: &'a mut EvalStats,
     /// Persistent state. Only a node whose `stateful()` is true may touch it.
     pub(crate) state: &'a mut StateStore,
     pub(crate) stateful: bool,
@@ -183,41 +214,59 @@ impl EvalCtx<'_> {
 
     /// Borrow input `index`.
     pub fn input(&self, index: u32) -> Result<&Value, NodeError> {
-        self.inputs
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                if self.taken.get(index as usize).copied().unwrap_or(false) {
-                    NodeError::InputAlreadyTaken {
-                        node: self.node,
-                        index,
-                    }
-                } else {
-                    NodeError::MissingInput {
-                        node: self.node,
-                        index,
-                    }
-                }
-            })
-    }
-
-    /// Take ownership of input `index`, leaving it unavailable to later reads.
-    /// This is how pass-through nodes forward a GPU field without copying it.
-    ///
-    /// Trap: calling `input(index)` after this will not report `MissingInput`
-    /// (which would look like a wiring mistake in the graph) but
-    /// `InputAlreadyTaken` (a bug in this node's own `eval`, since it read the
-    /// same input twice).
-    pub fn take_input(&mut self, index: u32) -> Result<Value, NodeError> {
-        let value = self
-            .inputs
-            .get_mut(index as usize)
-            .and_then(Option::take)
+        let i = index as usize;
+        if self.taken.get(i).copied().unwrap_or(false) {
+            return Err(NodeError::InputAlreadyTaken {
+                node: self.node,
+                index,
+            });
+        }
+        self.sources
+            .get(i)
+            .copied()
+            .flatten()
+            .and_then(|src| self.produced.get(&src))
             .ok_or(NodeError::MissingInput {
                 node: self.node,
                 index,
-            })?;
-        if let Some(slot) = self.taken.get_mut(index as usize) {
+            })
+    }
+
+    /// Take ownership of input `index`.
+    ///
+    /// If this is the value's last outstanding use, it is moved, with no copy.
+    /// If other inputs still need it, this returns a GPU copy and counts it in
+    /// `EvalStats::copies`. So a node that only reads an input should call
+    /// `input` instead.
+    ///
+    /// Trap: calling `input(index)` after this does not report `MissingInput`
+    /// (which would look like a wiring mistake in the graph). It reports
+    /// `InputAlreadyTaken`, a bug in this node's own `eval`, since it read the
+    /// same input twice.
+    pub fn take_input(&mut self, index: u32) -> Result<Value, NodeError> {
+        let i = index as usize;
+        let node = self.node;
+        let missing = || NodeError::MissingInput { node, index };
+        if self.taken.get(i).copied().unwrap_or(false) {
+            return Err(NodeError::InputAlreadyTaken { node, index });
+        }
+        let src = self.sources.get(i).copied().flatten().ok_or_else(missing)?;
+
+        let left = self.remaining.get(&src).copied().unwrap_or(0);
+        let value = if left <= 1 {
+            self.remaining.remove(&src);
+            self.produced.remove(&src).ok_or_else(missing)?
+        } else {
+            let shared = self.produced.get(&src).ok_or_else(missing)?;
+            let copy = shared.duplicate(self.gpu, self.pool)?;
+            if !matches!(copy, Value::Scalar(_)) {
+                self.stats.copies += 1;
+            }
+            self.remaining.insert(src, left - 1);
+            copy
+        };
+
+        if let Some(slot) = self.taken.get_mut(i) {
             *slot = true;
         }
         Ok(value)

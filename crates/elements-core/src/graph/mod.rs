@@ -8,25 +8,22 @@ mod state;
 mod time;
 
 pub use document::{DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION};
-pub use node::{EvalCtx, Node, NodeError, Value};
+pub use node::{EvalCtx, EvalStats, Node, NodeError, Value};
 pub use registry::{NodeCtor, NodeRegistry};
 pub use socket::{NodeId, SocketId, SocketSpec, SocketType};
 pub use state::StateStore;
 pub use time::{DEFAULT_FPS, DEFAULT_START_FRAME, Time};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
 
 /// A directed acyclic graph of nodes with one designated output.
 ///
-/// Each output socket may feed at most one input socket (`connect` enforces
-/// this). `Value::Field` wraps a GPU texture that is deliberately not
-/// `Clone`, so `eval` cannot hand the same produced value to two consumers —
-/// it moves each value out of the producer's slot into its single consumer.
-/// Allowing a second connection would mean the second consumer silently gets
-/// `None` and fails with a confusing `MissingInput` instead of a clear
-/// rejection at graph-construction time.
+/// Each input socket accepts exactly one edge (`connect` enforces this). An
+/// output socket may feed any number of inputs: the evaluator lends the value
+/// to each consumer, moves it to the last, and copies it for any earlier
+/// consumer that takes ownership. See `EvalCtx::take_input`.
 #[derive(Default)]
 pub struct Graph {
     nodes: Vec<Box<dyn Node>>,
@@ -54,6 +51,37 @@ pub struct Evaluated {
     /// The output node's first output. The caller owns it and should return it
     /// to the pool with `Value::release_to` when finished.
     pub value: Value,
+    pub stats: EvalStats,
+}
+
+/// Everything one `eval_frame` call threads through its nodes.
+struct Run<'a> {
+    gpu: &'a GpuContext,
+    pool: &'a mut FieldPool,
+    pipelines: &'a mut PipelineCache,
+    state: &'a mut StateStore,
+    time: Time,
+    dims: FieldDims,
+    produced: HashMap<SocketId, Value>,
+    remaining: HashMap<SocketId, u32>,
+    stats: EvalStats,
+}
+
+impl Run<'_> {
+    /// One use of `src` finished without taking ownership. If it was the last
+    /// use, the value goes back to the pool.
+    fn consume(&mut self, src: SocketId) {
+        let Some(left) = self.remaining.get_mut(&src) else {
+            return;
+        };
+        *left = left.saturating_sub(1);
+        if *left == 0 {
+            self.remaining.remove(&src);
+            if let Some(value) = self.produced.remove(&src) {
+                value.release_to(self.pool);
+            }
+        }
+    }
 }
 
 impl Graph {
@@ -84,8 +112,8 @@ impl Graph {
 
     /// Connect an output socket to an input socket, validating both ends.
     ///
-    /// Rejects type mismatches, nonexistent sockets, and any attempt to feed a
-    /// second input from an output that already has a consumer.
+    /// Rejects type mismatches, nonexistent sockets, and a second edge into an
+    /// input that already has one.
     pub fn connect(&mut self, from: SocketId, to: SocketId) -> Result<(), NodeError> {
         let from_spec = self.node(from.node)?.sockets();
         let to_spec = self.node(to.node)?.sockets();
@@ -117,10 +145,10 @@ impl Graph {
             });
         }
 
-        if self.edges.values().any(|src| *src == from) {
-            return Err(NodeError::AlreadyConsumed {
-                node: from.node,
-                index: from.index,
+        if self.edges.contains_key(&to) {
+            return Err(NodeError::InputAlreadyConnected {
+                node: to.node,
+                index: to.index,
             });
         }
 
@@ -238,6 +266,9 @@ impl Graph {
 
     /// Evaluate the output node and everything it depends on, as frame `time`,
     /// reading and writing persistent state in `state`.
+    ///
+    /// Every field produced along the way is back in `pool` when this returns,
+    /// except the result, whether evaluation succeeds or fails.
     pub fn eval_frame(
         &self,
         gpu: &GpuContext,
@@ -250,50 +281,94 @@ impl Graph {
         let output = self.output.ok_or(NodeError::NoOutput)?;
         let order = self.evaluation_order()?;
 
-        // Outputs of each evaluated node. Values are moved out as they are
-        // consumed, so each slot holds `None` once its consumer has run.
-        let mut produced: HashMap<NodeId, Vec<Option<Value>>> = HashMap::new();
+        let mut run = Run {
+            gpu,
+            pool,
+            pipelines,
+            state,
+            time,
+            dims,
+            produced: HashMap::new(),
+            remaining: HashMap::new(),
+            stats: EvalStats::default(),
+        };
+        let result = self.run(&mut run, &order, output);
+        for (_, value) in run.produced.drain() {
+            value.release_to(run.pool);
+        }
+        Ok(Evaluated {
+            value: result?,
+            stats: run.stats,
+        })
+    }
 
-        for id in order {
+    fn run(&self, run: &mut Run<'_>, order: &[NodeId], output: NodeId) -> Result<Value, NodeError> {
+        // Count every input use of every output, among the nodes that will run.
+        let needed: HashSet<NodeId> = order.iter().copied().collect();
+        for (to, from) in &self.edges {
+            if needed.contains(&to.node) {
+                *run.remaining.entry(*from).or_insert(0) += 1;
+            }
+        }
+
+        let result_socket = SocketId {
+            node: output,
+            index: 0,
+        };
+
+        for &id in order {
             let node = self.node(id)?;
             let spec = node.sockets();
+            let sources: Vec<Option<SocketId>> = (0..spec.inputs.len() as u32)
+                .map(|index| self.edges.get(&SocketId { node: id, index }).copied())
+                .collect();
 
-            let mut inputs: Vec<Option<Value>> = Vec::with_capacity(spec.inputs.len());
-            for index in 0..spec.inputs.len() as u32 {
-                let value = match self.edges.get(&SocketId { node: id, index }) {
-                    Some(src) => produced
-                        .get_mut(&src.node)
-                        .and_then(|outs| outs.get_mut(src.index as usize))
-                        .and_then(Option::take),
-                    None => None,
-                };
-                inputs.push(value);
-            }
-
-            let taken = vec![false; inputs.len()];
             let mut ctx = EvalCtx {
-                gpu,
-                pool,
-                pipelines,
-                dims,
+                gpu: run.gpu,
+                pool: &mut *run.pool,
+                pipelines: &mut *run.pipelines,
+                dims: run.dims,
                 node: id,
-                inputs,
-                taken,
-                state,
+                sources: sources.clone(),
+                taken: vec![false; sources.len()],
+                produced: &mut run.produced,
+                remaining: &mut run.remaining,
+                stats: &mut run.stats,
+                state: &mut *run.state,
                 stateful: node.stateful(),
-                time,
+                time: run.time,
             };
             let outputs = node
                 .eval(&mut ctx)
                 .map_err(|err| err.with_evaluating_node(id))?;
-            produced.insert(id, outputs.into_iter().map(Some).collect());
+            let taken = std::mem::take(&mut ctx.taken);
+
+            // Inputs this node only borrowed are finished with now.
+            for (index, src) in sources.iter().enumerate() {
+                if let Some(src) = src
+                    && !taken[index]
+                {
+                    run.consume(*src);
+                }
+            }
+
+            for (index, value) in outputs.into_iter().enumerate() {
+                let socket = SocketId {
+                    node: id,
+                    index: index as u32,
+                };
+                let wanted =
+                    socket == result_socket || run.remaining.get(&socket).copied().unwrap_or(0) > 0;
+                if wanted {
+                    run.produced.insert(socket, value);
+                } else {
+                    value.release_to(run.pool);
+                }
+            }
         }
 
-        produced
-            .get_mut(&output)
-            .and_then(|outs| outs.first_mut())
-            .and_then(Option::take)
-            .map(|value| Evaluated { value })
+        run.produced
+            .remove(&result_socket)
             .ok_or(NodeError::UnknownNode(output))
     }
 }

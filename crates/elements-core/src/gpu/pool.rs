@@ -21,6 +21,12 @@ impl FieldPool {
         Self::default()
     }
 
+    /// How many fresh GPU textures this pool has ever allocated. It never
+    /// decreases, so a stable count across frames proves reuse.
+    pub fn allocation_count(&self) -> u64 {
+        self.next_generation
+    }
+
     /// Take a field of this shape from the pool, allocating only if none is free.
     ///
     /// The returned field's contents are unspecified unless it was freshly

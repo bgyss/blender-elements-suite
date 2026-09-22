@@ -203,41 +203,6 @@ fn rejects_a_nonexistent_socket() {
 }
 
 #[test]
-fn rejects_a_second_consumer_of_one_output() {
-    let mut g = Graph::new();
-    let lit = g.add_node(Box::new(Literal(1.0)));
-    let add = g.add_node(Box::new(Add));
-
-    g.connect(
-        SocketId {
-            node: lit,
-            index: 0,
-        },
-        SocketId {
-            node: add,
-            index: 0,
-        },
-    )
-    .unwrap();
-    let err = g
-        .connect(
-            SocketId {
-                node: lit,
-                index: 0,
-            },
-            SocketId {
-                node: add,
-                index: 1,
-            },
-        )
-        .unwrap_err();
-    assert!(
-        matches!(err, NodeError::AlreadyConsumed { .. }),
-        "got {err:?}"
-    );
-}
-
-#[test]
 fn unconnected_input_is_an_error_at_eval_time() {
     let mut g = Graph::new();
     let add = g.add_node(Box::new(Add));
