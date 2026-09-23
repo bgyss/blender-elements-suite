@@ -146,8 +146,18 @@ neighbourhood has smoke, every face and every central difference the metrics
 touch (the divergence face stencil, the kinetic energy and vorticity from
 cell-centred averages of two faces) is stored in Mantaflow's cache and present
 in Ember's. Outflow is measured for the same reason on the z-faces at index
-nz − 1, with the density of layer nz − 2, not on face nz. The reader fills
-the missing face n with 0; no metric reads it.
+nz − 2, between layers nz − 3 and nz − 2, as the net upwind flux, and drift
+is taken over the control volume of layers 0 … nz − 3 (spec §4.3). The reader
+fills the missing face n with 0; no metric reads it.
+
+**The open top layer is a density sink.** Whenever the domain is not closed,
+the generated script calls `resetOutflow(flags, real=density)` every step
+(`smoke_script.h`), which sets the open boundary layer nz − 1 to zero density.
+So layer nz − 1 never holds smoke in the cache, face index nz − 1 is never
+stored, and no cell in layer nz − 2 is ever a *measured* cell under §4.1's
+neighbourhood rule. This was seen on two open-sided probe bakes: layer nz − 1
+had 0 smoky cells, and velocity was stored at z index nz − 2 but never at
+nz − 1. Task 6 confirms it with a 120-frame `plume` bake.
 
 **Tiles can drop values from the other grids.** In a domain-filling test
 (32³, `fill=1 volume=1 alpha=0 beta=0.5`, frame 3), density was constant over whole 8³ blocks and was
@@ -178,7 +188,7 @@ So index (i,j,k) holds the −x, −y and −z faces of cell (i,j,k), and the ca
 stores it only when that cell has smoke. A smoky cell's + faces can therefore
 be missing at the plume's edge, and face n on each axis is never stored. That
 is why the metrics measure only cells whose whole 3×3×3 neighbourhood is
-smoke, and outflow uses face nz − 1 (see Clipping).
+smoke, and outflow uses face nz − 2 (see Clipping).
 
 The brief's extent experiment cannot separate faces from centres. Velocity is
 clipped to density's voxels, so the stored extent is always density's (32³,
@@ -399,8 +409,10 @@ files, keeps growing. The estimate is under the 90-minute stop line.
    stored per cell but holds that cell's − faces, a smoky cell's + faces can
    be missing, and face n is never stored. Resolved: the §4.1 metrics use
    only measured cells, whose whole 3×3×3 neighbourhood is inside the domain,
-   collider-free and above density 1e-6, for both solvers; outflow uses face
-   nz − 1 with layer nz − 2's density. `results.md` must say so.
+   collider-free and above density 1e-6, for both solvers; outflow uses the
+   net upwind flux through face nz − 2, over the control volume of layers
+   0 … nz − 3, since Mantaflow's open top layer nz − 1 is a density sink
+   (`resetOutflow`). `results.md` must say so.
 3. **Mantaflow's wind acts only on smoky cells.** `plume_wind` is kept and
    documented as above. The brief's no-emitter wind check cannot work, and an
    emitter check replaces it.
