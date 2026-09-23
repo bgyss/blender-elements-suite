@@ -40,16 +40,21 @@ impl Scene {
                 temperature_rate: 1.0,
             },
             solver: SolverParams {
-                substeps: 1,
                 pressure_iterations: 160,
                 buoyancy_density: 0.0,
                 buoyancy_temperature: 1.0,
+                ..SolverParams::default()
             },
         }
     }
 
     pub fn with_iterations(mut self, n: u32) -> Self {
         self.solver.pressure_iterations = n;
+        self
+    }
+
+    pub fn with_max_substeps(mut self, n: u32) -> Self {
+        self.solver.max_substeps = n;
         self
     }
 
@@ -118,5 +123,34 @@ pub fn gate_verdict(rows: &[GateRow]) -> Option<u32> {
     rows.iter()
         .filter(|r| r.passes())
         .map(|r| r.iterations)
+        .max()
+}
+
+/// A preview frame at 128³, with the CFL measurement and every substep, must
+/// take at most this long (spec §6).
+pub const PRESET_FRAME_MS: f64 = 100.0;
+
+/// One row of the preview-preset sweep.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresetRow {
+    pub max_substeps: u32,
+    /// Median over three runs of each run's median frame time.
+    pub frame_ms_median: f64,
+}
+
+impl PresetRow {
+    /// Spec §6's per-row rule. `preview_substeps_verdict` uses it too.
+    pub fn passes(&self) -> bool {
+        self.frame_ms_median <= PRESET_FRAME_MS
+    }
+}
+
+/// Spec §6: the largest `max_substeps` whose median full frame fits. `None`
+/// means even one substep does not, and preview falls back to
+/// semi-Lagrangian advection before the sweep runs again.
+pub fn preview_substeps_verdict(rows: &[PresetRow]) -> Option<u32> {
+    rows.iter()
+        .filter(|r| r.passes())
+        .map(|r| r.max_substeps)
         .max()
 }

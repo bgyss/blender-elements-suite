@@ -4,6 +4,7 @@ mod batch;
 mod dispatch;
 mod field;
 mod pool;
+mod reduce;
 mod staggered;
 
 pub use batch::ComputeBatch;
@@ -12,6 +13,7 @@ pub use dispatch::{
 };
 pub use field::{Field, FieldDims, FieldFormat, validate_dims_fit_buffer_limit};
 pub use pool::FieldPool;
+pub use reduce::{ReduceOp, ReduceTarget, reduce};
 pub use staggered::{Axis, StaggeredField};
 
 use std::sync::{Arc, Mutex};

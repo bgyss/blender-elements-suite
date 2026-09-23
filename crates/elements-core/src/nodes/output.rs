@@ -88,6 +88,7 @@ mod tests {
             taken: vec![false],
             produced: &mut produced,
             remaining: &mut remaining,
+            result: src,
             stats: &mut stats,
             state: &mut state,
             stateful: false,

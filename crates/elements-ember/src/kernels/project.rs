@@ -1,7 +1,8 @@
 //! Pressure projection (stage 4).
 
 use elements_core::gpu::{
-    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
+    Axis, ComputeBatch, Field, FieldDims, GpuContext, GpuError, PipelineCache, ReduceOp,
+    ReduceTarget, StaggeredField, reduce,
 };
 
 use super::{Bind, Uniforms, bind_group, expect_dims};
@@ -19,6 +20,11 @@ const PRESSURE: &str = concat!(
 const GRADIENT: &str = concat!(
     include_str!("shaders/common.wgsl"),
     include_str!("shaders/gradient.wgsl"),
+);
+
+const SUBTRACT_MEAN: &str = concat!(
+    include_str!("shaders/common.wgsl"),
+    include_str!("shaders/subtract_mean.wgsl"),
 );
 
 fn expect_velocity(what: &str, velocity: &StaggeredField, u: &Uniforms) -> Result<(), GpuError> {
@@ -60,51 +66,127 @@ pub fn divergence(
     Ok(())
 }
 
-/// `iterations` red-black Gauss–Seidel sweeps on `phi`, in place, starting
-/// from whatever `phi` holds (the warm start).
+/// About 100 ms of pressure sweeps per submission at the measured 0.19 ms
+/// per iteration at 128³, well inside GPU watchdog limits (spec §4.3).
+pub const CELL_SWEEPS_PER_SUBMIT: u64 = 1 << 30;
+
+/// Pressure iterations per submission for a domain of `cells`: at least 1.
+pub fn iterations_per_submit(cells: FieldDims) -> u32 {
+    let per = CELL_SWEEPS_PER_SUBMIT / (cells.voxel_count() as u64).max(1);
+    u32::try_from(per).unwrap_or(u32::MAX).max(1)
+}
+
+/// `iterations` red-black Gauss–Seidel sweeps on `p`, solving ∇²p = div/h,
+/// in place, starting from whatever `p` holds (the warm start). The loop is
+/// split across submissions of at most `per_submit` iterations each.
+#[allow(clippy::too_many_arguments)] // every arg is load-bearing; see the doc above.
 pub fn pressure(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
     batch: &mut ComputeBatch,
     u: &Uniforms,
-    phi: &Field,
+    p: &Field,
     div: &Field,
     iterations: u32,
+    per_submit: u32,
 ) -> Result<(), GpuError> {
-    expect_dims("pressure phi", phi, u.cells())?;
+    expect_dims("pressure p", p, u.cells())?;
     expect_dims("pressure divergence", div, u.cells())?;
     let red = cache.get_or_create(gpu, "ember.pressure.red", PRESSURE, "red")?;
     let black = cache.get_or_create(gpu, "ember.pressure.black", PRESSURE, "black")?;
     // Auto layouts are never shared between pipelines, so each colour needs
     // its own bind group. Both are built once and reused every iteration.
-    let entries = [Bind::Tex(phi), Bind::Tex(div), Bind::Buf(u.any())];
+    let entries = [Bind::Tex(p), Bind::Tex(div), Bind::Buf(u.any())];
     let red_group = bind_group(gpu, &red, &entries)?;
     let black_group = bind_group(gpu, &black, &entries)?;
-    for _ in 0..iterations {
+    // A long loop is split across submissions, so one submission never runs
+    // long enough to trip a GPU watchdog (risk f). Order is unchanged.
+    let per_submit = per_submit.max(1);
+    for i in 0..iterations {
+        if i > 0 && i % per_submit == 0 {
+            batch.flush(gpu)?;
+        }
         batch.dispatch(&red, &red_group, u.cells());
         batch.dispatch(&black, &black_group, u.cells());
     }
     Ok(())
 }
 
-/// `velocity -= ∇phi`, with solid-wall faces forced to zero.
+/// Remove `field`'s mean on the GPU, with no readback: a sum reduction into
+/// `sum` (one slot), then a pass subtracting sum / cells. The bind groups
+/// keep `sum` alive until the batch has run.
+pub fn remove_mean(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    field: &Field,
+    sum: &ReduceTarget,
+) -> Result<(), GpuError> {
+    expect_dims("remove_mean field", field, u.cells())?;
+    reduce(gpu, cache, batch, field, ReduceOp::Sum, sum, 0)?;
+    let pipeline = cache.get_or_create(gpu, "ember.subtract_mean", SUBTRACT_MEAN, "main")?;
+    let group = bind_group(
+        gpu,
+        &pipeline,
+        &[
+            Bind::Tex(field),
+            Bind::Buf(sum.buffer()),
+            Bind::Buf(u.any()),
+        ],
+    )?;
+    batch.dispatch(&pipeline, &group, u.cells());
+    Ok(())
+}
+
+/// The whole pressure solve: `iterations` red-black sweeps on `p`, starting
+/// from whatever `p` holds (the warm start). In a closed domain (every face
+/// a wall) the Neumann system defines p only up to a constant, so p's mean
+/// is removed afterwards and the warm start cannot drift (spec §4.2).
+pub fn solve_pressure(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    p: &Field,
+    div: &Field,
+    iterations: u32,
+) -> Result<(), GpuError> {
+    pressure(
+        gpu,
+        cache,
+        batch,
+        u,
+        p,
+        div,
+        iterations,
+        iterations_per_submit(u.cells()),
+    )?;
+    if u.open_mask() == 0 {
+        let sum = ReduceTarget::new(gpu, 1)?;
+        remove_mean(gpu, cache, batch, u, p, &sum)?;
+    }
+    Ok(())
+}
+
+/// `velocity -= h·∇p`, with solid-wall faces forced to zero.
 pub fn subtract_gradient(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
     batch: &mut ComputeBatch,
     u: &Uniforms,
     velocity: &StaggeredField,
-    phi: &Field,
+    p: &Field,
 ) -> Result<(), GpuError> {
     expect_velocity("subtract_gradient", velocity, u)?;
-    expect_dims("subtract_gradient phi", phi, u.cells())?;
+    expect_dims("subtract_gradient p", p, u.cells())?;
     let pipeline = cache.get_or_create(gpu, "ember.gradient", GRADIENT, "main")?;
     for axis in Axis::ALL {
         let face = velocity.face(axis);
         let group = bind_group(
             gpu,
             &pipeline,
-            &[Bind::Tex(face), Bind::Tex(phi), Bind::Buf(u.axis(axis))],
+            &[Bind::Tex(face), Bind::Tex(p), Bind::Buf(u.axis(axis))],
         )?;
         batch.dispatch(&pipeline, &group, face.dims());
     }

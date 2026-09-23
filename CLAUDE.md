@@ -15,9 +15,14 @@ The suite is being built product by product. **Core v1** is merged. **Ember**
 persistent state, a timeline with a frame cache, staggered vector fields, and
 multi-consumer graph outputs. Piece 2 is split at a speed gate. **2a** is
 complete: the `elements-ember` crate, a GPU smoke solver that passed the 128³
-gate at 34 ms a step with 160 pressure iterations. **2b** is next: vorticity,
-dissipation, colliders, CFL substepping, quality presets and the Mantaflow
-benchmark. Its known risks are listed in §6 of the piece 2 spec.
+gate at 34 ms a step with 160 pressure iterations. **2b** is split into three
+cycles. **2b-1**, solver correctness, is complete: CFL substeps, RK2 +
+MacCormack advection, vorticity confinement, dissipation, per-face boundaries,
+and the `preview` and `final` presets (`docs/bench/presets.md`). Preview runs
+one CFL-clamped substep at about 92 ms a 128³ frame; why that is so far above
+2a's 34 ms is open risk (j) in §6 of the piece 2 spec. **2b-2**, scene content
+(emitters, colliders, wind, flame), is next. **2b-3**, the Mantaflow benchmark,
+follows it.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -26,7 +31,9 @@ benchmark. Its known risks are listed in §6 of the piece 2 spec.
 - Ember piece 1 plan: `docs/superpowers/plans/2026-09-21-ember-core-sim-foundations.md`
 - Ember piece 2 spec: `docs/superpowers/specs/2026-09-21-ember-solver-design.md`
 - Ember piece 2a plan: `docs/superpowers/plans/2026-09-22-ember-solver-2a.md`
-- Speed gate and iteration sweep: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`
+- Ember piece 2b-1 spec: `docs/superpowers/specs/2026-09-22-ember-solver-2b1-design.md`
+- Ember piece 2b-1 plan: `docs/superpowers/plans/2026-09-22-ember-solver-2b1.md`
+- Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
 **Read the progress ledger before starting work.** It records which tasks of
@@ -47,6 +54,7 @@ just blender-test # Blender integration test; finds the macOS app bundle
 just golden       # regenerate golden files (review the PNG by eye first)
 just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
 just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
+just bench-presets # the preview preset's substep cap; minutes, real GPU, not in check
 ```
 
 Single test: `cargo nextest run -p elements-core --test noise` (a test *file*),

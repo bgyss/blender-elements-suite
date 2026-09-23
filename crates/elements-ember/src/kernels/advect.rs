@@ -1,78 +1,109 @@
-//! Semi-Lagrangian advection (stages 3 and 5).
+//! Advection (stages 3 and 5): RK2 semi-Lagrangian passes, and MacCormack's
+//! correction (spec §4.1).
 
 use elements_core::gpu::{
-    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
+    Axis, ComputeBatch, Field, FieldDims, GpuContext, GpuError, PipelineCache, StaggeredField,
 };
+use serde::{Deserialize, Serialize};
 
 use super::{Bind, Uniforms, bind_group, expect_dims};
 
-const ADVECT_VELOCITY: &str = concat!(
+const ADVECT: &str = concat!(
     include_str!("shaders/common.wgsl"),
     include_str!("shaders/velocity.wgsl"),
-    include_str!("shaders/advect_velocity.wgsl"),
+    include_str!("shaders/advect.wgsl"),
 );
 
-const ADVECT_SCALAR: &str = concat!(
+const MACCORMACK: &str = concat!(
     include_str!("shaders/common.wgsl"),
     include_str!("shaders/velocity.wgsl"),
-    include_str!("shaders/advect_scalar.wgsl"),
+    include_str!("shaders/maccormack.wgsl"),
 );
 
-/// Advect `src` through itself into `dst`. Solid-wall faces of `dst` are zero.
-pub fn advect_velocity(
-    gpu: &GpuContext,
-    cache: &mut PipelineCache,
-    batch: &mut ComputeBatch,
+/// How the solver advects velocity and scalars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Advection {
+    /// One RK2 semi-Lagrangian pass: cheap, and diffusive.
+    #[serde(rename = "semi_lagrangian")]
+    SemiLagrangian,
+    /// Forward, backward and a clamped correction: sharper, three passes.
+    /// What Blender's Mantaflow gas uses (`order=2`).
+    #[serde(rename = "maccormack")]
+    MacCormack,
+}
+
+/// The grid an advection pass carries. It picks the pass's uniform: its
+/// offset, its dims and, for a scalar, its dissipation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carried {
+    Face(Axis),
+    Density,
+    Temperature,
+}
+
+impl Carried {
+    /// The texel dims of this grid in a domain of `cells`.
+    pub fn dims(self, cells: FieldDims) -> FieldDims {
+        match self {
+            Self::Face(axis) => StaggeredField::face_dims(cells, axis),
+            Self::Density | Self::Temperature => cells,
+        }
+    }
+}
+
+/// One semi-Lagrangian pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// The whole of plain semi-Lagrangian advection, dissipation included.
+    SemiLagrangian,
+    /// MacCormack's forward pass, q̂ = A(q).
+    Forward,
+    /// MacCormack's backward pass, q̃ = A⁻¹(q̂).
+    Backward,
+}
+
+fn check(
+    what: &str,
     u: &Uniforms,
-    src: &StaggeredField,
-    dst: &StaggeredField,
+    carried: Carried,
+    velocity: &StaggeredField,
+    fields: &[&Field],
 ) -> Result<(), GpuError> {
-    if src.cells() != u.cells() || dst.cells() != u.cells() {
+    if velocity.cells() != u.cells() {
         return Err(GpuError::Validation(format!(
-            "advect_velocity: src {:?}, dst {:?}, domain {:?}",
-            src.cells(),
-            dst.cells(),
+            "{what}: velocity {:?}, domain {:?}",
+            velocity.cells(),
             u.cells()
         )));
     }
-    let pipeline = cache.get_or_create(gpu, "ember.advect_velocity", ADVECT_VELOCITY, "main")?;
-    for axis in Axis::ALL {
-        let group = bind_group(
-            gpu,
-            &pipeline,
-            &[
-                Bind::Tex(src.face(Axis::X)),
-                Bind::Tex(src.face(Axis::Y)),
-                Bind::Tex(src.face(Axis::Z)),
-                Bind::Tex(dst.face(axis)),
-                Bind::Buf(u.axis(axis)),
-            ],
-        )?;
-        batch.dispatch(&pipeline, &group, dst.face(axis).dims());
+    let dims = carried.dims(u.cells());
+    for field in fields {
+        expect_dims(what, field, dims)?;
     }
     Ok(())
 }
 
-/// Advect the cell-centred `src` through `velocity` into `dst`.
-pub fn advect_scalar(
+/// Record one pass carrying `src` through `velocity` into `dst`. Solid-wall
+/// faces of a velocity face grid come out zero.
+#[allow(clippy::too_many_arguments)]
+pub fn advect(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
     batch: &mut ComputeBatch,
     u: &Uniforms,
+    carried: Carried,
+    pass: Pass,
     velocity: &StaggeredField,
     src: &Field,
     dst: &Field,
 ) -> Result<(), GpuError> {
-    let cells = u.cells();
-    if velocity.cells() != cells {
-        return Err(GpuError::Validation(format!(
-            "advect_scalar: velocity {:?}, domain {cells:?}",
-            velocity.cells()
-        )));
-    }
-    expect_dims("advect_scalar src", src, cells)?;
-    expect_dims("advect_scalar dst", dst, cells)?;
-    let pipeline = cache.get_or_create(gpu, "ember.advect_scalar", ADVECT_SCALAR, "main")?;
+    check("advect", u, carried, velocity, &[src, dst])?;
+    let (key, entry) = match pass {
+        Pass::SemiLagrangian => ("ember.advect.semi_lagrangian", "semi_lagrangian"),
+        Pass::Forward => ("ember.advect.forward", "forward"),
+        Pass::Backward => ("ember.advect.backward", "backward"),
+    };
+    let pipeline = cache.get_or_create(gpu, key, ADVECT, entry)?;
     let group = bind_group(
         gpu,
         &pipeline,
@@ -82,9 +113,44 @@ pub fn advect_scalar(
             Bind::Tex(velocity.face(Axis::Z)),
             Bind::Tex(src),
             Bind::Tex(dst),
-            Bind::Buf(u.any()),
+            Bind::Buf(u.carried(carried)),
         ],
     )?;
-    batch.dispatch(&pipeline, &group, cells);
+    batch.dispatch(&pipeline, &group, dst.dims());
+    Ok(())
+}
+
+/// Record MacCormack's correction: `dst` = clamp(`fwd` + ½(`orig` − `bwd`)),
+/// times the carried scalar's dissipation.
+#[allow(clippy::too_many_arguments)]
+pub fn maccormack(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    carried: Carried,
+    velocity: &StaggeredField,
+    orig: &Field,
+    fwd: &Field,
+    bwd: &Field,
+    dst: &Field,
+) -> Result<(), GpuError> {
+    check("maccormack", u, carried, velocity, &[orig, fwd, bwd, dst])?;
+    let pipeline = cache.get_or_create(gpu, "ember.maccormack", MACCORMACK, "main")?;
+    let group = bind_group(
+        gpu,
+        &pipeline,
+        &[
+            Bind::Tex(velocity.face(Axis::X)),
+            Bind::Tex(velocity.face(Axis::Y)),
+            Bind::Tex(velocity.face(Axis::Z)),
+            Bind::Tex(orig),
+            Bind::Tex(fwd),
+            Bind::Tex(bwd),
+            Bind::Tex(dst),
+            Bind::Buf(u.carried(carried)),
+        ],
+    )?;
+    batch.dispatch(&pipeline, &group, dst.dims());
     Ok(())
 }

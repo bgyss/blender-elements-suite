@@ -4,6 +4,8 @@
 **Status:** Piece 2a (§1–4) is complete. The 128³ gate passed, and the default is
 160 pressure iterations (`docs/bench/speed-gate.md`). §5 is the benchmark design,
 whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
+Piece 2b-1 (solver correctness) is complete; see `2026-09-22-ember-solver-2b1-design.md`.
+Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e), the open part of (g), and (j) remain.
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
 ## 1. Goal and split
@@ -18,7 +20,9 @@ pressure projection and scalar advection; `ember.sphere_emitter`; the
 still-domain, divergence-free, buoyant-blob and determinism validation scenes;
 the 128³ speed gate and its recorded decision.
 
-**2b — after the gate (designed later, with the gate's numbers):** vorticity
+**2b — after the gate:** split into three cycles (user decision, 2026-09-22):
+2b-1 solver correctness (`2026-09-22-ember-solver-2b1-design.md`), 2b-2 scene
+content, 2b-3 the Mantaflow benchmark. The original list: vorticity
 confinement, dissipation, flame, box and noise-modulated emitters, sphere and
 box colliders, animatable transforms, CFL substepping, quality presets, the
 collider validation scene, per-face boundary settings, and the Mantaflow
@@ -346,33 +350,39 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 
 ## 6. Risks carried into piece 2b
 
-Found by piece 2a's whole-branch review. (a) is resolved and (g) mostly;
-(b) and the open remainder of (g) should be the first things 2b's plan
-addresses.
+Found by piece 2a's whole-branch review. (a) and (i) were resolved in 2a, and
+(g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). Still open: (e), the open
+part of (g), and (j).
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
   256 MiB limit.
-- **(b) The warm start assumes a fixed `h`.** The pressure slot stores
-  φ = h·p. CFL substepping changes `h`, so it must rescale the stored φ by
-  h_new/h_old before each solve, or store p and multiply by `h` in the kernels.
-- **(c) There is no CFL limit and no dissipation.** Sampling is bounded, so
-  nothing blows up, but temperature and buoyancy accumulate near a constant
-  emitter and the backtrace is a single Euler step. At 128³ every 1 m/s is
-  about 2.7 cells per step. 2b needs CFL substeps, an RK2 backtrace and
-  dissipation.
-- **(d) The open top admits inflow.** A backtrace that leaves through the top
-  clamps to the top layer instead of taking the ambient value, so smoke is
-  drawn back in. When per-face boundaries arrive, a fully closed domain makes
-  the Neumann system singular and needs mean removal or pinning.
+- **(b) Resolved (45a8e1f).** The pressure slot now stores p and the solve
+  is ∇²p = div/h, so the warm start survives a change of `h`. As found: the
+  slot stored φ = h·p, so CFL substepping, which changes `h`, would have had to
+  rescale the stored φ by h_new/h_old before each solve.
+- **(c) Resolved (3ef9ccd and d86071e).** Substeps are chosen each frame by
+  CFL, capped at `max_substeps` (3ef9ccd), and advection is MacCormack over an
+  RK2 backtrace with density and temperature dissipation (d86071e). As found:
+  there was no CFL limit and no dissipation. Sampling is bounded, so nothing
+  blew up, but temperature and buoyancy accumulated near a constant emitter and
+  the backtrace was a single Euler step. At 128³ every 1 m/s is about 2.7 cells
+  per step.
+- **(d) Resolved (45a8e1f and 93d6c47).** Scalars read the ambient value 0
+  beyond an open face (45a8e1f), and a fully closed domain removes p's mean
+  after each solve (93d6c47). As found: a backtrace that left through the open
+  top clamped to the top layer instead of taking the ambient value, so smoke
+  was drawn back in, and per-face boundaries would make a fully closed domain's
+  Neumann system singular.
 - **(e) Pressure stays unconverged at low frequencies.** The residual falls
   about as N^-1.5 (`docs/bench/iteration-sweep.md`), so expect plume shape to
   differ from Mantaflow's PCG. Multigrid is the stretch goal, and the warm start
   is load-bearing.
-- **(f) Long single submissions.** One substep is one submission, up to 2000
-  dispatches. At 256³–512³ with offline iteration counts that can run for
-  seconds and trip GPU watchdogs, which surface as `DeviceLost`. Split
-  submissions every K iterations on large grids.
+- **(f) Resolved (d0cc411).** The pressure loop is split across submissions
+  every `iterations_per_submit(cells)` iterations, bit-identical to one
+  submission. As found: one substep was one submission, up to 2000 dispatches,
+  which at 256³–512³ with offline iteration counts could run for seconds and
+  trip GPU watchdogs, surfacing as `DeviceLost`.
 - **(g) Resolved, partly open (37c01a9 and 02ee266).**
   `GpuContext::scoped` now pushes OutOfMemory, Internal and Validation scopes,
   so an out-of-memory error from texture creation is reported as
@@ -389,12 +399,41 @@ addresses.
   set when a document is validated was dropped from the hardening slice by the
   user's choice to capture the error rather than predict it, so it remains
   open.
-- **(h) Unused outputs are copied every frame.** All three solver outputs are
-  duplicated even when only density is consumed: free at 128³, real bandwidth
-  at 512³.
+- **(h) Resolved (23e8d6e).** The solver now copies only the outputs
+  `EvalCtx::output_wanted` reports as read, and leaves a placeholder in the
+  rest. As found: all three solver outputs were duplicated every frame even
+  when only density was consumed: free at 128³, real bandwidth at 512³.
 - **(i) Resolved (8d8bc64).** `crates/elements-ember/tests/solver.rs`
   adds `one_frame_adds_each_emitted_quantity_to_its_own_output`, which drives
   the graph through both an emitter-straight-to-output probe and a
   through-the-solver probe and asserts each of density and temperature
   matches rate × dt to 1e-5. Proved to fail by swapping the solver's source
   fields in `SmokeSolver::step`.
+- **(j) Preview frame cost.** A 128³ preview frame costs about 92 ms with
+  MacCormack, RK2 and the CFL readback, against 2a's 34 ms per step at the same
+  N (`docs/bench/presets.md`). That leaves about 8 ms of headroom at one
+  substep, with CFL clamped on every frame. The increase is unexplained and
+  should be profiled before 2b-3.
+
+  2b-1's final review narrowed it down. The preset sweep is linear in the
+  substep count, at about 90.5 ms per substep plus about 1 ms per frame
+  (cap 1 = 91.77 ms, cap 2 = 182.77 ms, cap 3 = 272.31 ms). The per-frame
+  work, the CFL readback and the output copies, is therefore not the cause:
+  the regression is inside the substep. The likely causes, most likely first:
+
+  1. `pressure.wgsl`'s runtime axis loop, with dynamic vector indexing,
+     `is_open` reads of the uniform, and a division per cell. naga's Metal
+     backend adds loop bounding to every loop (`force_loop_bounding`), which
+     tends to block unrolling. The kernel runs in 320 dispatches per substep
+     at N = 160.
+  2. The sampling path's runtime loops and the local `array<f32, 8>` in
+     `texel()` and `corners()`.
+  3. MacCormack plus RK2, which raise texel reads per grid cell by about 5×,
+     including the forward backtrace the correction pass recomputes.
+
+  The cheap way to tell them apart: `just bench-sweep 20,160` (the
+  recipe sets `SPEED_GATE_ITERATIONS` itself, so an outer value is
+  overridden; it rewrites `docs/bench/iteration-sweep.md`) gives the
+  per-iteration slope, which isolates (1), and one frame with
+  `advection: semi_lagrangian` isolates (3). A fix may let preview afford 2
+  substeps, which would reopen the preset decision in `docs/bench/presets.md`.

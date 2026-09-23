@@ -1,7 +1,8 @@
 //! `ember.smoke_solver`: a dense-grid smoke solver (spec §2.4, §3).
 //!
-//! Per substep: emit, buoyancy, advect velocity, project, advect scalars.
-//! Vorticity confinement and dissipation arrive in piece 2b.
+//! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
+//! project, and advect scalars with dissipation. Each frame first measures
+//! the fastest face and picks its substep count by CFL.
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError,
@@ -10,7 +11,9 @@ use elements_core::gpu::{
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 use serde::{Deserialize, Serialize};
 
-use crate::kernels::{self, StepConstants, Uniforms};
+use crate::boundaries::Boundaries;
+use crate::cfl;
+use crate::kernels::{self, Advection, Carried, Pass, StepConstants, Uniforms};
 use crate::params;
 
 pub const KIND: &str = "ember.smoke_solver";
@@ -18,43 +21,206 @@ pub const KIND: &str = "ember.smoke_solver";
 const VELOCITY: &str = "velocity";
 const DENSITY: &str = "density";
 const TEMPERATURE: &str = "temperature";
-/// Holds φ = h·p, the pressure scaled by the substep, not p itself.
+/// Holds p. The warm start stays valid when h changes (spec §4.3).
 const PRESSURE: &str = "pressure";
 const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
 
 const MAX_SUBSTEPS: u32 = 16;
 const MAX_PRESSURE_ITERATIONS: u32 = 1000;
+const MAX_CFL: f32 = 10.0;
 
-fn default_substeps() -> u32 {
-    1
+/// A quality preset (spec §6). It fills every field a document leaves unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Quality {
+    /// Interactive: 128³ within 100 ms a frame.
+    #[default]
+    Preview,
+    /// Offline bakes: no time budget.
+    Final,
 }
 
-/// Chosen by the user from the speed gate (`docs/bench/speed-gate.md`): 34 ms a
-/// step at 128³, leaving headroom for 2b's stages and the handoff to Blender.
-fn default_pressure_iterations() -> u32 {
-    160
+impl Quality {
+    /// The preset's full parameter set.
+    pub fn params(self) -> SolverParams {
+        let (pressure_iterations, max_substeps) = match self {
+            // One substep: the largest cap whose 128³ frame fits in 100 ms
+            // (spec §6), decided 2026-09-22 in `docs/bench/presets.md`.
+            Self::Preview => (160, 1),
+            // 480 iterations: ratio 0.0076 in `docs/bench/iteration-sweep.md`.
+            Self::Final => (480, 8),
+        };
+        SolverParams {
+            max_substeps,
+            cfl: 1.0,
+            pressure_iterations,
+            advection: Advection::MacCormack,
+            vorticity: 0.0,
+            density_dissipation: 0.0,
+            temperature_dissipation: 0.0,
+            buoyancy_density: 0.0,
+            // Provisional until 2b-3 maps parameters to Mantaflow's.
+            buoyancy_temperature: 1.0,
+            boundaries: Boundaries::default(),
+        }
+    }
 }
 
-/// Provisional until 2b maps parameters to Mantaflow's.
-fn default_buoyancy_temperature() -> f32 {
-    1.0
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `ember.smoke_solver`'s parameters, resolved: every field has a value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SolverParams {
-    /// Fixed substeps per frame. CFL-driven substepping is 2b.
-    #[serde(default = "default_substeps")]
-    pub substeps: u32,
+    /// Cap on CFL substeps per frame (spec §3).
+    pub max_substeps: u32,
+    /// Target maximum cells travelled per substep.
+    pub cfl: f32,
     /// Red-black Gauss–Seidel iterations per substep.
-    #[serde(default = "default_pressure_iterations")]
     pub pressure_iterations: u32,
+    /// How velocity and scalars are advected (spec §4.1).
+    pub advection: Advection,
+    /// Vorticity confinement ε, 1/s; 0 turns it off (spec §4.4).
+    pub vorticity: f32,
+    /// Exponential decay of density, 1/s (spec §4.5).
+    pub density_dissipation: f32,
+    /// Exponential decay of temperature, 1/s.
+    pub temperature_dissipation: f32,
     /// α: downward acceleration per unit density, m/s².
-    #[serde(default)]
     pub buoyancy_density: f32,
     /// β: upward acceleration per unit temperature, m/s².
-    #[serde(default = "default_buoyancy_temperature")]
     pub buoyancy_temperature: f32,
+    /// Which domain faces are open; the rest are walls (spec §4.2).
+    pub boundaries: Boundaries,
+}
+
+impl Default for SolverParams {
+    fn default() -> Self {
+        Quality::default().params()
+    }
+}
+
+/// A document's parameters as written. Every field is optional, and
+/// `resolve_params` fills the gaps from the preset.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocParams {
+    quality: Option<Quality>,
+    /// 2a's name for `max_substeps`, still accepted.
+    substeps: Option<u32>,
+    max_substeps: Option<u32>,
+    cfl: Option<f32>,
+    pressure_iterations: Option<u32>,
+    advection: Option<Advection>,
+    vorticity: Option<f32>,
+    density_dissipation: Option<f32>,
+    temperature_dissipation: Option<f32>,
+    buoyancy_density: Option<f32>,
+    buoyancy_temperature: Option<f32>,
+    boundaries: Option<Boundaries>,
+}
+
+/// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
+/// unset fields from the preset, and validate the result (spec §2).
+pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocError> {
+    // `deny_unknown_fields` rejects misspelt keys; an absent `params` is `null`.
+    let doc: DocParams = if params.is_null() {
+        params::parse(KIND, &serde_json::json!({}))?
+    } else {
+        params::parse(KIND, params)?
+    };
+    if doc.substeps.is_some() && doc.max_substeps.is_some() {
+        return Err(params::bad(
+            KIND,
+            "set max_substeps or its alias substeps, not both",
+        ));
+    }
+    let preset = doc.quality.unwrap_or_default().params();
+    let p = SolverParams {
+        max_substeps: doc
+            .max_substeps
+            .or(doc.substeps)
+            .unwrap_or(preset.max_substeps),
+        cfl: doc.cfl.unwrap_or(preset.cfl),
+        pressure_iterations: doc
+            .pressure_iterations
+            .unwrap_or(preset.pressure_iterations),
+        advection: doc.advection.unwrap_or(preset.advection),
+        vorticity: doc.vorticity.unwrap_or(preset.vorticity),
+        density_dissipation: doc
+            .density_dissipation
+            .unwrap_or(preset.density_dissipation),
+        temperature_dissipation: doc
+            .temperature_dissipation
+            .unwrap_or(preset.temperature_dissipation),
+        buoyancy_density: doc.buoyancy_density.unwrap_or(preset.buoyancy_density),
+        buoyancy_temperature: doc
+            .buoyancy_temperature
+            .unwrap_or(preset.buoyancy_temperature),
+        boundaries: doc.boundaries.unwrap_or(preset.boundaries),
+    };
+    validate(&p)?;
+    Ok(p)
+}
+
+fn validate(p: &SolverParams) -> Result<(), DocError> {
+    if !(1..=MAX_SUBSTEPS).contains(&p.max_substeps) {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "max_substeps must be 1..={MAX_SUBSTEPS}, got {}",
+                p.max_substeps
+            ),
+        ));
+    }
+    if !(1..=MAX_PRESSURE_ITERATIONS).contains(&p.pressure_iterations) {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "pressure_iterations must be 1..={MAX_PRESSURE_ITERATIONS}, got {}",
+                p.pressure_iterations
+            ),
+        ));
+    }
+    params::finite(KIND, "cfl", &[p.cfl])?;
+    if !(p.cfl > 0.0 && p.cfl <= MAX_CFL) {
+        return Err(params::bad(
+            KIND,
+            format!("cfl must be in (0, {MAX_CFL}], got {}", p.cfl),
+        ));
+    }
+    params::finite(
+        KIND,
+        "buoyancy",
+        &[p.buoyancy_density, p.buoyancy_temperature],
+    )?;
+    let rates = [
+        p.vorticity,
+        p.density_dissipation,
+        p.temperature_dissipation,
+    ];
+    params::finite(KIND, "vorticity and dissipation", &rates)?;
+    if rates.iter().any(|&r| r < 0.0) {
+        return Err(params::bad(
+            KIND,
+            "vorticity and dissipation rates must be at least 0",
+        ));
+    }
+    Ok(())
+}
+
+impl SolverParams {
+    /// Kernel constants for one substep of length `h`, in a domain of
+    /// `cells` with voxel edge `dx`.
+    pub fn step_constants(&self, cells: FieldDims, h: f32, dx: f32) -> StepConstants {
+        StepConstants {
+            alpha: self.buoyancy_density,
+            beta: self.buoyancy_temperature,
+            open_mask: self.boundaries.open_mask(),
+            advection: self.advection,
+            density_dissipation: self.density_dissipation,
+            temperature_dissipation: self.temperature_dissipation,
+            vorticity: self.vorticity,
+            ..StepConstants::new(cells, h, dx)
+        }
+    }
 }
 
 /// Everything the solver carries from one step to the next.
@@ -62,7 +228,7 @@ pub struct SolverState {
     pub velocity: StaggeredField,
     pub density: Field,
     pub temperature: Field,
-    /// φ = h·p, kept as the next solve's warm start.
+    /// p, kept as the next solve's warm start.
     pub pressure: Field,
 }
 
@@ -135,6 +301,8 @@ pub struct Substep {
     uniforms: Uniforms,
     batch: ComputeBatch,
     retired: Vec<Field>,
+    advection: Advection,
+    vorticity: bool,
 }
 
 impl Substep {
@@ -143,10 +311,14 @@ impl Substep {
             uniforms: Uniforms::new(gpu, constants)?,
             batch: ComputeBatch::new(),
             retired: Vec::new(),
+            advection: constants.advection,
+            vorticity: constants.vorticity > 0.0,
         })
     }
 
-    /// Stages 1–3: emit, buoyancy, advect velocity.
+    /// Everything before projection, four passes: emit, buoyancy, vorticity
+    /// confinement, advect velocity. That is stages 1–3 of the piece 2
+    /// spec's table, with 2b-1's confinement between forces and advection.
     pub fn pre_projection(
         &mut self,
         gpu: &GpuContext,
@@ -181,16 +353,64 @@ impl Substep {
             &state.density,
             &state.temperature,
         )?;
-        let advected = pool.acquire_staggered_uninit(gpu, u.cells())?;
-        if let Err(e) =
-            kernels::advect_velocity(gpu, cache, &mut self.batch, u, &state.velocity, &advected)
-        {
-            self.retired.extend(advected.into_faces());
-            return Err(e);
+        if self.vorticity {
+            self.confine_vorticity(gpu, cache, pool, state)?;
         }
+        let cells = self.uniforms.cells();
+        let mut faces = Vec::with_capacity(3);
+        for axis in Axis::ALL {
+            match self.advect_grid(
+                gpu,
+                cache,
+                pool,
+                Carried::Face(axis),
+                &state.velocity,
+                state.velocity.face(axis),
+            ) {
+                Ok(face) => faces.push(face),
+                Err(e) => {
+                    self.retired.extend(faces);
+                    return Err(e);
+                }
+            }
+        }
+        let [x, y, z]: [Field; 3] = match faces.try_into() {
+            Ok(array) => array,
+            Err(_) => unreachable!("exactly three faces were advected"),
+        };
+        let advected = StaggeredField::from_faces(cells, [x, y, z])?;
         let old = std::mem::replace(&mut state.velocity, advected);
         self.retired.extend(old.into_faces());
         Ok(())
+    }
+
+    /// Vorticity confinement onto the velocity, through four pooled scratch
+    /// fields for ω and |ω|.
+    fn confine_vorticity(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        state: &SolverState,
+    ) -> Result<(), GpuError> {
+        let cells = self.uniforms.cells();
+        let mut omega = Vec::with_capacity(4);
+        for _ in 0..4 {
+            match pool.acquire(gpu, cells, FieldFormat::R32Float) {
+                Ok(field) => omega.push(field),
+                Err(e) => {
+                    self.retired.extend(omega);
+                    return Err(e);
+                }
+            }
+        }
+        let refs = [&omega[0], &omega[1], &omega[2], &omega[3]];
+        let u = &self.uniforms;
+        let recorded = kernels::curl(gpu, cache, &mut self.batch, u, &state.velocity, refs)
+            .and_then(|()| kernels::confine(gpu, cache, &mut self.batch, u, &state.velocity, refs));
+        // The batch may reference them whether or not recording finished.
+        self.retired.extend(omega);
+        recorded
     }
 
     /// Stage 4: make the velocity divergence-free, warm-starting from `state.pressure`.
@@ -206,7 +426,7 @@ impl Substep {
         let div = pool.acquire(gpu, u.cells(), FieldFormat::R32Float)?;
         let recorded = kernels::divergence(gpu, cache, &mut self.batch, u, &state.velocity, &div)
             .and_then(|()| {
-                kernels::pressure(
+                kernels::solve_pressure(
                     gpu,
                     cache,
                     &mut self.batch,
@@ -239,33 +459,129 @@ impl Substep {
         pool: &mut FieldPool,
         state: &mut SolverState,
     ) -> Result<(), GpuError> {
-        self.advect_one(gpu, cache, pool, &state.velocity, &mut state.density)?;
-        self.advect_one(gpu, cache, pool, &state.velocity, &mut state.temperature)
+        let density = self.advect_grid(
+            gpu,
+            cache,
+            pool,
+            Carried::Density,
+            &state.velocity,
+            &state.density,
+        )?;
+        self.retired
+            .push(std::mem::replace(&mut state.density, density));
+        let temperature = self.advect_grid(
+            gpu,
+            cache,
+            pool,
+            Carried::Temperature,
+            &state.velocity,
+            &state.temperature,
+        )?;
+        self.retired
+            .push(std::mem::replace(&mut state.temperature, temperature));
+        Ok(())
     }
 
-    fn advect_one(
+    /// `src`, carried through `velocity` into a fresh pooled field. Scratch
+    /// fields, and the new field if recording fails, are retired.
+    fn advect_grid(
         &mut self,
         gpu: &GpuContext,
         cache: &mut PipelineCache,
         pool: &mut FieldPool,
+        carried: Carried,
         velocity: &StaggeredField,
-        field: &mut Field,
+        src: &Field,
+    ) -> Result<Field, GpuError> {
+        let dst = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
+        let recorded = match self.advection {
+            Advection::SemiLagrangian => kernels::advect(
+                gpu,
+                cache,
+                &mut self.batch,
+                &self.uniforms,
+                carried,
+                Pass::SemiLagrangian,
+                velocity,
+                src,
+                &dst,
+            ),
+            Advection::MacCormack => {
+                self.maccormack(gpu, cache, pool, carried, velocity, src, &dst)
+            }
+        };
+        match recorded {
+            Ok(()) => Ok(dst),
+            Err(e) => {
+                self.retired.push(dst);
+                Err(e)
+            }
+        }
+    }
+
+    /// Record MacCormack's three passes from `src` into `dst`.
+    #[allow(clippy::too_many_arguments)]
+    fn maccormack(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        carried: Carried,
+        velocity: &StaggeredField,
+        src: &Field,
+        dst: &Field,
     ) -> Result<(), GpuError> {
-        let dst = pool.acquire(gpu, field.dims(), FieldFormat::R32Float)?;
-        if let Err(e) = kernels::advect_scalar(
+        let fwd = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
+        let bwd = match pool.acquire(gpu, src.dims(), FieldFormat::R32Float) {
+            Ok(field) => field,
+            Err(e) => {
+                self.retired.push(fwd);
+                return Err(e);
+            }
+        };
+        let u = &self.uniforms;
+        let recorded = kernels::advect(
             gpu,
             cache,
             &mut self.batch,
-            &self.uniforms,
+            u,
+            carried,
+            Pass::Forward,
             velocity,
-            field,
-            &dst,
-        ) {
-            self.retired.push(dst);
-            return Err(e);
-        }
-        self.retired.push(std::mem::replace(field, dst));
-        Ok(())
+            src,
+            &fwd,
+        )
+        .and_then(|()| {
+            kernels::advect(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                carried,
+                Pass::Backward,
+                velocity,
+                &fwd,
+                &bwd,
+            )
+        })
+        .and_then(|()| {
+            kernels::maccormack(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                carried,
+                velocity,
+                src,
+                &fwd,
+                &bwd,
+                dst,
+            )
+        });
+        // The batch may reference both whether or not recording finished.
+        self.retired.push(fwd);
+        self.retired.push(bwd);
+        recorded
     }
 
     /// Run everything recorded, then return replaced fields to the pool.
@@ -277,11 +593,17 @@ impl Substep {
         result
     }
 
-    /// Discard everything recorded without running it.
+    /// Discard everything still recorded without running it.
     ///
-    /// The state passed to the stages may now hold fields that were never
-    /// written, so the caller must discard the state too.
-    pub fn abandon(self, pool: &mut FieldPool) {
+    /// Work already flushed may still be reading retired fields, so this
+    /// waits for the GPU before releasing them (spec §5). The state passed to
+    /// the stages may now hold fields that were never written, so the caller
+    /// must discard the state too.
+    pub fn abandon(self, gpu: &GpuContext, pool: &mut FieldPool) {
+        if self.batch.submitted_any() {
+            // The step has already failed; a second error adds nothing.
+            let _ = gpu.wait();
+        }
         for field in self.retired {
             pool.release(field);
         }
@@ -306,7 +628,7 @@ pub fn substep(
     match recorded {
         Ok(()) => step.submit(gpu, pool),
         Err(e) => {
-            step.abandon(pool);
+            step.abandon(gpu, pool);
             Err(e)
         }
     }
@@ -399,30 +721,10 @@ impl SmokeSolver {
         ctx.release(temperature_source);
         stepped?;
 
-        // The outputs are copies: the state stays in the store for the next frame.
-        ctx.with_gpu_pool(|gpu, _, pool| {
-            let density = pool.duplicate(gpu, &state.density)?;
-            let temperature = match pool.duplicate(gpu, &state.temperature) {
-                Ok(field) => field,
-                Err(e) => {
-                    pool.release(density);
-                    return Err(e);
-                }
-            };
-            let velocity = match duplicate_velocity(gpu, pool, &state.velocity) {
-                Ok(velocity) => velocity,
-                Err(e) => {
-                    pool.release(density);
-                    pool.release(temperature);
-                    return Err(e);
-                }
-            };
-            Ok(vec![
-                Value::Field(density),
-                Value::Field(temperature),
-                Value::VectorField(velocity),
-            ])
-        })
+        // The outputs are copies: the state stays in the store for the next
+        // frame. Outputs nobody reads are not copied at all.
+        let wanted: [bool; 3] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
+        ctx.with_gpu_pool(|gpu, _, pool| copy_outputs(gpu, pool, state, wanted))
     }
 
     fn step<'a>(
@@ -444,30 +746,23 @@ impl SmokeSolver {
             density: field(density_source, 0)?,
             temperature: field(temperature_source, 1)?,
         };
-        let SolverParams {
-            substeps,
-            pressure_iterations,
-            buoyancy_density,
-            buoyancy_temperature,
-        } = self.params;
-        let constants = StepConstants {
-            cells: ctx.dims(),
-            h: (ctx.time().dt / substeps as f64) as f32,
-            dx: ctx.voxel_size(),
-            alpha: buoyancy_density,
-            beta: buoyancy_temperature,
-        };
+        // Spec §3: one measurement per frame, from the entering state, so
+        // the count is deterministic however the frame is reached.
+        let dt = ctx.time().dt;
+        let dx = ctx.voxel_size();
+        let speed = ctx.with_gpu(|gpu, cache| cfl::measure_speed(gpu, cache, &state.velocity))?;
+        let plan = cfl::plan_substeps(speed, dt, dx, self.params.cfl, self.params.max_substeps)
+            .ok_or(NodeError::SolverDiverged { node })?;
+        if plan.clamped {
+            ctx.count_cfl_clamped();
+        }
+        let constants =
+            self.params
+                .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx);
+        let iterations = self.params.pressure_iterations;
         ctx.with_gpu_pool(|gpu, cache, pool| {
-            for _ in 0..substeps {
-                substep(
-                    gpu,
-                    cache,
-                    pool,
-                    state,
-                    sources,
-                    &constants,
-                    pressure_iterations,
-                )?;
+            for _ in 0..plan.count {
+                substep(gpu, cache, pool, state, sources, &constants, iterations)?;
             }
             Ok(())
         })
@@ -515,36 +810,42 @@ impl Node for SmokeSolver {
 }
 
 pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
-    // `deny_unknown_fields` rejects misspelt keys; an absent `params` is `null`.
-    let params: SolverParams = if params.is_null() {
-        params::parse(KIND, &serde_json::json!({}))?
-    } else {
-        params::parse(KIND, params)?
-    };
-    if !(1..=MAX_SUBSTEPS).contains(&params.substeps) {
-        return Err(params::bad(
-            KIND,
-            format!(
-                "substeps must be 1..={MAX_SUBSTEPS}, got {}",
-                params.substeps
-            ),
-        ));
+    Ok(Box::new(SmokeSolver {
+        params: resolve_params(params)?,
+    }))
+}
+
+/// Pooled copies of the wanted outputs, in socket order, with a
+/// `Value::Scalar(0.0)` placeholder in each unwanted slot (see
+/// `EvalCtx::output_wanted`). On failure, copies already made go back.
+fn copy_outputs(
+    gpu: &GpuContext,
+    pool: &mut FieldPool,
+    state: &SolverState,
+    wanted: [bool; 3],
+) -> Result<Vec<Value>, GpuError> {
+    let mut outputs: Vec<Value> = Vec::with_capacity(3);
+    for (index, wanted) in wanted.into_iter().enumerate() {
+        let copied = if !wanted {
+            Ok(Value::Scalar(0.0))
+        } else {
+            match index {
+                0 => pool.duplicate(gpu, &state.density).map(Value::Field),
+                1 => pool.duplicate(gpu, &state.temperature).map(Value::Field),
+                _ => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
+            }
+        };
+        match copied {
+            Ok(value) => outputs.push(value),
+            Err(e) => {
+                for value in outputs {
+                    value.release_to(pool);
+                }
+                return Err(e);
+            }
+        }
     }
-    if !(1..=MAX_PRESSURE_ITERATIONS).contains(&params.pressure_iterations) {
-        return Err(params::bad(
-            KIND,
-            format!(
-                "pressure_iterations must be 1..={MAX_PRESSURE_ITERATIONS}, got {}",
-                params.pressure_iterations
-            ),
-        ));
-    }
-    params::finite(
-        KIND,
-        "buoyancy",
-        &[params.buoyancy_density, params.buoyancy_temperature],
-    )?;
-    Ok(Box::new(SmokeSolver { params }))
+    Ok(outputs)
 }
 
 /// A pooled copy of all three faces. On failure, faces already copied go back to the pool.
