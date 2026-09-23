@@ -40,6 +40,17 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(
         serde_json::json!({ "boundaries": { "-x": "porous" } })
     ));
+    assert!(!rejected(
+        serde_json::json!({ "advection": "semi_lagrangian" })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "advection": "maccormack", "density_dissipation": 0.5 })
+    ));
+    assert!(rejected(serde_json::json!({ "advection": "bfecc" })));
+    assert!(rejected(serde_json::json!({ "density_dissipation": -1.0 })));
+    assert!(rejected(
+        serde_json::json!({ "temperature_dissipation": 1e39 })
+    ));
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.

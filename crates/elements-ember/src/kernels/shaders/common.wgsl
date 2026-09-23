@@ -12,7 +12,7 @@ struct Params {
     alpha: f32,          // buoyancy per unit density (sinks), m/s²
     beta: f32,           // buoyancy per unit temperature (rises), m/s²
     open_mask: u32,      // bit 2·axis + side is set when that domain face is open
-    _pad0: u32,
+    decay: f32,          // exp(−rate·h) for the scalar a pass carries; 1 otherwise
 };
 
 // `axis` for a cell-centred grid.

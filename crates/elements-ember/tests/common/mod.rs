@@ -159,62 +159,116 @@ pub fn velocity_at(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3]) -> [f32
     v
 }
 
-fn backtrace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], h_inv_dx: f32) -> [f32; 3] {
+/// Mirrors `backtrace` in `velocity.wgsl`: an RK2 midpoint step. `k` is
+/// direction · h / dx; a negative `k` traces forward in time.
+fn backtrace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], k: f32) -> [f32; 3] {
     let v = velocity_at(faces, cells, x);
-    [
-        x[0] - v[0] * h_inv_dx,
-        x[1] - v[1] * h_inv_dx,
-        x[2] - v[2] * h_inv_dx,
-    ]
+    let mid = [
+        x[0] - 0.5 * k * v[0],
+        x[1] - 0.5 * k * v[1],
+        x[2] - 0.5 * k * v[2],
+    ];
+    let v = velocity_at(faces, cells, mid);
+    [x[0] - k * v[0], x[1] - k * v[1], x[2] - k * v[2]]
 }
 
-/// Mirrors `advect_scalar.wgsl`.
-pub fn cpu_advect_scalar(
+/// The grid an advection pass carries.
+#[derive(Clone, Copy, Debug)]
+pub enum Grid {
+    Face(usize),
+    Cell,
+}
+
+fn grid_dims(cells: FieldDims, grid: Grid) -> FieldDims {
+    match grid {
+        Grid::Face(a) => face_dims(cells, a),
+        Grid::Cell => cells,
+    }
+}
+
+fn grid_offset(grid: Grid) -> [f32; 3] {
+    match grid {
+        Grid::Face(a) => face_offset(a),
+        Grid::Cell => [0.5; 3],
+    }
+}
+
+fn grid_open(grid: Grid, mask: u32) -> Option<u32> {
+    match grid {
+        Grid::Face(_) => None,
+        Grid::Cell => Some(mask),
+    }
+}
+
+fn is_wall_texel(cells: FieldDims, mask: u32, grid: Grid, ijk: [u32; 3]) -> bool {
+    match grid {
+        Grid::Face(a) => is_wall_in(cells, mask, a, ijk[a]),
+        Grid::Cell => false,
+    }
+}
+
+/// Mirrors `pass_over` in `advect.wgsl`.
+pub fn cpu_advect(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
     mask: u32,
+    grid: Grid,
     src: &[f32],
-    h_inv_dx: f32,
+    k: f32,
+    decay: f32,
 ) -> Vec<f32> {
-    let mut out = vec![0.0; cells.voxel_count()];
-    for k in 0..cells.z {
-        for j in 0..cells.y {
-            for i in 0..cells.x {
-                let x = [i as f32 + 0.5, j as f32 + 0.5, k as f32 + 0.5];
-                let b = backtrace(faces, cells, x, h_inv_dx);
-                out[index(cells, i, j, k)] = sample_grid(src, cells, Some(mask), sub(b, [0.5; 3]));
+    let d = grid_dims(cells, grid);
+    let off = grid_offset(grid);
+    let mut out = vec![0.0; d.voxel_count()];
+    for kk in 0..d.z {
+        for j in 0..d.y {
+            for i in 0..d.x {
+                if is_wall_texel(cells, mask, grid, [i, j, kk]) {
+                    continue;
+                }
+                let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
+                let b = backtrace(faces, cells, x, k);
+                out[index(d, i, j, kk)] =
+                    sample_grid(src, d, grid_open(grid, mask), sub(b, off)) * decay;
             }
         }
     }
     out
 }
 
-/// Mirrors `advect_velocity.wgsl` for all three faces.
-pub fn cpu_advect_velocity(
+/// Mirrors `advect.wgsl`'s forward and backward passes and `maccormack.wgsl`.
+pub fn cpu_maccormack(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
     mask: u32,
-    h_inv_dx: f32,
-) -> [Vec<f32>; 3] {
-    std::array::from_fn(|a| {
-        let d = face_dims(cells, a);
-        let mut out = vec![0.0; d.voxel_count()];
-        for k in 0..d.z {
-            for j in 0..d.y {
-                for i in 0..d.x {
-                    if is_wall_in(cells, mask, a, [i, j, k][a]) {
-                        continue;
-                    }
-                    let x = [i as f32, j as f32, k as f32];
-                    let off = face_offset(a);
-                    let x = [x[0] + off[0], x[1] + off[1], x[2] + off[2]];
-                    let b = backtrace(faces, cells, x, h_inv_dx);
-                    out[index(d, i, j, k)] = sample_grid(&faces[a], d, None, sub(b, off));
+    grid: Grid,
+    src: &[f32],
+    k: f32,
+    decay: f32,
+) -> Vec<f32> {
+    let fwd = cpu_advect(faces, cells, mask, grid, src, k, 1.0);
+    let bwd = cpu_advect(faces, cells, mask, grid, &fwd, -k, 1.0);
+    let d = grid_dims(cells, grid);
+    let off = grid_offset(grid);
+    let mut out = vec![0.0; d.voxel_count()];
+    for kk in 0..d.z {
+        for j in 0..d.y {
+            for i in 0..d.x {
+                if is_wall_texel(cells, mask, grid, [i, j, kk]) {
+                    continue;
                 }
+                let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
+                let b = backtrace(faces, cells, x, k);
+                let (c, _) = corners(src, d, grid_open(grid, mask), sub(b, off));
+                let lo = c.iter().copied().fold(c[0], f32::min);
+                let hi = c.iter().copied().fold(c[0], f32::max);
+                let at = index(d, i, j, kk);
+                let corrected = fwd[at] + 0.5 * (src[at] - bwd[at]);
+                out[at] = corrected.max(lo).min(hi) * decay;
             }
         }
-        out
-    })
+    }
+    out
 }
 
 /// A staggered field holding `faces` (X, Y, Z order).

@@ -7,3 +7,12 @@ fn velocity_at(x: vec3<f32>) -> vec3<f32> {
         sample_grid(vel_z, 2u, x - grid_offset(2u)),
     );
 }
+
+// RK2 (midpoint) backtrace from `x`, in cell units, over one substep.
+// `direction` 1 traces back in time; -1 traces forward, for MacCormack's
+// backward pass.
+fn backtrace(x: vec3<f32>, direction: f32) -> vec3<f32> {
+    let k = direction * params.h * params.inv_dx;
+    let mid = x - 0.5 * k * velocity_at(x);
+    return x - k * velocity_at(mid);
+}

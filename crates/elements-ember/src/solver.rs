@@ -1,7 +1,7 @@
 //! `ember.smoke_solver`: a dense-grid smoke solver (spec §2.4, §3).
 //!
-//! Per substep: emit, buoyancy, advect velocity, project, advect scalars.
-//! Vorticity confinement and dissipation arrive in piece 2b.
+//! Per substep: emit, buoyancy, advect velocity, project, and advect scalars
+//! with dissipation. Vorticity confinement arrives in the next task.
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError,
@@ -11,7 +11,7 @@ use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, Socke
 use serde::{Deserialize, Serialize};
 
 use crate::boundaries::Boundaries;
-use crate::kernels::{self, StepConstants, Uniforms};
+use crate::kernels::{self, Advection, Carried, Pass, StepConstants, Uniforms};
 use crate::params;
 
 pub const KIND: &str = "ember.smoke_solver";
@@ -39,6 +39,12 @@ pub struct SolverParams {
     pub buoyancy_temperature: f32,
     /// Which domain faces are open; the rest are walls (spec §4.2).
     pub boundaries: Boundaries,
+    /// How velocity and scalars are advected (spec §4.1).
+    pub advection: Advection,
+    /// Exponential decay of density, 1/s (spec §4.5).
+    pub density_dissipation: f32,
+    /// Exponential decay of temperature, 1/s.
+    pub temperature_dissipation: f32,
 }
 
 impl Default for SolverParams {
@@ -52,6 +58,9 @@ impl Default for SolverParams {
             // Provisional until 2b-3 maps parameters to Mantaflow's.
             buoyancy_temperature: 1.0,
             boundaries: Boundaries::default(),
+            advection: Advection::MacCormack,
+            density_dissipation: 0.0,
+            temperature_dissipation: 0.0,
         }
     }
 }
@@ -64,6 +73,9 @@ impl SolverParams {
             alpha: self.buoyancy_density,
             beta: self.buoyancy_temperature,
             open_mask: self.boundaries.open_mask(),
+            advection: self.advection,
+            density_dissipation: self.density_dissipation,
+            temperature_dissipation: self.temperature_dissipation,
             ..StepConstants::new(cells, h, dx)
         }
     }
@@ -147,6 +159,7 @@ pub struct Substep {
     uniforms: Uniforms,
     batch: ComputeBatch,
     retired: Vec<Field>,
+    advection: Advection,
 }
 
 impl Substep {
@@ -155,6 +168,7 @@ impl Substep {
             uniforms: Uniforms::new(gpu, constants)?,
             batch: ComputeBatch::new(),
             retired: Vec::new(),
+            advection: constants.advection,
         })
     }
 
@@ -193,13 +207,29 @@ impl Substep {
             &state.density,
             &state.temperature,
         )?;
-        let advected = pool.acquire_staggered_uninit(gpu, u.cells())?;
-        if let Err(e) =
-            kernels::advect_velocity(gpu, cache, &mut self.batch, u, &state.velocity, &advected)
-        {
-            self.retired.extend(advected.into_faces());
-            return Err(e);
+        let cells = self.uniforms.cells();
+        let mut faces = Vec::with_capacity(3);
+        for axis in Axis::ALL {
+            match self.advect_grid(
+                gpu,
+                cache,
+                pool,
+                Carried::Face(axis),
+                &state.velocity,
+                state.velocity.face(axis),
+            ) {
+                Ok(face) => faces.push(face),
+                Err(e) => {
+                    self.retired.extend(faces);
+                    return Err(e);
+                }
+            }
         }
+        let [x, y, z]: [Field; 3] = match faces.try_into() {
+            Ok(array) => array,
+            Err(_) => unreachable!("exactly three faces were advected"),
+        };
+        let advected = StaggeredField::from_faces(cells, [x, y, z])?;
         let old = std::mem::replace(&mut state.velocity, advected);
         self.retired.extend(old.into_faces());
         Ok(())
@@ -251,33 +281,129 @@ impl Substep {
         pool: &mut FieldPool,
         state: &mut SolverState,
     ) -> Result<(), GpuError> {
-        self.advect_one(gpu, cache, pool, &state.velocity, &mut state.density)?;
-        self.advect_one(gpu, cache, pool, &state.velocity, &mut state.temperature)
+        let density = self.advect_grid(
+            gpu,
+            cache,
+            pool,
+            Carried::Density,
+            &state.velocity,
+            &state.density,
+        )?;
+        self.retired
+            .push(std::mem::replace(&mut state.density, density));
+        let temperature = self.advect_grid(
+            gpu,
+            cache,
+            pool,
+            Carried::Temperature,
+            &state.velocity,
+            &state.temperature,
+        )?;
+        self.retired
+            .push(std::mem::replace(&mut state.temperature, temperature));
+        Ok(())
     }
 
-    fn advect_one(
+    /// `src`, carried through `velocity` into a fresh pooled field. Scratch
+    /// fields, and the new field if recording fails, are retired.
+    fn advect_grid(
         &mut self,
         gpu: &GpuContext,
         cache: &mut PipelineCache,
         pool: &mut FieldPool,
+        carried: Carried,
         velocity: &StaggeredField,
-        field: &mut Field,
+        src: &Field,
+    ) -> Result<Field, GpuError> {
+        let dst = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
+        let recorded = match self.advection {
+            Advection::SemiLagrangian => kernels::advect(
+                gpu,
+                cache,
+                &mut self.batch,
+                &self.uniforms,
+                carried,
+                Pass::SemiLagrangian,
+                velocity,
+                src,
+                &dst,
+            ),
+            Advection::MacCormack => {
+                self.maccormack(gpu, cache, pool, carried, velocity, src, &dst)
+            }
+        };
+        match recorded {
+            Ok(()) => Ok(dst),
+            Err(e) => {
+                self.retired.push(dst);
+                Err(e)
+            }
+        }
+    }
+
+    /// Record MacCormack's three passes from `src` into `dst`.
+    #[allow(clippy::too_many_arguments)]
+    fn maccormack(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        carried: Carried,
+        velocity: &StaggeredField,
+        src: &Field,
+        dst: &Field,
     ) -> Result<(), GpuError> {
-        let dst = pool.acquire(gpu, field.dims(), FieldFormat::R32Float)?;
-        if let Err(e) = kernels::advect_scalar(
+        let fwd = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
+        let bwd = match pool.acquire(gpu, src.dims(), FieldFormat::R32Float) {
+            Ok(field) => field,
+            Err(e) => {
+                self.retired.push(fwd);
+                return Err(e);
+            }
+        };
+        let u = &self.uniforms;
+        let recorded = kernels::advect(
             gpu,
             cache,
             &mut self.batch,
-            &self.uniforms,
+            u,
+            carried,
+            Pass::Forward,
             velocity,
-            field,
-            &dst,
-        ) {
-            self.retired.push(dst);
-            return Err(e);
-        }
-        self.retired.push(std::mem::replace(field, dst));
-        Ok(())
+            src,
+            &fwd,
+        )
+        .and_then(|()| {
+            kernels::advect(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                carried,
+                Pass::Backward,
+                velocity,
+                &fwd,
+                &bwd,
+            )
+        })
+        .and_then(|()| {
+            kernels::maccormack(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                carried,
+                velocity,
+                src,
+                &fwd,
+                &bwd,
+                dst,
+            )
+        });
+        // The batch may reference both whether or not recording finished.
+        self.retired.push(fwd);
+        self.retired.push(bwd);
+        recorded
     }
 
     /// Run everything recorded, then return replaced fields to the pool.
@@ -539,6 +665,14 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
         "buoyancy",
         &[params.buoyancy_density, params.buoyancy_temperature],
     )?;
+    params::finite(
+        KIND,
+        "dissipation",
+        &[params.density_dissipation, params.temperature_dissipation],
+    )?;
+    if params.density_dissipation < 0.0 || params.temperature_dissipation < 0.0 {
+        return Err(params::bad(KIND, "dissipation rates must be at least 0"));
+    }
     Ok(Box::new(SmokeSolver { params }))
 }
 
