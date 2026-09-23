@@ -2,6 +2,7 @@ mod common;
 
 use common::*;
 use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, PipelineCache};
+use elements_ember::bench::GATE_RATIO;
 use elements_ember::emitter::{Sphere, fill_sphere};
 use elements_ember::kernels::StepConstants;
 use elements_ember::metrics::{centroid_z, divergence};
@@ -63,11 +64,8 @@ fn projection_leaves_at_most_a_tenth_of_the_divergence() {
         temperature: &temperature_source,
     };
     let constants = StepConstants {
-        cells,
-        h: 1.0 / 24.0,
-        dx,
-        alpha: 0.0,
         beta: 1.0,
+        ..StepConstants::new(cells, 1.0 / 24.0, dx)
     };
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
     for _ in 0..20 {
@@ -131,11 +129,8 @@ fn a_hot_blob_rises_every_frame() {
         temperature: &zero,
     };
     let constants = StepConstants {
-        cells,
-        h: 1.0 / 24.0,
-        dx,
-        alpha: 0.0,
         beta: 1.0,
+        ..StepConstants::new(cells, 1.0 / 24.0, dx)
     };
 
     let mut heights = vec![centroid_z(&state.density.read_back(&gpu).unwrap(), cells).unwrap()];
@@ -155,4 +150,69 @@ fn a_hot_blob_rises_every_frame() {
             pair[1]
         );
     }
+}
+
+/// Spec §4.3, risk (b): the slot holds p, so after the substep length drops
+/// threefold the warm start is still close, and one 20-iteration projection
+/// still meets 2a's divergence rule. A relative bound against a no-switch
+/// run can't hold: unconverged projections leave residual divergence that
+/// does not scale with h, so any change of h costs something (measured on M1
+/// Max: switched 0.062, same-history no-switch 0.024, storing h·p instead
+/// 0.20).
+#[test]
+fn the_warm_start_survives_a_change_of_substep_length() {
+    const ITERATIONS: u32 = 20;
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(16, 16, 16);
+    let dx = 2.0 / 16.0;
+    let density_source = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    let temperature_source = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    let sphere = Sphere {
+        center: [1.0, 1.0, 0.4],
+        radius: 0.3,
+        density_rate: 1.0,
+        temperature_rate: 2.0,
+    };
+    fill_sphere(
+        &gpu,
+        &mut cache,
+        &density_source,
+        &temperature_source,
+        &sphere,
+        dx,
+    )
+    .unwrap();
+    let sources = Sources {
+        density: &density_source,
+        temperature: &temperature_source,
+    };
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+    let warm = StepConstants {
+        beta: 1.0,
+        ..StepConstants::new(cells, 1.0 / 24.0, dx)
+    };
+    for _ in 0..24 {
+        substep(
+            &gpu, &mut cache, &mut pool, &mut state, sources, &warm, ITERATIONS,
+        )
+        .unwrap();
+    }
+    let last = StepConstants {
+        beta: 1.0,
+        ..StepConstants::new(cells, 1.0 / 72.0, dx)
+    };
+    let mut step = Substep::new(&gpu, &last).unwrap();
+    step.pre_projection(&gpu, &mut cache, &mut pool, &mut state, sources)
+        .unwrap();
+    step.submit(&gpu, &mut pool).unwrap();
+    let before = divergence(&state.read_velocity(&gpu).unwrap(), cells, dx);
+    let mut step = Substep::new(&gpu, &last).unwrap();
+    step.project(&gpu, &mut cache, &mut pool, &mut state, ITERATIONS)
+        .unwrap();
+    step.submit(&gpu, &mut pool).unwrap();
+    let after = divergence(&state.read_velocity(&gpu).unwrap(), cells, dx);
+    let switched = after.rms / before.rms;
+    assert!(switched <= GATE_RATIO, "switched {switched}");
 }

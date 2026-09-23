@@ -43,6 +43,7 @@ pub fn assert_close(gpu: &[f32], cpu: &[f32], tol: f32, what: &str) {
 }
 
 use elements_core::gpu::{Axis, StaggeredField};
+use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 
 pub const AXES: [Axis; 3] = [Axis::X, Axis::Y, Axis::Z];
 
@@ -50,41 +51,98 @@ pub fn face_dims(cells: FieldDims, axis: usize) -> FieldDims {
     StaggeredField::face_dims(cells, AXES[axis])
 }
 
-/// Mirrors `face_offset` in `common.wgsl`.
+/// Mirrors `face_offset` in `common.wgsl`. Kept as a name distinct from
+/// `grid_offset` only where a face-grid-only offset is meant; `grid_offset`
+/// below is the general mirror used by everything else.
 pub fn face_offset(axis: usize) -> [f32; 3] {
     let mut o = [0.5; 3];
     o[axis] = 0.0;
     o
 }
 
-/// Mirrors `is_wall` in `common.wgsl`.
-pub fn is_wall(cells: FieldDims, axis: usize, i: u32) -> bool {
-    let n = [cells.x, cells.y, cells.z][axis];
-    if axis == 2 && i == n {
-        return false;
-    }
-    i == 0 || i == n
+/// Mirrors `is_open` in `common.wgsl`.
+pub fn is_open(mask: u32, axis: usize, side: usize) -> bool {
+    (mask >> (2 * axis + side)) & 1 == 1
 }
 
-/// Mirrors `trilinear` in `common.wgsl`, including its edge clamp.
-pub fn trilinear(data: &[f32], dims: FieldDims, p: [f32; 3]) -> f32 {
+/// Mirrors `is_wall` in `common.wgsl`.
+pub fn is_wall_in(cells: FieldDims, mask: u32, axis: usize, i: u32) -> bool {
+    let n = [cells.x, cells.y, cells.z][axis];
+    if i == 0 {
+        return !is_open(mask, axis, 0);
+    }
+    if i == n {
+        return !is_open(mask, axis, 1);
+    }
+    false
+}
+
+/// `is_wall_in` with 2a's boundaries: walls everywhere but `+z`.
+pub fn is_wall(cells: FieldDims, axis: usize, i: u32) -> bool {
+    is_wall_in(cells, DEFAULT_OPEN_MASK, axis, i)
+}
+
+/// Mirrors `texel` in `common.wgsl`. `open` is `Some(mask)` for a cell
+/// grid, which reads 0 beyond an open face; face grids pass `None` and clamp.
+pub fn texel(data: &[f32], dims: FieldDims, open: Option<u32>, c: [i32; 3]) -> f32 {
     let size = [dims.x as i32, dims.y as i32, dims.z as i32];
+    let mut q = c;
+    for a in 0..3 {
+        if c[a] < 0 {
+            if open.is_some_and(|m| is_open(m, a, 0)) {
+                return 0.0;
+            }
+            q[a] = 0;
+        } else if c[a] >= size[a] {
+            if open.is_some_and(|m| is_open(m, a, 1)) {
+                return 0.0;
+            }
+            q[a] = size[a] - 1;
+        }
+    }
+    data[index(dims, q[0] as u32, q[1] as u32, q[2] as u32)]
+}
+
+/// Mirrors `corners` in `common.wgsl`: the 8 texels around `p` and the
+/// fractional position between them.
+pub fn corners(
+    data: &[f32],
+    dims: FieldDims,
+    open: Option<u32>,
+    p: [f32; 3],
+) -> ([f32; 8], [f32; 3]) {
+    let size = [dims.x as f32, dims.y as f32, dims.z as f32];
     let mut i0 = [0i32; 3];
-    let mut i1 = [0i32; 3];
     let mut t = [0f32; 3];
     for a in 0..3 {
-        let last = size[a] - 1;
-        let q = p[a].clamp(0.0, last as f32);
-        i0[a] = q.floor() as i32;
-        i1[a] = (i0[a] + 1).min(last);
-        t[a] = q - i0[a] as f32;
+        let q = p[a].clamp(-1.0, size[a]);
+        let f = q.floor();
+        i0[a] = f as i32;
+        t[a] = q - f;
     }
-    let at = |x: i32, y: i32, z: i32| data[index(dims, x as u32, y as u32, z as u32)];
+    let c = std::array::from_fn(|n| {
+        texel(
+            data,
+            dims,
+            open,
+            [
+                i0[0] + (n & 1) as i32,
+                i0[1] + ((n >> 1) & 1) as i32,
+                i0[2] + ((n >> 2) & 1) as i32,
+            ],
+        )
+    });
+    (c, t)
+}
+
+/// Mirrors `sample_grid` in `common.wgsl`.
+pub fn sample_grid(data: &[f32], dims: FieldDims, open: Option<u32>, p: [f32; 3]) -> f32 {
+    let (c, t) = corners(data, dims, open, p);
     let mix = |a: f32, b: f32, t: f32| a * (1.0 - t) + b * t;
-    let c00 = mix(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), t[0]);
-    let c10 = mix(at(i0[0], i1[1], i0[2]), at(i1[0], i1[1], i0[2]), t[0]);
-    let c01 = mix(at(i0[0], i0[1], i1[2]), at(i1[0], i0[1], i1[2]), t[0]);
-    let c11 = mix(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), t[0]);
+    let c00 = mix(c[0], c[1], t[0]);
+    let c10 = mix(c[2], c[3], t[0]);
+    let c01 = mix(c[4], c[5], t[0]);
+    let c11 = mix(c[6], c[7], t[0]);
     mix(mix(c00, c10, t[1]), mix(c01, c11, t[1]), t[2])
 }
 
@@ -96,7 +154,7 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 pub fn velocity_at(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3]) -> [f32; 3] {
     let mut v = [0.0; 3];
     for (a, out) in v.iter_mut().enumerate() {
-        *out = trilinear(&faces[a], face_dims(cells, a), sub(x, face_offset(a)));
+        *out = sample_grid(&faces[a], face_dims(cells, a), None, sub(x, face_offset(a)));
     }
     v
 }
@@ -114,6 +172,7 @@ fn backtrace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], h_inv_dx: f32
 pub fn cpu_advect_scalar(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
+    mask: u32,
     src: &[f32],
     h_inv_dx: f32,
 ) -> Vec<f32> {
@@ -123,7 +182,7 @@ pub fn cpu_advect_scalar(
             for i in 0..cells.x {
                 let x = [i as f32 + 0.5, j as f32 + 0.5, k as f32 + 0.5];
                 let b = backtrace(faces, cells, x, h_inv_dx);
-                out[index(cells, i, j, k)] = trilinear(src, cells, sub(b, [0.5; 3]));
+                out[index(cells, i, j, k)] = sample_grid(src, cells, Some(mask), sub(b, [0.5; 3]));
             }
         }
     }
@@ -134,6 +193,7 @@ pub fn cpu_advect_scalar(
 pub fn cpu_advect_velocity(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
+    mask: u32,
     h_inv_dx: f32,
 ) -> [Vec<f32>; 3] {
     std::array::from_fn(|a| {
@@ -142,14 +202,14 @@ pub fn cpu_advect_velocity(
         for k in 0..d.z {
             for j in 0..d.y {
                 for i in 0..d.x {
-                    if is_wall(cells, a, [i, j, k][a]) {
+                    if is_wall_in(cells, mask, a, [i, j, k][a]) {
                         continue;
                     }
                     let x = [i as f32, j as f32, k as f32];
                     let off = face_offset(a);
                     let x = [x[0] + off[0], x[1] + off[1], x[2] + off[2]];
                     let b = backtrace(faces, cells, x, h_inv_dx);
-                    out[index(d, i, j, k)] = trilinear(&faces[a], d, sub(b, off));
+                    out[index(d, i, j, k)] = sample_grid(&faces[a], d, None, sub(b, off));
                 }
             }
         }
@@ -182,45 +242,54 @@ pub fn velocity_pattern(cells: FieldDims) -> [Vec<f32>; 3] {
     })
 }
 
-/// Mirrors `relax` in `pressure.wgsl`: red (even i+j+k) then black, per iteration.
-pub fn cpu_red_black(phi: &mut [f32], div: &[f32], cells: FieldDims, dx2: f32, iterations: u32) {
-    let (nx, ny, nz) = (cells.x, cells.y, cells.z);
+/// Mirrors `relax` in `pressure.wgsl`: red (even i+j+k) then black, per
+/// iteration, solving ∇²p = div / scale.
+pub fn cpu_red_black(
+    p: &mut [f32],
+    div: &[f32],
+    cells: FieldDims,
+    mask: u32,
+    dx2: f32,
+    scale: f32,
+    iterations: u32,
+) {
+    let n = [cells.x as i32, cells.y as i32, cells.z as i32];
     for _ in 0..iterations {
         for colour in [0, 1] {
-            for k in 0..nz {
-                for j in 0..ny {
-                    for i in 0..nx {
+            for k in 0..cells.z {
+                for j in 0..cells.y {
+                    for i in 0..cells.x {
                         if (i + j + k) % 2 != colour {
                             continue;
                         }
+                        let c = [i as i32, j as i32, k as i32];
+                        let at =
+                            |q: [i32; 3]| p[index(cells, q[0] as u32, q[1] as u32, q[2] as u32)];
                         let mut sum = 0.0f32;
                         let mut count = 0.0f32;
-                        if i > 0 {
-                            sum += phi[index(cells, i - 1, j, k)];
-                            count += 1.0;
+                        for a in 0..3 {
+                            let mut lo = c;
+                            lo[a] -= 1;
+                            let mut hi = c;
+                            hi[a] += 1;
+                            if c[a] > 0 {
+                                sum += at(lo);
+                                count += 1.0;
+                            } else if is_open(mask, a, 0) {
+                                count += 1.0;
+                            }
+                            if c[a] < n[a] - 1 {
+                                sum += at(hi);
+                                count += 1.0;
+                            } else if is_open(mask, a, 1) {
+                                count += 1.0;
+                            }
                         }
-                        if i < nx - 1 {
-                            sum += phi[index(cells, i + 1, j, k)];
-                            count += 1.0;
+                        if count == 0.0 {
+                            continue;
                         }
-                        if j > 0 {
-                            sum += phi[index(cells, i, j - 1, k)];
-                            count += 1.0;
-                        }
-                        if j < ny - 1 {
-                            sum += phi[index(cells, i, j + 1, k)];
-                            count += 1.0;
-                        }
-                        if k > 0 {
-                            sum += phi[index(cells, i, j, k - 1)];
-                            count += 1.0;
-                        }
-                        if k < nz - 1 {
-                            sum += phi[index(cells, i, j, k + 1)];
-                        }
-                        count += 1.0;
-                        phi[index(cells, i, j, k)] =
-                            (sum - dx2 * div[index(cells, i, j, k)]) / count;
+                        let rhs = dx2 * div[index(cells, i, j, k)] / scale;
+                        p[index(cells, i, j, k)] = (sum - rhs) / count;
                     }
                 }
             }

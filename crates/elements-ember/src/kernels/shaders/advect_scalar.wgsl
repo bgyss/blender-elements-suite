@@ -14,6 +14,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let x = vec3<f32>(gid) + vec3<f32>(0.5);
     let back = x - velocity_at(x) * (params.h * params.inv_dx);
-    let value = trilinear(src, back - vec3<f32>(0.5));
+    let value = sample_grid(src, CELL, back - grid_offset(CELL));
     textureStore(dst, vec3<i32>(gid), vec4<f32>(value, 0.0, 0.0, 0.0));
 }

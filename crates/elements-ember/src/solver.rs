@@ -10,6 +10,7 @@ use elements_core::gpu::{
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 use serde::{Deserialize, Serialize};
 
+use crate::boundaries::Boundaries;
 use crate::kernels::{self, StepConstants, Uniforms};
 use crate::params;
 
@@ -18,43 +19,54 @@ pub const KIND: &str = "ember.smoke_solver";
 const VELOCITY: &str = "velocity";
 const DENSITY: &str = "density";
 const TEMPERATURE: &str = "temperature";
-/// Holds φ = h·p, the pressure scaled by the substep, not p itself.
+/// Holds p. The warm start stays valid when h changes (spec §4.3).
 const PRESSURE: &str = "pressure";
 const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
 
 const MAX_SUBSTEPS: u32 = 16;
 const MAX_PRESSURE_ITERATIONS: u32 = 1000;
 
-fn default_substeps() -> u32 {
-    1
-}
-
-/// Chosen by the user from the speed gate (`docs/bench/speed-gate.md`): 34 ms a
-/// step at 128³, leaving headroom for 2b's stages and the handoff to Blender.
-fn default_pressure_iterations() -> u32 {
-    160
-}
-
-/// Provisional until 2b maps parameters to Mantaflow's.
-fn default_buoyancy_temperature() -> f32 {
-    1.0
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct SolverParams {
-    /// Fixed substeps per frame. CFL-driven substepping is 2b.
-    #[serde(default = "default_substeps")]
+    /// Fixed substeps per frame. CFL-driven substepping is Task 7.
     pub substeps: u32,
     /// Red-black Gauss–Seidel iterations per substep.
-    #[serde(default = "default_pressure_iterations")]
     pub pressure_iterations: u32,
     /// α: downward acceleration per unit density, m/s².
-    #[serde(default)]
     pub buoyancy_density: f32,
     /// β: upward acceleration per unit temperature, m/s².
-    #[serde(default = "default_buoyancy_temperature")]
     pub buoyancy_temperature: f32,
+    /// Which domain faces are open; the rest are walls (spec §4.2).
+    pub boundaries: Boundaries,
+}
+
+impl Default for SolverParams {
+    fn default() -> Self {
+        Self {
+            substeps: 1,
+            // Chosen by the user from the speed gate
+            // (`docs/bench/speed-gate.md`): 34 ms a step at 128³.
+            pressure_iterations: 160,
+            buoyancy_density: 0.0,
+            // Provisional until 2b-3 maps parameters to Mantaflow's.
+            buoyancy_temperature: 1.0,
+            boundaries: Boundaries::default(),
+        }
+    }
+}
+
+impl SolverParams {
+    /// Kernel constants for one substep of length `h`, in a domain of
+    /// `cells` with voxel edge `dx`.
+    pub fn step_constants(&self, cells: FieldDims, h: f32, dx: f32) -> StepConstants {
+        StepConstants {
+            alpha: self.buoyancy_density,
+            beta: self.buoyancy_temperature,
+            open_mask: self.boundaries.open_mask(),
+            ..StepConstants::new(cells, h, dx)
+        }
+    }
 }
 
 /// Everything the solver carries from one step to the next.
@@ -62,7 +74,7 @@ pub struct SolverState {
     pub velocity: StaggeredField,
     pub density: Field,
     pub temperature: Field,
-    /// φ = h·p, kept as the next solve's warm start.
+    /// p, kept as the next solve's warm start.
     pub pressure: Field,
 }
 
@@ -427,16 +439,13 @@ impl SmokeSolver {
         let SolverParams {
             substeps,
             pressure_iterations,
-            buoyancy_density,
-            buoyancy_temperature,
+            ..
         } = self.params;
-        let constants = StepConstants {
-            cells: ctx.dims(),
-            h: (ctx.time().dt / substeps as f64) as f32,
-            dx: ctx.voxel_size(),
-            alpha: buoyancy_density,
-            beta: buoyancy_temperature,
-        };
+        let constants = self.params.step_constants(
+            ctx.dims(),
+            (ctx.time().dt / substeps as f64) as f32,
+            ctx.voxel_size(),
+        );
         ctx.with_gpu_pool(|gpu, cache, pool| {
             for _ in 0..substeps {
                 substep(

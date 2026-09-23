@@ -9,10 +9,10 @@
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (any(gid >= face_dims(2u))) {
+    if (any(gid >= grid_dims(2u))) {
         return;
     }
-    // The floor is a solid wall, and the open top's value comes from projection.
+    // Boundary faces are left alone: a wall stays zero, and an open face's value comes from projection.
     if (gid.z == 0u || gid.z == params.dims.z) {
         return;
     }

@@ -8,11 +8,9 @@ const CELLS: FieldDims = FieldDims { x: 8, y: 6, z: 5 };
 
 fn constants() -> StepConstants {
     StepConstants {
-        cells: CELLS,
-        h: 0.25,
-        dx: 0.125,
         alpha: 0.5,
         beta: 2.0,
+        ..StepConstants::new(CELLS, 0.25, 0.125)
     }
 }
 

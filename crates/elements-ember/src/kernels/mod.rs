@@ -16,6 +16,8 @@ pub use project::{divergence, pressure, subtract_gradient};
 use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError};
 use wgpu::util::DeviceExt;
 
+use crate::boundaries::DEFAULT_OPEN_MASK;
+
 /// Values every kernel in one substep shares.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepConstants {
@@ -29,6 +31,24 @@ pub struct StepConstants {
     pub alpha: f32,
     /// Buoyancy per unit temperature (rises), m/s².
     pub beta: f32,
+    /// Open domain faces; see `Boundaries::open_mask`.
+    pub open_mask: u32,
+}
+
+impl StepConstants {
+    /// No buoyancy, and 2a's boundaries. Build variations with
+    /// `StepConstants { beta: 1.0, ..StepConstants::new(cells, h, dx) }`, so
+    /// fields added later get their defaults here instead of breaking callers.
+    pub fn new(cells: FieldDims, h: f32, dx: f32) -> Self {
+        Self {
+            cells,
+            h,
+            dx,
+            alpha: 0.0,
+            beta: 0.0,
+            open_mask: DEFAULT_OPEN_MASK,
+        }
+    }
 }
 
 /// Matches `Params` in `common.wgsl`, 48 bytes.
@@ -40,9 +60,11 @@ struct KernelParams {
     h: f32,
     inv_dx: f32,
     dx2: f32,
+    pressure_scale: f32,
     alpha: f32,
     beta: f32,
-    _pad: [u32; 3],
+    open_mask: u32,
+    _pad: u32,
 }
 
 pub(crate) fn axis_index(axis: Axis) -> u32 {
@@ -58,6 +80,7 @@ pub(crate) fn axis_index(axis: Axis) -> u32 {
 pub struct Uniforms {
     per_axis: [wgpu::Buffer; 3],
     cells: FieldDims,
+    open_mask: u32,
 }
 
 impl Uniforms {
@@ -69,9 +92,11 @@ impl Uniforms {
                 h: c.h,
                 inv_dx: 1.0 / c.dx,
                 dx2: c.dx * c.dx,
+                pressure_scale: c.h,
                 alpha: c.alpha,
                 beta: c.beta,
-                _pad: [0; 3],
+                open_mask: c.open_mask,
+                _pad: 0,
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -84,12 +109,18 @@ impl Uniforms {
         Ok(Self {
             per_axis,
             cells: c.cells,
+            open_mask: c.open_mask,
         })
     }
 
     /// The domain these constants describe.
     pub fn cells(&self) -> FieldDims {
         self.cells
+    }
+
+    /// Open domain faces, as in `StepConstants::open_mask`.
+    pub fn open_mask(&self) -> u32 {
+        self.open_mask
     }
 
     pub(crate) fn axis(&self, axis: Axis) -> &wgpu::Buffer {

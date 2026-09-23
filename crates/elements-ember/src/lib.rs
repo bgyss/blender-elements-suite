@@ -6,6 +6,7 @@
 //! smoke; this crate is the seam `NodeRegistry` exists for.
 
 pub mod bench;
+pub mod boundaries;
 pub mod emitter;
 pub mod kernels;
 pub mod metrics;

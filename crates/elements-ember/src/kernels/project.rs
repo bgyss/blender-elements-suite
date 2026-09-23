@@ -60,24 +60,24 @@ pub fn divergence(
     Ok(())
 }
 
-/// `iterations` red-black Gauss–Seidel sweeps on `phi`, in place, starting
-/// from whatever `phi` holds (the warm start).
+/// `iterations` red-black Gauss–Seidel sweeps on `p`, solving ∇²p = div/h,
+/// in place, starting from whatever `p` holds (the warm start).
 pub fn pressure(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
     batch: &mut ComputeBatch,
     u: &Uniforms,
-    phi: &Field,
+    p: &Field,
     div: &Field,
     iterations: u32,
 ) -> Result<(), GpuError> {
-    expect_dims("pressure phi", phi, u.cells())?;
+    expect_dims("pressure p", p, u.cells())?;
     expect_dims("pressure divergence", div, u.cells())?;
     let red = cache.get_or_create(gpu, "ember.pressure.red", PRESSURE, "red")?;
     let black = cache.get_or_create(gpu, "ember.pressure.black", PRESSURE, "black")?;
     // Auto layouts are never shared between pipelines, so each colour needs
     // its own bind group. Both are built once and reused every iteration.
-    let entries = [Bind::Tex(phi), Bind::Tex(div), Bind::Buf(u.any())];
+    let entries = [Bind::Tex(p), Bind::Tex(div), Bind::Buf(u.any())];
     let red_group = bind_group(gpu, &red, &entries)?;
     let black_group = bind_group(gpu, &black, &entries)?;
     for _ in 0..iterations {
@@ -87,24 +87,24 @@ pub fn pressure(
     Ok(())
 }
 
-/// `velocity -= ∇phi`, with solid-wall faces forced to zero.
+/// `velocity -= h·∇p`, with solid-wall faces forced to zero.
 pub fn subtract_gradient(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
     batch: &mut ComputeBatch,
     u: &Uniforms,
     velocity: &StaggeredField,
-    phi: &Field,
+    p: &Field,
 ) -> Result<(), GpuError> {
     expect_velocity("subtract_gradient", velocity, u)?;
-    expect_dims("subtract_gradient phi", phi, u.cells())?;
+    expect_dims("subtract_gradient p", p, u.cells())?;
     let pipeline = cache.get_or_create(gpu, "ember.gradient", GRADIENT, "main")?;
     for axis in Axis::ALL {
         let face = velocity.face(axis);
         let group = bind_group(
             gpu,
             &pipeline,
-            &[Bind::Tex(face), Bind::Tex(phi), Bind::Buf(u.axis(axis))],
+            &[Bind::Tex(face), Bind::Tex(p), Bind::Buf(u.axis(axis))],
         )?;
         batch.dispatch(&pipeline, &group, face.dims());
     }

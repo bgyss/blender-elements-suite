@@ -31,6 +31,15 @@ fn rejects_out_of_range_solver_parameters() {
     ));
     assert!(rejected(serde_json::json!({ "buoyancy_density": 1e39 })));
     assert!(rejected(serde_json::json!({ "vorticity": 1.0 })));
+    assert!(!rejected(
+        serde_json::json!({ "boundaries": { "-x": "open", "+z": "wall" } })
+    ));
+    assert!(rejected(
+        serde_json::json!({ "boundaries": { "+w": "open" } })
+    ));
+    assert!(rejected(
+        serde_json::json!({ "boundaries": { "-x": "porous" } })
+    ));
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.
@@ -45,11 +54,9 @@ fn a_still_domain_stays_exactly_still() {
     let zero = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
     let constants = StepConstants {
-        cells,
-        h: 1.0 / 24.0,
-        dx: 0.25,
         alpha: 0.5,
         beta: 2.0,
+        ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
     };
     let sources = Sources {
         density: &zero,
@@ -280,11 +287,9 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
 
     let zero = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
     let constants = StepConstants {
-        cells,
-        h: 1.0 / 24.0,
-        dx: 0.25,
         alpha: 0.5,
         beta: 2.0,
+        ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
     };
     let sources = Sources {
         density: &zero,

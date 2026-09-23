@@ -9,16 +9,16 @@
 
 fn component(axis: u32, p: vec3<f32>) -> f32 {
     switch axis {
-        case 0u: { return trilinear(vel_x, p); }
-        case 1u: { return trilinear(vel_y, p); }
-        default: { return trilinear(vel_z, p); }
+        case 0u: { return sample_grid(vel_x, 0u, p); }
+        case 1u: { return sample_grid(vel_y, 1u, p); }
+        default: { return sample_grid(vel_z, 2u, p); }
     }
 }
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let axis = params.axis;
-    if (any(gid >= face_dims(axis))) {
+    if (any(gid >= grid_dims(axis))) {
         return;
     }
     let p = vec3<i32>(gid);
@@ -28,7 +28,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(dst, p, vec4<f32>(0.0));
         return;
     }
-    let x = vec3<f32>(gid) + face_offset(axis);
+    let x = vec3<f32>(gid) + grid_offset(axis);
     let back = x - velocity_at(x) * (params.h * params.inv_dx);
-    textureStore(dst, p, vec4<f32>(component(axis, back - face_offset(axis)), 0.0, 0.0, 0.0));
+    textureStore(dst, p, vec4<f32>(component(axis, back - grid_offset(axis)), 0.0, 0.0, 0.0));
 }

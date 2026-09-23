@@ -15,7 +15,6 @@ use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, Pipeline
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::{GATE_RATIO, GATE_STEP_MS, GateRow, Scene, gate_verdict};
 use elements_ember::emitter::fill_sphere;
-use elements_ember::kernels::StepConstants;
 use elements_ember::metrics::{DivergenceStats, divergence};
 use elements_ember::solver::{SolverState, Sources, Substep, substep};
 
@@ -101,13 +100,10 @@ fn divergence_at(
     let dx = (scene.domain_size / x.max(y).max(z) as f64) as f32;
     let n = scene.solver.pressure_iterations;
     let substeps = scene.solver.substeps;
-    let constants = StepConstants {
-        cells,
-        h: (1.0 / scene.fps / substeps as f64) as f32,
-        dx,
-        alpha: scene.solver.buoyancy_density,
-        beta: scene.solver.buoyancy_temperature,
-    };
+    let constants =
+        scene
+            .solver
+            .step_constants(cells, (1.0 / scene.fps / substeps as f64) as f32, dx);
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
     let density_source = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
