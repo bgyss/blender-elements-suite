@@ -13,6 +13,7 @@ pub mod kernels;
 pub mod metrics;
 mod params;
 pub mod solver;
+pub mod transform;
 
 use elements_core::graph::NodeRegistry;
 
