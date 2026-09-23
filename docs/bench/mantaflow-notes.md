@@ -95,6 +95,13 @@ metadata. The committed fixture also reads fully: 240 of 240
 grids read the same with and without the patch. The existing `elements-io`
 VDB tests (vdb-rs as the oracle) pass on the patched crate.
 
+**What the patch leaves alone.** Root-level tile values are still read and
+discarded; that is harmless, because a root tile covers 4096³ and no domain of
+256³ or less has one. Inactive voxels read as 0, not as the grid's background
+value: fine for density and velocity, whose background is 0, but `shadow`'s is
+−1. Half-float decoding exists only for `f32` grids, so a half-float velocity
+grid would not decode; the scene script must keep `openvdb_data_depth = "32"`.
+
 **`vdb-rs` does not check value types.** Reading `density` as `[f32; 3]`
 returns 0 values without an error, and reading `temperature` as `[f32; 3]`
 gives `IoError`. The Task 7 reader must check `descriptor.grid_type`
@@ -124,9 +131,23 @@ Every other cell reads as zero.
   (against 4,353 at 1e-6).
 
 **Decision: keep the default `clipping` (1e-6), and compute the velocity
-metrics for both solvers over the mask density > 1e-6.** That mask is exactly
-the set of voxels the cache stores velocity for, and the same mask is applied
-to Ember's fields.
+metrics for both solvers only over *measured* cells (spec §4.1): cells whose
+whole 3×3×3 neighbourhood lies inside the domain, holds no collider cell and
+has density above 1e-6.** The same mask is applied to Ember's fields.
+
+**Why the mask is the whole neighbourhood, not the cell.** Velocity is
+staggered (see Velocity location), and the cache stores velocity index
+(i,j,k), which holds the −x, −y and −z faces of cell (i,j,k), only when cell
+(i,j,k) has density. A smoky cell's +x face is index (i+1,j,k), which belongs
+to the neighbour: at the plume's edge, where that neighbour has no smoke, the
+face is missing and reads as 0. Face index n on each axis is never stored at
+all, because the file has only indices 0 … n−1. If every cell in the 3×3×3
+neighbourhood has smoke, every face and every central difference the metrics
+touch (the divergence face stencil, the kinetic energy and vorticity from
+cell-centred averages of two faces) is stored in Mantaflow's cache and present
+in Ember's. Outflow is measured for the same reason on the z-faces at index
+nz − 1, with the density of layer nz − 2, not on face nz. The reader fills
+the missing face n with 0; no metric reads it.
 
 **Tiles can drop values from the other grids.** In a domain-filling test
 (32³, `fill=1 volume=1 alpha=0 beta=0.5`, frame 3), density was constant over whole 8³ blocks and was
@@ -152,6 +173,12 @@ zeros.
   between cells i−1 and i (`KnAddBuoyancy` in `extforces.cpp` averages
   `factor(i,j,k)` and `factor(i,j,k−1)` for the z component). That is
   Ember's face convention.
+
+So index (i,j,k) holds the −x, −y and −z faces of cell (i,j,k), and the cache
+stores it only when that cell has smoke. A smoky cell's + faces can therefore
+be missing at the plume's edge, and face n on each axis is never stored. That
+is why the metrics measure only cells whose whole 3×3×3 neighbourhood is
+smoke, and outflow uses face nz − 1 (see Clipping).
 
 The brief's extent experiment cannot separate faces from centres. Velocity is
 clipped to density's voxels, so the stored extent is always density's (32³,
@@ -235,11 +262,11 @@ gravity is converted to cells per unit² by `scaleAcceleration = (n / L) · 0.4�
 | Vorticity | `vorticity` ε, 1/s: Δu = h·ε·dx·(N×ω) | domain `vorticity`: Δu = v·(dt / frame)·(N×ω), grid units | `vorticity = ε / fps` (dx cancels) | `extforces.cpp` `KnConfForce`; `smoke_script.h` | no: bench ε = 0, so 0 |
 | Wind | uniform acceleration a, m/s², every cell | `WIND` field, strength S | `S = |a| / (0.2 · fps)`: 0.5 m/s² at 24 fps gives 0.1042 | `fluid.cc` `update_effectors_task_cb` (× 0.2, clamp ±1); `effect.cc` `do_physical_effector` (÷ fps, `vel_to_sec`); then `scaleSpeedFrames` and `addForceField` | yes, below |
 | Wind falloff | none | `falloff_type = "SPHERE"`, `falloff_power = 0`, `use_min_distance = use_max_distance = False`, `z_direction = "BOTH"`, `flow = 0` | power 0 makes the falloff 1 everywhere; `flow` (default 1 for WIND) would add drag towards the smoke's own velocity | `effect.cc` `effector_falloff`, `falloff_func` | yes (used in the check) |
-| Wind direction | the acceleration vector | the field object's local +z | object rotation `rotation_to(direction)` (quaternion) | `effect.cc`, `PFIELD_WIND` uses `efd->nor` | yes for +x |
+| Wind direction | the acceleration vector | the field object's local +z | object rotation `rotation_to(direction)` (quaternion); set `rotation_mode = "QUATERNION"` first, or `rotation_quaternion` is ignored | `effect.cc`, `PFIELD_WIND` uses `efd->nor` | yes for +x |
 | Inflow, density | adds `rate · occupancy · h` each substep | with `use_absolute = False`, adds `density · emission` once per frame and clamps to [0, 1]; with `use_absolute = True` (Blender's default) it holds the value instead | `use_absolute = False`, `density = density_rate / fps` | `fluid.cc` `apply_inflow_fields` (and the reset of the inflow grids to the current grids before emission); `initplugins.cpp` `applyEmission` | yes: mass 0.97–1.03 of Ember's, below |
 | Inflow, temperature | adds `rate · occupancy · h` each substep | raises heat to `temperature` in the emitter (`ADD_IF_LOWER`), never above it, in both modes | `temperature = temperature_rate · 24 / fps`: Ember's emitter-centre value at frame 24 | `fluid.cc` `ADD_IF_LOWER`, `apply_inflow_fields` | yes: held at 1.000, below |
 | Emitter volume | a filled sphere with a one-cell soft edge | a mesh flow emits a **shell** by default (`volume_density = 0`), plus a falloff out to `surface_distance` cells outside the mesh (default 1.0) | `volume_density = 1`, `surface_distance = 0` | `fluid.cc` `sample_mesh`; a 32³ bake showed a hollow emitter; the default `surface_distance` added 33% mass | yes, below |
-| Emitter activity | `active_frames` [1, 60] | no equivalent setting | keyframe the flow's emission off after frame 60 (spec §5) | — | not tested here |
+| Emitter activity | `active_frames` [1, 60] | no frame-range setting | keyframe the flow's emission off after frame 60 (spec §5); Task 6 must verify the switch by a bake. The property is `flow_settings.use_inflow` ("Use Flow", "Control when to apply fluid flow", animatable, default True), found by listing `FluidFlowSettings` RNA in 5.2.2 | RNA listing | no: exists, not yet verified by a bake |
 | Substeps | `max_substeps` (preview: 1) | `timesteps_min = timesteps_max` | equal | generated script | yes (script) |
 | Boundaries | closed sides and floor, open top | all six sides **open** by default (`xXyYzZ`) | `use_collision_border_{front,back,left,right,bottom} = True`, `top = False` (probe `bench=1`) | generated script: `boundConditions` | yes (script) |
 | Advection | MacCormack | `advectSemiLagrange(order=2)`, Mantaflow's MacCormack | none needed | generated script | yes (script) |
@@ -368,9 +395,12 @@ files, keeps growing. The estimate is under the 90-minute stop line.
    (a)). Resolved: the workspace vendors a patched copy (`vendor/vdb-rs/`).
    The Task 7 reader must add the grid-type check that `vdb-rs` lacks.
 2. **The cache holds velocity only where there is smoke** (density above
-   `clipping`), and `clipping = 0` does not change that. Resolved: the §4.1
-   velocity metrics use the mask density > 1e-6 for both solvers, and
-   `results.md` must say so.
+   `clipping`), and `clipping = 0` does not change that. Since velocity is
+   stored per cell but holds that cell's − faces, a smoky cell's + faces can
+   be missing, and face n is never stored. Resolved: the §4.1 metrics use
+   only measured cells, whose whole 3×3×3 neighbourhood is inside the domain,
+   collider-free and above density 1e-6, for both solvers; outflow uses face
+   nz − 1 with layer nz − 2's density. `results.md` must say so.
 3. **Mantaflow's wind acts only on smoky cells.** `plume_wind` is kept and
    documented as above. The brief's no-emitter wind check cannot work, and an
    emitter check replaces it.

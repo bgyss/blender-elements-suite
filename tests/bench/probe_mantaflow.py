@@ -15,7 +15,7 @@ Options, all optional, for the experiments in docs/bench/mantaflow-notes.md:
   density=D         the flow's density (default Blender's, 1)
   temperature=T     the flow's temperature difference (default Blender's, 1)
   absolute=0|1      the flow's use_absolute (default Blender's, 1: hold the value)
-  surface=S         the flow's surface_distance, in cells (default Blender's, 1.5)
+  surface=S         the flow's surface_distance, in cells (default Blender's, 1.0)
   alpha=A beta=B    the domain's buoyancy coefficients
   vorticity=V       the domain's vorticity
   wind=S            add a WIND force field of strength S blowing along +x

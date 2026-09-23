@@ -10,5 +10,7 @@ bytemuck.workspace = true
 elements-core = { path = "../elements-core" }
 serde.workspace = true
 serde_json.workspace = true
-vdb-rs.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+vdb-rs.workspace = true
