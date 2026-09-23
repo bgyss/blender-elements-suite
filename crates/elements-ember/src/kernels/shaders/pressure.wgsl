@@ -15,24 +15,46 @@ fn relax(gid: vec3<u32>, colour: u32) {
     let n = vec3<i32>(params.dims);
     var sum = 0.0;
     var count = 0.0;
-    for (var a = 0u; a < 3u; a = a + 1u) {
-        var e = vec3<i32>(0);
-        e[a] = 1;
-        // A neighbour inside counts with its value. Beyond an open face
-        // p = 0 (Dirichlet), so it counts with nothing added. Beyond a wall
-        // (Neumann) it is left out.
-        if (c[a] > 0) {
-            sum += textureLoad(pressure, c - e).x;
-            count += 1.0;
-        } else if (is_open(a, 0u)) {
-            count += 1.0;
-        }
-        if (c[a] < n[a] - 1) {
-            sum += textureLoad(pressure, c + e).x;
-            count += 1.0;
-        } else if (is_open(a, 1u)) {
-            count += 1.0;
-        }
+    // A neighbour inside counts with its value. Beyond an open face p = 0
+    // (Dirichlet), so it counts with nothing added. Beyond a wall (Neumann)
+    // it is left out. Written out per side on purpose: as a loop over axes
+    // with dynamic vector indexing, this kernel ran about 40% slower through
+    // naga's Metal backend (0.28 against 0.20 ms per iteration at 128³).
+    if (c.x > 0) {
+        sum += textureLoad(pressure, c - vec3<i32>(1, 0, 0)).x;
+        count += 1.0;
+    } else if (is_open(0u, 0u)) {
+        count += 1.0;
+    }
+    if (c.x < n.x - 1) {
+        sum += textureLoad(pressure, c + vec3<i32>(1, 0, 0)).x;
+        count += 1.0;
+    } else if (is_open(0u, 1u)) {
+        count += 1.0;
+    }
+    if (c.y > 0) {
+        sum += textureLoad(pressure, c - vec3<i32>(0, 1, 0)).x;
+        count += 1.0;
+    } else if (is_open(1u, 0u)) {
+        count += 1.0;
+    }
+    if (c.y < n.y - 1) {
+        sum += textureLoad(pressure, c + vec3<i32>(0, 1, 0)).x;
+        count += 1.0;
+    } else if (is_open(1u, 1u)) {
+        count += 1.0;
+    }
+    if (c.z > 0) {
+        sum += textureLoad(pressure, c - vec3<i32>(0, 0, 1)).x;
+        count += 1.0;
+    } else if (is_open(2u, 0u)) {
+        count += 1.0;
+    }
+    if (c.z < n.z - 1) {
+        sum += textureLoad(pressure, c + vec3<i32>(0, 0, 1)).x;
+        count += 1.0;
+    } else if (is_open(2u, 1u)) {
+        count += 1.0;
     }
     // Only a closed 1×1×1 domain has no neighbours, and nothing to solve.
     if (count == 0.0) {
