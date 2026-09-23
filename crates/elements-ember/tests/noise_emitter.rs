@@ -157,6 +157,12 @@ fn bad_noise_is_rejected() {
         serde_json::json!({ "seed": 1, "scale_m": 0.0, "amplitude": 0.5 })
     ));
     assert!(with(
+        serde_json::json!({ "seed": 1, "scale_m": 1e-40, "amplitude": 0.5 })
+    ));
+    assert!(with(
+        serde_json::json!({ "seed": 1, "scale_m": 0.1, "amplitude": 0.5, "evolution": 1e38 })
+    ));
+    assert!(with(
         serde_json::json!({ "seed": 1, "scale_m": 0.1, "amplitude": 1.5 })
     ));
     assert!(

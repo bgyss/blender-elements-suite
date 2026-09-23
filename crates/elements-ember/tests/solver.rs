@@ -890,3 +890,97 @@ fn a_collider_sdf_without_its_velocity_is_an_error() {
         "got {err:?}"
     );
 }
+
+/// Like `a_failed_step_returns_every_field_to_the_pool`, with a collider
+/// wired to inputs 4 and 5. The solid mask is built before the first emit,
+/// which is where the mis-sized source fails, so the mask must go back to
+/// the pool on the error path too.
+#[test]
+fn a_failed_step_with_a_collider_returns_the_mask_to_the_pool() {
+    let registry = elements_ember::registry();
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(
+        registry
+            .build(
+                "ember.sphere_emitter",
+                &serde_json::json!({ "center": [1.0, 1.0, 0.4], "radius": 0.3 }),
+            )
+            .unwrap(),
+    );
+    let wrong = graph.add_node(Box::new(WrongSize));
+    let collider = graph.add_node(
+        registry
+            .build(
+                "ember.collider",
+                &serde_json::json!({
+                    "shape": { "sphere": { "radius": 0.2 } },
+                    "transform": { "keys": [{ "frame": 0, "translate": [1.0, 1.0, 1.2] }] }
+                }),
+            )
+            .unwrap(),
+    );
+    let solver = graph.add_node(registry.build(KIND, &serde_json::json!({})).unwrap());
+    let output = graph.add_node(
+        registry
+            .build("core.output", &serde_json::json!({}))
+            .unwrap(),
+    );
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    graph
+        .connect(socket(emitter, 0), socket(solver, 0))
+        .unwrap();
+    graph.connect(socket(wrong, 0), socket(solver, 1)).unwrap();
+    graph
+        .connect(socket(collider, 0), socket(solver, 4))
+        .unwrap();
+    graph
+        .connect(socket(collider, 1), socket(solver, 5))
+        .unwrap();
+    graph.connect(socket(solver, 0), socket(output, 0)).unwrap();
+    graph.set_output(output);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut timeline = timeline(0);
+    let err = timeline
+        .goto(
+            &graph,
+            &gpu,
+            &mut pool,
+            &mut pipelines,
+            FieldDims::new(8, 8, 8),
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, NodeError::Gpu(GpuError::Validation(_))),
+        "got {err:?}"
+    );
+    assert!(pool.allocation_count() > 0);
+    assert_eq!(
+        pool.pooled_count() as u64,
+        pool.allocation_count(),
+        "every allocated texture, the solid mask included, must be back in the pool"
+    );
+}
+
+/// With a collider in the domain, the per-frame solid mask goes back to the
+/// pool after every successful step. The pool reaches a steady state within
+/// a few frames, so a mask that leaked each frame would show as allocations
+/// growing between frames 3 and 6.
+#[test]
+fn a_collider_mask_does_not_leak_across_frames() {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&plume_16_with_far_collider(PREVIEW, true)).unwrap();
+    doc["nodes"][3]["params"]["transform"]["keys"][0]["translate"] =
+        serde_json::json!([1.0, 1.0, 1.2]);
+    let mut session = Session::new(&doc.to_string());
+    let mut timeline = timeline(0);
+    let mut counts = Vec::new();
+    for frame in 1..=6 {
+        session.density_bits(&mut timeline, frame);
+        counts.push(session.pool.allocation_count());
+    }
+    assert_eq!(counts[2], counts[5], "allocations per frame: {counts:?}");
+}

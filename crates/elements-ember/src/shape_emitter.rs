@@ -26,16 +26,23 @@ const FACES_WGSL: &str = concat!(
     include_str!("kernels/shaders/emitter_faces.wgsl"),
 );
 
+/// The smallest noise cell a document may ask for, metres (spec §2.2).
+pub const MIN_NOISE_SCALE_M: f32 = 1e-4;
+/// The largest noise evolution rate, in either direction, per second
+/// (spec §2.2).
+pub const MAX_NOISE_EVOLUTION: f32 = 1e4;
+
 /// Noise that modulates an emitter's rates (spec §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Noise {
     pub seed: u64,
-    /// Size of one noise cell, metres.
+    /// Size of one noise cell, metres; at least [`MIN_NOISE_SCALE_M`].
     pub scale_m: f32,
     /// 0 turns the noise off; 1 lets it cut emission to zero.
     pub amplitude: f32,
-    /// How fast the pattern changes, per second; 0 is a still pattern.
+    /// How fast the pattern changes, per second; 0 is a still pattern. At
+    /// most [`MAX_NOISE_EVOLUTION`] in magnitude.
     #[serde(default)]
     pub evolution: f32,
 }
@@ -276,8 +283,20 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
     }
     if let Some(n) = p.noise {
         params::finite(KIND, "noise", &[n.scale_m, n.amplitude, n.evolution])?;
-        if n.scale_m <= 0.0 {
-            return Err(params::bad(KIND, "noise scale_m must be positive"));
+        // A tiny scale puts many noise cells in one voxel, and the
+        // position divided by it overflows f32; a huge evolution loses the
+        // pattern's time coordinate to f32 rounding within seconds.
+        if n.scale_m < MIN_NOISE_SCALE_M {
+            return Err(params::bad(
+                KIND,
+                "noise scale_m must be at least 1e-4 metres",
+            ));
+        }
+        if n.evolution.abs() > MAX_NOISE_EVOLUTION {
+            return Err(params::bad(
+                KIND,
+                "noise evolution must be within [-1e4, 1e4] per second",
+            ));
         }
         if !(0.0..=1.0).contains(&n.amplitude) {
             return Err(params::bad(KIND, "noise amplitude must be in [0, 1]"));

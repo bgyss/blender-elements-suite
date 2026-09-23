@@ -54,7 +54,8 @@ impl Scene {
     }
 
     /// `plume` with a static sphere collider of radius 0.25 m, 0.5 m above the
-    /// emitter (piece 2 spec §5.3).
+    /// emitter. Piece 2 spec §5.3 names the scene; the numbers are from the
+    /// 2b-2 spec §6.
     pub fn plume_collider(resolution: u32) -> Self {
         Self {
             name: "plume_collider",
@@ -66,7 +67,8 @@ impl Scene {
         }
     }
 
-    /// `plume` with wind of 0.5 m/s² along +x (piece 2 spec §5.3).
+    /// `plume` with wind of 0.5 m/s² along +x. Piece 2 spec §5.3 names the
+    /// scene; the numbers are from the 2b-2 spec §6.
     pub fn plume_wind(resolution: u32) -> Self {
         let mut scene = Self::plume(resolution);
         scene.name = "plume_wind";

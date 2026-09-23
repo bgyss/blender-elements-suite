@@ -112,5 +112,20 @@ fn the_plume_collider_scene_loads_and_steps() {
 fn the_plume_wind_scene_loads_and_steps() {
     let scene = Scene::plume_wind(16);
     assert_eq!(scene.solver.wind, [0.5, 0.0, 0.0]);
+    // The document is what 2b-3's Mantaflow side and the daemon read, so the
+    // wind must survive serialisation, not just sit on the struct.
+    let text = scene.document().to_json().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let solver = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == 1)
+        .expect("node 1 is the solver");
+    assert_eq!(
+        solver["params"]["wind"],
+        serde_json::json!([0.5, 0.0, 0.0]),
+        "the serialised solver params must carry the wind"
+    );
     loads_and_steps(&scene);
 }
