@@ -1,0 +1,39 @@
+[package]
+name = "vdb-rs"
+version = "0.6.0"
+edition = "2021"
+authors = ["Traverse-Research <support@traverseresearch.nl>"]
+description = "OpenVDB manipulation library."
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/Traverse-Research/vdb-rs"
+repository = "https://github.com/Traverse-Research/vdb-rs"
+keywords = ["voxel", "vdb"]
+categories = ["rendering"]
+include = ["src", "LICENSE"]
+documentation = "https://docs.rs/vdb-rs"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+
+[profile.dev.package.'*']
+opt-level = 's'
+debug = true
+
+[dependencies]
+bitflags = "2"
+bitvec = "1"
+blosc-src = { version = "0.3.0", features = ["lz4"] }
+bytemuck = { version = "1.13", features = ["extern_crate_alloc"] }
+byteorder = "1.4"
+flate2 = "1"
+glam = ">=0.18,<=0.24"
+half = { version = "2.2.1", features = ["bytemuck"] }
+log = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+bevy = { version = "0.11", default-features = false, features = ["bevy_pbr"] }
+bevy-aabb-instancing = "0.10"
+bevy_egui = "0.22"
+smooth-bevy-cameras = "0.9"

@@ -378,6 +378,7 @@ dependencies = [
  "elements-core",
  "serde",
  "serde_json",
+ "vdb-rs",
  "wgpu",
 ]
 
@@ -1484,8 +1485,6 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "vdb-rs"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd7c7f05c3fffea2ea595d9645b81ca7c0fc53c739992b1145ed478cd01f400"
 dependencies = [
  "bitflags",
  "bitvec",
