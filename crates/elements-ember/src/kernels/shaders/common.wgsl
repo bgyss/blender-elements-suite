@@ -28,7 +28,9 @@ fn is_open(axis: u32, side: u32) -> bool {
 }
 
 // Whether face `i` along `axis` is a solid wall: a boundary face that is
-// not open. Everything wall-related goes through this one function.
+// not open. This is the face grids' wall test; the pressure stencil,
+// `texel()`, buoyancy and the curl/confine clamps have their own boundary
+// logic (2b-1 spec §4.2 lists them for 2b-2's collider mask).
 fn is_wall(axis: u32, i: u32) -> bool {
     if (i == 0u) {
         return !is_open(axis, 0u);

@@ -350,8 +350,8 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 
 ## 6. Risks carried into piece 2b
 
-Found by piece 2a's whole-branch review. (a) was resolved in 2a, and (g)
-mostly. 2b-1 resolved (b), (c), (d), (f) and (h). Still open: (e), the open
+Found by piece 2a's whole-branch review. (a) and (i) were resolved in 2a, and
+(g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). Still open: (e), the open
 part of (g), and (j).
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
