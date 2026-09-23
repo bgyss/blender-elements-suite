@@ -129,3 +129,31 @@ fn the_plume_wind_scene_loads_and_steps() {
     );
     loads_and_steps(&scene);
 }
+
+use elements_ember::bench::EMISSION_FRAMES;
+
+/// 2b-3 spec §3: every bench scene uses the general emitter, a static
+/// sphere with no noise or velocity, emitting for frames 1–60.
+#[test]
+fn bench_scenes_use_the_general_emitter_with_a_window() {
+    for scene in [
+        Scene::plume(32),
+        Scene::plume_collider(32),
+        Scene::plume_wind(32),
+    ] {
+        let doc = scene.document();
+        let emitter = &doc.nodes[0];
+        assert_eq!(emitter.kind, "ember.emitter", "{}", scene.name);
+        assert_eq!(
+            emitter.params["active_frames"],
+            serde_json::json!(EMISSION_FRAMES),
+            "{}",
+            scene.name
+        );
+        assert_eq!(scene.emitter.velocity_blend, 0.0);
+        assert!(scene.emitter.noise.is_none());
+        // The document still evaluates.
+        let registry = elements_ember::registry();
+        doc.into_graph(&registry).unwrap();
+    }
+}

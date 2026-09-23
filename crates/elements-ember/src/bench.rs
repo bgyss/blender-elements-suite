@@ -3,7 +3,7 @@
 use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION};
 
 use crate::collider::{self, ColliderParams};
-use crate::emitter::{self, Sphere};
+use crate::shape_emitter::{self, EmitterParams};
 use crate::solver::{self, SolverParams};
 use crate::transform::{Shape, Transform};
 
@@ -12,8 +12,13 @@ pub const GATE_STEP_MS: f64 = 100.0;
 /// Projection must leave at most this fraction of the RMS divergence.
 pub const GATE_RATIO: f64 = 0.10;
 
-/// A benchmark scene, defined once (spec §5.3). Piece 2a generates only the
-/// `.elements` document from it; 2b adds the matching Mantaflow script.
+/// Frames on which every bench scene emits (2b-3 spec §3). Frames after the
+/// last measure mass drift with no sources.
+pub const EMISSION_FRAMES: [u32; 2] = [1, 60];
+
+/// A benchmark scene, defined once (spec §5.3). It generates the `.elements`
+/// document; the matching Mantaflow scene comes from the same values
+/// (`docs/superpowers/specs/2026-09-23-ember-mantaflow-benchmark-2b3-design.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
     pub name: &'static str,
@@ -22,7 +27,7 @@ pub struct Scene {
     pub domain_size: f64,
     pub fps: f64,
     pub frames: u32,
-    pub emitter: Sphere,
+    pub emitter: EmitterParams,
     pub solver: SolverParams,
     /// A static collider wired to the solver's inputs 4 and 5, if any.
     pub collider: Option<ColliderParams>,
@@ -37,11 +42,14 @@ impl Scene {
             domain_size: 2.0,
             fps: 24.0,
             frames: 120,
-            emitter: Sphere {
-                center: [1.0, 1.0, 0.3],
-                radius: 0.2,
+            emitter: EmitterParams {
                 density_rate: 1.0,
                 temperature_rate: 1.0,
+                active_frames: Some(EMISSION_FRAMES),
+                ..EmitterParams::new(
+                    Shape::Sphere { radius: 0.2 },
+                    Transform::at([1.0, 1.0, 0.3]),
+                )
             },
             solver: SolverParams {
                 pressure_iterations: 160,
@@ -101,8 +109,8 @@ impl Scene {
         let mut nodes = vec![
             DocNode {
                 id: 0,
-                kind: emitter::KIND.to_owned(),
-                params: to_value(serde_json::to_value(self.emitter)),
+                kind: shape_emitter::KIND.to_owned(),
+                params: to_value(serde_json::to_value(&self.emitter)),
             },
             DocNode {
                 id: 1,
