@@ -20,9 +20,11 @@ cycles. **2b-1**, solver correctness, is complete: CFL substeps, RK2 +
 MacCormack advection, vorticity confinement, dissipation, per-face boundaries,
 and the `preview` and `final` presets (`docs/bench/presets.md`). Preview runs
 one CFL-clamped substep at about 92 ms a 128³ frame; why that is so far above
-2a's 34 ms is open risk (j) in §6 of the piece 2 spec. **2b-2**, scene content
-(emitters, colliders, wind, flame), is next. **2b-3**, the Mantaflow benchmark,
-follows it.
+2a's 34 ms is open risk (j) in §6 of the piece 2 spec. **2b-2**, scene content,
+is complete: keyframed box and sphere emitters (with noise and velocity
+emission) and colliders, unions of each, and wind
+(`docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`).
+**2b-3**, the Mantaflow benchmark, is next. Flame is its own later cycle, 2b-4.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -33,6 +35,8 @@ follows it.
 - Ember piece 2a plan: `docs/superpowers/plans/2026-09-22-ember-solver-2a.md`
 - Ember piece 2b-1 spec: `docs/superpowers/specs/2026-09-22-ember-solver-2b1-design.md`
 - Ember piece 2b-1 plan: `docs/superpowers/plans/2026-09-22-ember-solver-2b1.md`
+- Ember piece 2b-2 spec: `docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`
+- Ember piece 2b-2 plan: `docs/superpowers/plans/2026-09-23-ember-scene-content-2b2.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
@@ -143,6 +147,9 @@ parser, with `vdb-rs` used as the read-back oracle in tests.
   buffers at 256 MiB. Everything else stays at `downlevel_defaults`. Notably,
   **4 storage textures per shader stage**: read fields through
   `texture_3d<f32>` + `textureLoad`, and write through storage.
+- **Kernels with solids** include `solid.wgsl` and must declare
+  `var solid: texture_3d<f32>`. When there is no collider, a 1×1×1 placeholder
+  is bound and `has_solids` = 0 keeps it unread.
 - **A snapshot for frame N is the state entering N.** Producing N is always
   "restore or reach the entering state, then one `eval`". Never cache outputs.
 - Blender extension ZIPs put `__init__.py` and `blender_manifest.toml` at the

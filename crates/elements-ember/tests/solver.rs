@@ -223,7 +223,11 @@ fn timeline(budget_bytes: u64) -> Timeline {
 /// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
 /// back and forth, and after eviction forced a recompute.
 fn assert_frame_40_is_bit_identical(solver: &str) {
-    let mut s = Session::new(&plume_16(solver));
+    assert_doc_frame_40_is_bit_identical(&plume_16(solver));
+}
+
+fn assert_doc_frame_40_is_bit_identical(doc: &str) {
+    let mut s = Session::new(doc);
 
     let mut in_order = timeline(0);
     let mut reference = Vec::new();
@@ -256,6 +260,47 @@ fn assert_frame_40_is_bit_identical(solver: &str) {
 #[test]
 fn frame_40_is_bit_identical_however_it_is_reached() {
     assert_frame_40_is_bit_identical(PREVIEW);
+}
+
+/// A 16³ document with an animated, noisy box emitter (all four outputs
+/// wired) and an animated sphere collider (inputs 4 and 5).
+const ANIMATED: &str = r#"{
+  "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+  "nodes": [
+    { "id": 0, "kind": "ember.emitter", "params": {
+        "shape": { "box": { "half_extents": [0.2, 0.2, 0.1] } },
+        "transform": { "keys": [
+          { "frame": 1, "translate": [0.7, 1.0, 0.3] },
+          { "frame": 40, "translate": [1.3, 1.0, 0.3], "rotate": { "axis": [0, 0, 1], "degrees": 90 } } ] },
+        "density_rate": 1.0, "temperature_rate": 2.0,
+        "velocity": [0.0, 0.0, 0.5], "velocity_blend": 4.0,
+        "noise": { "seed": 9, "scale_m": 0.2, "amplitude": 0.6, "evolution": 1.5 } } },
+    { "id": 1, "kind": "ember.collider", "params": {
+        "shape": { "sphere": { "radius": 0.2 } },
+        "transform": { "keys": [
+          { "frame": 1, "translate": [0.6, 1.0, 1.2] },
+          { "frame": 40, "translate": [1.4, 1.0, 1.1] } ] } } },
+    { "id": 2, "kind": "ember.smoke_solver", "params": { "pressure_iterations": 40, "buoyancy_temperature": 1.0, "vorticity": 2.0 } },
+    { "id": 3, "kind": "core.output", "params": {} }
+  ],
+  "edges": [
+    { "from_node": 0, "from_index": 0, "to_node": 2, "to_index": 0 },
+    { "from_node": 0, "from_index": 1, "to_node": 2, "to_index": 1 },
+    { "from_node": 0, "from_index": 2, "to_node": 2, "to_index": 2 },
+    { "from_node": 0, "from_index": 3, "to_node": 2, "to_index": 3 },
+    { "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 4 },
+    { "from_node": 1, "from_index": 1, "to_node": 2, "to_index": 5 },
+    { "from_node": 2, "from_index": 0, "to_node": 3, "to_index": 0 }
+  ],
+  "output": 3
+}"#;
+
+/// Umbrella §4: frame 40 is bit-identical in order, after scrubbing and after
+/// eviction, with an animated collider and an animated, noisy emitter,
+/// because poses, masks and noise are recomputed from the document's time.
+#[test]
+fn frame_40_is_bit_identical_with_animated_emitter_and_collider() {
+    assert_doc_frame_40_is_bit_identical(ANIMATED);
 }
 
 /// Everything 2b-1 added, switched on: a CFL count that varies from frame to

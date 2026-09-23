@@ -2,8 +2,10 @@
 
 use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION};
 
+use crate::collider::{self, ColliderParams};
 use crate::emitter::{self, Sphere};
 use crate::solver::{self, SolverParams};
+use crate::transform::{Shape, Transform};
 
 /// A step must take at most this long at 128³ (≥ 10 fps).
 pub const GATE_STEP_MS: f64 = 100.0;
@@ -12,7 +14,7 @@ pub const GATE_RATIO: f64 = 0.10;
 
 /// A benchmark scene, defined once (spec §5.3). Piece 2a generates only the
 /// `.elements` document from it; 2b adds the matching Mantaflow script.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
     pub name: &'static str,
     pub cells: [u32; 3],
@@ -22,6 +24,8 @@ pub struct Scene {
     pub frames: u32,
     pub emitter: Sphere,
     pub solver: SolverParams,
+    /// A static collider wired to the solver's inputs 4 and 5, if any.
+    pub collider: Option<ColliderParams>,
 }
 
 impl Scene {
@@ -45,7 +49,29 @@ impl Scene {
                 buoyancy_temperature: 1.0,
                 ..SolverParams::default()
             },
+            collider: None,
         }
+    }
+
+    /// `plume` with a static sphere collider of radius 0.25 m, 0.5 m above the
+    /// emitter (piece 2 spec §5.3).
+    pub fn plume_collider(resolution: u32) -> Self {
+        Self {
+            name: "plume_collider",
+            collider: Some(ColliderParams {
+                shape: Shape::Sphere { radius: 0.25 },
+                transform: Transform::at([1.0, 1.0, 0.8]),
+            }),
+            ..Self::plume(resolution)
+        }
+    }
+
+    /// `plume` with wind of 0.5 m/s² along +x (piece 2 spec §5.3).
+    pub fn plume_wind(resolution: u32) -> Self {
+        let mut scene = Self::plume(resolution);
+        scene.name = "plume_wind";
+        scene.solver.wind = [0.5, 0.0, 0.0];
+        scene
     }
 
     pub fn with_iterations(mut self, n: u32) -> Self {
@@ -58,7 +84,8 @@ impl Scene {
         self
     }
 
-    /// The scene as an `.elements` document: emitter → solver → output.
+    /// The scene as an `.elements` document: emitter → solver → output, plus
+    /// the collider when there is one.
     pub fn document(&self) -> Document {
         let to_value = |v: serde_json::Result<serde_json::Value>| {
             v.expect("scene parameters are plain numbers and always serialize")
@@ -69,6 +96,32 @@ impl Scene {
             to_node,
             to_index,
         };
+        let mut nodes = vec![
+            DocNode {
+                id: 0,
+                kind: emitter::KIND.to_owned(),
+                params: to_value(serde_json::to_value(self.emitter)),
+            },
+            DocNode {
+                id: 1,
+                kind: solver::KIND.to_owned(),
+                params: to_value(serde_json::to_value(self.solver)),
+            },
+            DocNode {
+                id: 2,
+                kind: "core.output".to_owned(),
+                params: serde_json::json!({}),
+            },
+        ];
+        let mut edges = vec![edge(0, 0, 1, 0), edge(0, 1, 1, 1), edge(1, 0, 2, 0)];
+        if let Some(collider) = &self.collider {
+            nodes.push(DocNode {
+                id: 3,
+                kind: collider::KIND.to_owned(),
+                params: to_value(serde_json::to_value(collider)),
+            });
+            edges.extend([edge(3, 0, 1, 4), edge(3, 1, 1, 5)]);
+        }
         Document {
             version: ELEMENTS_DOC_VERSION,
             dims: self.cells,
@@ -76,24 +129,8 @@ impl Scene {
             start_frame: 1,
             cache_budget_mb: 0,
             domain_size: self.domain_size,
-            nodes: vec![
-                DocNode {
-                    id: 0,
-                    kind: emitter::KIND.to_owned(),
-                    params: to_value(serde_json::to_value(self.emitter)),
-                },
-                DocNode {
-                    id: 1,
-                    kind: solver::KIND.to_owned(),
-                    params: to_value(serde_json::to_value(self.solver)),
-                },
-                DocNode {
-                    id: 2,
-                    kind: "core.output".to_owned(),
-                    params: serde_json::json!({}),
-                },
-            ],
-            edges: vec![edge(0, 0, 1, 0), edge(0, 1, 1, 1), edge(1, 0, 2, 0)],
+            nodes,
+            edges,
             output: 2,
         }
     }

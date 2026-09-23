@@ -1,7 +1,7 @@
 # Ember Piece 2b-2 — Scene Content Design
 
 **Date:** 2026-09-23
-**Status:** Approved for planning
+**Status:** Complete.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2). Follows 2b-1
 (`2026-09-22-ember-solver-2b1-design.md`), whose §4.2 lists the places a
 collider's solid mask must reach.
@@ -236,15 +236,15 @@ Grids are at most 32³ and non-cubic, except where a test says otherwise.
 | Keyframes | the midpoint between two keys gives the linear translation and the slerp rotation; velocity equals Δtranslate/Δt; the transform holds before the first key and after the last | lerp the rotation instead of slerp |
 | Obstacle velocity | a box spinning at a known ω has face velocities `ω × r` against a CPU reference | leave out ω × r |
 | Noise | bit-identical for a seed; mean factor within 5% of `1 − amplitude/2`; the pattern changes over time when `evolution > 0`; the same pattern within tolerance at 32³ and 64³ | noise in grid units rather than metres |
-| Emitter union | the rates add, occupancy is the maximum, and velocity is occupancy-weighted | max instead of sum for the rates |
+| Emitter union | the rates add, the velocity weight is the maximum, and velocity is weighted by each emitter's velocity weight | max instead of sum for the rates |
 | Collider union | the SDF is the minimum, and each face's velocity comes from the nearer collider | take the velocity from the farther collider |
 | Velocity blend | still fluid in a fully occupied emitter reaches `u_e·(1 − exp(−rate·t))` | linear `rate·h` |
-| Solid faces | after projection, every solid face carries exactly the obstacle's velocity component along the face's axis | skip the solid test in `is_wall` |
+| Solid faces | after projection, every solid face carries exactly the obstacle's velocity component along the face's axis | delete the `face_solid` branch in `gradient.wgsl` |
 | Collider scene (umbrella §6) | plume past a static sphere at 32³: density inside stays at most 1% of peak (zeroed by construction); density beside the sphere exceeds twice the same measure with no collider (the plume is deflected) | `solidify` always writes 0, so smoke passes straight through the sphere |
-| Moving collider | a box pushed through still air drives mean flow ahead of it in its direction of motion; the divergence rule holds | obstacle velocity zero |
+| Moving collider | a box pushed through still air drives mean flow ahead of it in its direction of motion | obstacle velocity zero |
 | Wind | still air under uniform wind accelerates at the wind's rate, to 1e-5 | apply wind at wall faces too |
-| Sockets | occupancy without velocity, or SDF without velocity, is an error; a 2-input document steps bit-identically to before | require all six inputs |
-| Determinism | frame 40 is bit-identical in order, after scrubbing and after eviction, with an animated collider and an animated, noisy emitter | cache the solid mask inside the node across frames |
+| Sockets | a velocity weight without its target velocity, or SDF without velocity, is an error; a 2-input document steps bit-identically to before | require all six inputs |
+| Determinism | frame 40 is bit-identical in order, after scrubbing and after eviction, with an animated collider and an animated, noisy emitter | `ember.emitter` keeps the previous frame's pose in the node and uses it (caching only the first frame's pose does not fail: every timeline shares the node and evaluates frame 1 first, so all see the same stale pose) |
 
 ## 6. Benchmark scenes
 
@@ -262,12 +262,15 @@ test like `the_plume_scene_loads_and_steps`.
 
 1. Core `EvalCtx::input_connected`. Shapes and keyframed transforms: CPU
    evaluation, velocities, and the WGSL SDF module.
-2. `ember.emitter` (sphere and box, rates, occupancy, emitted velocity) and
+2. `ember.emitter` (sphere and box, rates, velocity weight, emitted velocity) and
    `ember.emitter_union`.
 3. Noise modulation.
 4. `ember.collider`, obstacle velocity, `ember.collider_union`.
-5. The solver's optional sockets, `solidify`, and the solid mask in every
-   boundary place, with the collider scene.
-6. Velocity emission and wind.
+5. Velocity emission and wind.
+6. The solver's optional collider sockets, `solidify`, and the solid mask in
+   every boundary place, with the collider scene.
+
+   Velocity emission was built before solids, the reverse of the order first
+   planned, so the solver's inputs grew from 2 to 4 (Task 5) to 6 (Task 6).
 7. Determinism under animation, the two benchmark scenes, and docs (CLAUDE.md
    and the piece 2 spec's status).

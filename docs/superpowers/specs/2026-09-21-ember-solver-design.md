@@ -5,6 +5,7 @@
 160 pressure iterations (`docs/bench/speed-gate.md`). §5 is the benchmark design,
 whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
 Piece 2b-1 (solver correctness) is complete; see `2026-09-22-ember-solver-2b1-design.md`.
+2b-2 (scene content) is complete; see `2026-09-23-ember-scene-content-2b2-design.md`.
 Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e), the open part of (g), and (j) remain.
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
