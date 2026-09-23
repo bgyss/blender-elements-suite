@@ -6,8 +6,9 @@ use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
     StateStore, Time, Timeline, TimelineConfig, Value,
 };
+use elements_ember::kernels::Advection;
 use elements_ember::kernels::StepConstants;
-use elements_ember::solver::{KIND, SolverState, Sources, substep};
+use elements_ember::solver::{KIND, SolverParams, SolverState, Sources, resolve_params, substep};
 
 fn rejected(params: serde_json::Value) -> bool {
     matches!(
@@ -24,6 +25,17 @@ fn rejects_out_of_range_solver_parameters() {
     ));
     assert!(rejected(serde_json::json!({ "substeps": 0 })));
     assert!(rejected(serde_json::json!({ "substeps": 17 })));
+    assert!(!rejected(serde_json::json!({ "quality": "final" })));
+    assert!(rejected(serde_json::json!({ "quality": "ultra" })));
+    assert!(!rejected(
+        serde_json::json!({ "max_substeps": 16, "cfl": 10.0 })
+    ));
+    assert!(rejected(serde_json::json!({ "max_substeps": 17 })));
+    assert!(rejected(
+        serde_json::json!({ "substeps": 2, "max_substeps": 2 })
+    ));
+    assert!(rejected(serde_json::json!({ "cfl": 0.0 })));
+    assert!(rejected(serde_json::json!({ "cfl": 10.5 })));
     assert!(rejected(serde_json::json!({ "pressure_iterations": 0 })));
     assert!(rejected(serde_json::json!({ "pressure_iterations": 1001 })));
     assert!(rejected(
@@ -53,6 +65,42 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(
         serde_json::json!({ "temperature_dissipation": 1e39 })
     ));
+}
+
+/// Spec §6: a preset fills only the fields a document leaves unset, and
+/// 2a's `substeps` still works as `max_substeps`.
+#[test]
+fn a_preset_fills_only_what_the_document_leaves_unset() {
+    let p = resolve_params(&serde_json::json!({ "quality": "final", "pressure_iterations": 50 }))
+        .unwrap();
+    assert_eq!(p.pressure_iterations, 50, "an explicit field wins");
+    assert_eq!(p.max_substeps, 8, "final's cap");
+    let alias = resolve_params(&serde_json::json!({ "substeps": 3 })).unwrap();
+    assert_eq!(alias.max_substeps, 3, "the 2a alias");
+    assert_eq!(
+        resolve_params(&serde_json::Value::Null).unwrap(),
+        SolverParams::default()
+    );
+}
+
+/// Every per-substep parameter a document sets reaches the kernels.
+#[test]
+fn step_constants_carry_every_solver_parameter() {
+    let p = resolve_params(&serde_json::json!({
+        "advection": "semi_lagrangian", "vorticity": 3.0,
+        "density_dissipation": 0.5, "temperature_dissipation": 0.25,
+        "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
+        "boundaries": { "-x": "open" }
+    }))
+    .unwrap();
+    let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
+    assert_eq!(c.advection, Advection::SemiLagrangian);
+    assert_eq!(c.vorticity, 3.0);
+    assert_eq!(c.density_dissipation, 0.5);
+    assert_eq!(c.temperature_dissipation, 0.25);
+    assert_eq!(c.alpha, 0.75);
+    assert_eq!(c.beta, 2.0);
+    assert_eq!(c.open_mask, 0b100001);
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.

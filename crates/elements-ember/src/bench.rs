@@ -40,7 +40,6 @@ impl Scene {
                 temperature_rate: 1.0,
             },
             solver: SolverParams {
-                substeps: 1,
                 pressure_iterations: 160,
                 buoyancy_density: 0.0,
                 buoyancy_temperature: 1.0,
@@ -51,6 +50,11 @@ impl Scene {
 
     pub fn with_iterations(mut self, n: u32) -> Self {
         self.solver.pressure_iterations = n;
+        self
+    }
+
+    pub fn with_max_substeps(mut self, n: u32) -> Self {
+        self.solver.max_substeps = n;
         self
     }
 

@@ -1,7 +1,8 @@
 //! `ember.smoke_solver`: a dense-grid smoke solver (spec §2.4, §3).
 //!
 //! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
-//! project, and advect scalars with dissipation.
+//! project, and advect scalars with dissipation. Each frame first measures
+//! the fastest face and picks its substep count by CFL.
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError,
@@ -11,6 +12,7 @@ use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, Socke
 use serde::{Deserialize, Serialize};
 
 use crate::boundaries::Boundaries;
+use crate::cfl;
 use crate::kernels::{self, Advection, Carried, Pass, StepConstants, Uniforms};
 use crate::params;
 
@@ -25,47 +27,183 @@ const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
 
 const MAX_SUBSTEPS: u32 = 16;
 const MAX_PRESSURE_ITERATIONS: u32 = 1000;
+const MAX_CFL: f32 = 10.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// A quality preset (spec §6). It fills every field a document leaves unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Quality {
+    /// Interactive: 128³ within 100 ms a frame.
+    #[default]
+    Preview,
+    /// Offline bakes: no time budget.
+    Final,
+}
+
+impl Quality {
+    /// The preset's full parameter set.
+    pub fn params(self) -> SolverParams {
+        let (pressure_iterations, max_substeps) = match self {
+            // `max_substeps` is provisional until the preset sweep decides it
+            // (spec §6, `docs/bench/presets.md`).
+            Self::Preview => (160, 2),
+            // 480 iterations: ratio 0.0076 in `docs/bench/iteration-sweep.md`.
+            Self::Final => (480, 8),
+        };
+        SolverParams {
+            max_substeps,
+            cfl: 1.0,
+            pressure_iterations,
+            advection: Advection::MacCormack,
+            vorticity: 0.0,
+            density_dissipation: 0.0,
+            temperature_dissipation: 0.0,
+            buoyancy_density: 0.0,
+            // Provisional until 2b-3 maps parameters to Mantaflow's.
+            buoyancy_temperature: 1.0,
+            boundaries: Boundaries::default(),
+        }
+    }
+}
+
+/// `ember.smoke_solver`'s parameters, resolved: every field has a value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SolverParams {
-    /// Fixed substeps per frame. CFL-driven substepping is Task 7.
-    pub substeps: u32,
+    /// Cap on CFL substeps per frame (spec §3).
+    pub max_substeps: u32,
+    /// Target maximum cells travelled per substep.
+    pub cfl: f32,
     /// Red-black Gauss–Seidel iterations per substep.
     pub pressure_iterations: u32,
+    /// How velocity and scalars are advected (spec §4.1).
+    pub advection: Advection,
+    /// Vorticity confinement ε, 1/s; 0 turns it off (spec §4.4).
+    pub vorticity: f32,
+    /// Exponential decay of density, 1/s (spec §4.5).
+    pub density_dissipation: f32,
+    /// Exponential decay of temperature, 1/s.
+    pub temperature_dissipation: f32,
     /// α: downward acceleration per unit density, m/s².
     pub buoyancy_density: f32,
     /// β: upward acceleration per unit temperature, m/s².
     pub buoyancy_temperature: f32,
     /// Which domain faces are open; the rest are walls (spec §4.2).
     pub boundaries: Boundaries,
-    /// How velocity and scalars are advected (spec §4.1).
-    pub advection: Advection,
-    /// Exponential decay of density, 1/s (spec §4.5).
-    pub density_dissipation: f32,
-    /// Exponential decay of temperature, 1/s.
-    pub temperature_dissipation: f32,
-    /// Vorticity confinement ε, 1/s; 0 turns it off (spec §4.4).
-    pub vorticity: f32,
 }
 
 impl Default for SolverParams {
     fn default() -> Self {
-        Self {
-            substeps: 1,
-            // Chosen by the user from the speed gate
-            // (`docs/bench/speed-gate.md`): 34 ms a step at 128³.
-            pressure_iterations: 160,
-            buoyancy_density: 0.0,
-            // Provisional until 2b-3 maps parameters to Mantaflow's.
-            buoyancy_temperature: 1.0,
-            boundaries: Boundaries::default(),
-            advection: Advection::MacCormack,
-            density_dissipation: 0.0,
-            temperature_dissipation: 0.0,
-            vorticity: 0.0,
-        }
+        Quality::default().params()
     }
+}
+
+/// A document's parameters as written. Every field is optional, and
+/// `resolve_params` fills the gaps from the preset.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocParams {
+    quality: Option<Quality>,
+    /// 2a's name for `max_substeps`, still accepted.
+    substeps: Option<u32>,
+    max_substeps: Option<u32>,
+    cfl: Option<f32>,
+    pressure_iterations: Option<u32>,
+    advection: Option<Advection>,
+    vorticity: Option<f32>,
+    density_dissipation: Option<f32>,
+    temperature_dissipation: Option<f32>,
+    buoyancy_density: Option<f32>,
+    buoyancy_temperature: Option<f32>,
+    boundaries: Option<Boundaries>,
+}
+
+/// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
+/// unset fields from the preset, and validate the result (spec §2).
+pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocError> {
+    // `deny_unknown_fields` rejects misspelt keys; an absent `params` is `null`.
+    let doc: DocParams = if params.is_null() {
+        params::parse(KIND, &serde_json::json!({}))?
+    } else {
+        params::parse(KIND, params)?
+    };
+    if doc.substeps.is_some() && doc.max_substeps.is_some() {
+        return Err(params::bad(
+            KIND,
+            "set max_substeps or its alias substeps, not both",
+        ));
+    }
+    let preset = doc.quality.unwrap_or_default().params();
+    let p = SolverParams {
+        max_substeps: doc
+            .max_substeps
+            .or(doc.substeps)
+            .unwrap_or(preset.max_substeps),
+        cfl: doc.cfl.unwrap_or(preset.cfl),
+        pressure_iterations: doc
+            .pressure_iterations
+            .unwrap_or(preset.pressure_iterations),
+        advection: doc.advection.unwrap_or(preset.advection),
+        vorticity: doc.vorticity.unwrap_or(preset.vorticity),
+        density_dissipation: doc
+            .density_dissipation
+            .unwrap_or(preset.density_dissipation),
+        temperature_dissipation: doc
+            .temperature_dissipation
+            .unwrap_or(preset.temperature_dissipation),
+        buoyancy_density: doc.buoyancy_density.unwrap_or(preset.buoyancy_density),
+        buoyancy_temperature: doc
+            .buoyancy_temperature
+            .unwrap_or(preset.buoyancy_temperature),
+        boundaries: doc.boundaries.unwrap_or(preset.boundaries),
+    };
+    validate(&p)?;
+    Ok(p)
+}
+
+fn validate(p: &SolverParams) -> Result<(), DocError> {
+    if !(1..=MAX_SUBSTEPS).contains(&p.max_substeps) {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "max_substeps must be 1..={MAX_SUBSTEPS}, got {}",
+                p.max_substeps
+            ),
+        ));
+    }
+    if !(1..=MAX_PRESSURE_ITERATIONS).contains(&p.pressure_iterations) {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "pressure_iterations must be 1..={MAX_PRESSURE_ITERATIONS}, got {}",
+                p.pressure_iterations
+            ),
+        ));
+    }
+    params::finite(KIND, "cfl", &[p.cfl])?;
+    if !(p.cfl > 0.0 && p.cfl <= MAX_CFL) {
+        return Err(params::bad(
+            KIND,
+            format!("cfl must be in (0, {MAX_CFL}], got {}", p.cfl),
+        ));
+    }
+    params::finite(
+        KIND,
+        "buoyancy",
+        &[p.buoyancy_density, p.buoyancy_temperature],
+    )?;
+    let rates = [
+        p.vorticity,
+        p.density_dissipation,
+        p.temperature_dissipation,
+    ];
+    params::finite(KIND, "vorticity and dissipation", &rates)?;
+    if rates.iter().any(|&r| r < 0.0) {
+        return Err(params::bad(
+            KIND,
+            "vorticity and dissipation rates must be at least 0",
+        ));
+    }
+    Ok(())
 }
 
 impl SolverParams {
@@ -606,27 +744,23 @@ impl SmokeSolver {
             density: field(density_source, 0)?,
             temperature: field(temperature_source, 1)?,
         };
-        let SolverParams {
-            substeps,
-            pressure_iterations,
-            ..
-        } = self.params;
-        let constants = self.params.step_constants(
-            ctx.dims(),
-            (ctx.time().dt / substeps as f64) as f32,
-            ctx.voxel_size(),
-        );
+        // Spec §3: one measurement per frame, from the entering state, so
+        // the count is deterministic however the frame is reached.
+        let dt = ctx.time().dt;
+        let dx = ctx.voxel_size();
+        let speed = ctx.with_gpu(|gpu, cache| cfl::measure_speed(gpu, cache, &state.velocity))?;
+        let plan = cfl::plan_substeps(speed, dt, dx, self.params.cfl, self.params.max_substeps)
+            .ok_or(NodeError::SolverDiverged { node })?;
+        if plan.clamped {
+            ctx.count_cfl_clamped();
+        }
+        let constants =
+            self.params
+                .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx);
+        let iterations = self.params.pressure_iterations;
         ctx.with_gpu_pool(|gpu, cache, pool| {
-            for _ in 0..substeps {
-                substep(
-                    gpu,
-                    cache,
-                    pool,
-                    state,
-                    sources,
-                    &constants,
-                    pressure_iterations,
-                )?;
+            for _ in 0..plan.count {
+                substep(gpu, cache, pool, state, sources, &constants, iterations)?;
             }
             Ok(())
         })
@@ -674,54 +808,9 @@ impl Node for SmokeSolver {
 }
 
 pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
-    // `deny_unknown_fields` rejects misspelt keys; an absent `params` is `null`.
-    let params: SolverParams = if params.is_null() {
-        params::parse(KIND, &serde_json::json!({}))?
-    } else {
-        params::parse(KIND, params)?
-    };
-    if !(1..=MAX_SUBSTEPS).contains(&params.substeps) {
-        return Err(params::bad(
-            KIND,
-            format!(
-                "substeps must be 1..={MAX_SUBSTEPS}, got {}",
-                params.substeps
-            ),
-        ));
-    }
-    if !(1..=MAX_PRESSURE_ITERATIONS).contains(&params.pressure_iterations) {
-        return Err(params::bad(
-            KIND,
-            format!(
-                "pressure_iterations must be 1..={MAX_PRESSURE_ITERATIONS}, got {}",
-                params.pressure_iterations
-            ),
-        ));
-    }
-    params::finite(
-        KIND,
-        "buoyancy",
-        &[params.buoyancy_density, params.buoyancy_temperature],
-    )?;
-    params::finite(
-        KIND,
-        "vorticity and dissipation",
-        &[
-            params.vorticity,
-            params.density_dissipation,
-            params.temperature_dissipation,
-        ],
-    )?;
-    if params.vorticity < 0.0
-        || params.density_dissipation < 0.0
-        || params.temperature_dissipation < 0.0
-    {
-        return Err(params::bad(
-            KIND,
-            "vorticity and dissipation rates must be at least 0",
-        ));
-    }
-    Ok(Box::new(SmokeSolver { params }))
+    Ok(Box::new(SmokeSolver {
+        params: resolve_params(params)?,
+    }))
 }
 
 /// Pooled copies of the wanted outputs, in socket order, with a

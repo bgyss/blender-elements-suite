@@ -7,6 +7,7 @@
 
 pub mod bench;
 pub mod boundaries;
+pub mod cfl;
 pub mod emitter;
 pub mod kernels;
 pub mod metrics;

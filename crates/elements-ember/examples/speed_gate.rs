@@ -6,6 +6,10 @@
 //! `just bench-sweep` instead sweeps the counts in `SPEED_GATE_ITERATIONS`
 //! (comma-separated) into `docs/bench/iteration-sweep.md`. That is exploration
 //! for choosing presets, not the gate, so it never touches the gate's record.
+//!
+//! Since piece 2b-1 the plume scene uses the preview preset (MacCormack, CFL
+//! substeps), so a rerun no longer reproduces 2a's table. `speed-gate.md`
+//! records the commit its numbers came from.
 
 use std::error::Error;
 use std::process::Command;
@@ -99,7 +103,7 @@ fn divergence_at(
     let cells = FieldDims::new(x, y, z);
     let dx = (scene.domain_size / x.max(y).max(z) as f64) as f32;
     let n = scene.solver.pressure_iterations;
-    let substeps = scene.solver.substeps;
+    let substeps = scene.solver.max_substeps;
     let constants =
         scene
             .solver
@@ -165,7 +169,7 @@ fn main() -> Res<()> {
     let registry = elements_ember::registry();
     let mut table = String::new();
     let mut rows = Vec::new();
-    let scene_substeps = Scene::plume(RESOLUTION).solver.substeps;
+    let scene_substeps = Scene::plume(RESOLUTION).solver.max_substeps;
     let sweep: Option<Vec<u32>> = match std::env::var("SPEED_GATE_ITERATIONS") {
         Ok(list) => Some(
             list.split(',')
@@ -242,7 +246,7 @@ fn main() -> Res<()> {
          - OS: macOS {os}\n\
          - Ember commit: {commit}\n\
          - Date: {date}\n\
-         - Scene: `plume`, {RESOLUTION}³, substeps {substeps}. Frames {first}–{last} timed after \
+         - Scene: `plume`, {RESOLUTION}³, max_substeps {substeps}. Frames {first}–{last} timed after \
          {WARMUP} warm-up frames, as `eval` plus a blocking poll; median of {RUNS} runs' medians. \
          The step ms min–max range is pooled over all timed frames of all {RUNS} runs, not a \
          single run. Divergence from the frame-{last} state.\n\n\

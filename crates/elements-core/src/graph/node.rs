@@ -36,6 +36,8 @@ pub enum NodeError {
     NotStateful { node: NodeId },
     #[error("node {node:?} state slot {slot:?} does not match the current domain")]
     StateShape { node: NodeId, slot: &'static str },
+    #[error("node {node:?} diverged: its velocity is no longer finite")]
+    SolverDiverged { node: NodeId },
     #[error(transparent)]
     Gpu(#[from] GpuError),
 }
@@ -110,6 +112,9 @@ pub struct EvalStats {
     /// GPU copies made because a field fed more than one input, and a
     /// consumer that was not the last one took ownership of it.
     pub copies: u32,
+    /// Frames in which a solver wanted more CFL substeps than its cap
+    /// allowed. It still ran them, at the cap.
+    pub cfl_clamped: u32,
 }
 
 impl Value {
@@ -234,6 +239,11 @@ impl EvalCtx<'_> {
 
     pub fn node_id(&self) -> NodeId {
         self.node
+    }
+
+    /// Count this evaluation as one where a solver's CFL substeps hit its cap.
+    pub fn count_cfl_clamped(&mut self) {
+        self.stats.cfl_clamped += 1;
     }
 
     /// Whether output `index` of this node will be used: it is the graph's
