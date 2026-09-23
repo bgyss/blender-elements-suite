@@ -6,7 +6,7 @@ An open-source, Rust-based suite of real-time VFX authoring tools for Blender. T
 
 ## Status
 
-Early. The engine and the first milestone of its smoke solver work; most of what makes smoke look like smoke is still to come.
+Early. The engine and the first two milestones of its smoke solver work; fire, colliders and the rest of what a production smoke scene needs are still to come.
 
 **What exists today**
 
@@ -23,7 +23,7 @@ Early. The engine and the first milestone of its smoke solver work; most of what
 
   A frame is bit-identical however you reach it: playing forward, scrubbing back, or restoring from the cache.
 
-**How fast it is.** A 128³ grid on an Apple M1 Max (Metal), with the pass/fail rule fixed before anything was measured:
+**How fast it is.** Piece 2a's speed gate, on a 128³ grid on an Apple M1 Max (Metal), with semi-Lagrangian advection and a fixed single substep, and the pass/fail rule fixed before anything was measured:
 
 | Pressure iterations | ms per step | Divergence left after projection |
 |---|---|---|
@@ -31,11 +31,11 @@ Early. The engine and the first milestone of its smoke solver work; most of what
 | **160 (default)** | **34.1** | **4.3%** |
 | 480 | 94.4 | 0.76% |
 
-The full tables and conditions are in [`docs/bench/speed-gate.md`](docs/bench/speed-gate.md) and [`docs/bench/iteration-sweep.md`](docs/bench/iteration-sweep.md). The images above are a 256³ run: 120 frames simulated in 93 seconds, including writing every frame to OpenVDB, then rendered offline in Cycles.
+The full tables and conditions are in [`docs/bench/speed-gate.md`](docs/bench/speed-gate.md) and [`docs/bench/iteration-sweep.md`](docs/bench/iteration-sweep.md). With MacCormack, RK2 and the per-frame CFL measurement, a default `preview` frame now takes about 92 ms at 128³ ([`docs/bench/presets.md`](docs/bench/presets.md)); the increase over the gate is not yet explained (risk (j) in §6 of [the solver spec](docs/superpowers/specs/2026-09-21-ember-solver-design.md)). The images above are a 256³ run: 120 frames simulated in 93 seconds, including writing every frame to OpenVDB, then rendered offline in Cycles.
 
 **Not yet**
 
-- Fire, colliders, wind and animated emitters. These are next. The plume above predates vorticity confinement, which is why it is smooth and laminar.
+- Fire, colliders, wind and animated emitters. These are next. The plume above is smooth and laminar because vorticity confinement, though implemented, is off by default (`vorticity` is 0 in both presets) and off in the example scene.
 - A live preview in the Blender viewport. Today you bake to VDB and load the sequence.
 - A benchmark against Blender's built-in Mantaflow solver. It follows the scene content above, and it will report where Mantaflow wins.
 

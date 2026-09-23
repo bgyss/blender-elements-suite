@@ -86,7 +86,7 @@ fn main() -> Res<()> {
             frame_ms_median: median(&medians),
         };
         let min = all.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = all.iter().copied().fold(0.0, f64::max);
+        let max = all.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         table.push_str(&format!(
             "| {cap} | {:.2} ({min:.2}–{max:.2}) | {clamped} of {} | {} |\n",
             row.frame_ms_median,
@@ -112,7 +112,7 @@ fn main() -> Res<()> {
          vorticity 0. Frames {first}–{last} timed after {WARMUP} warm-up frames, each as \
          `eval_frame` (the CFL measurement and every substep) plus a blocking wait; median of \
          {RUNS} runs' medians. The min–max range is pooled over all timed frames of all runs.\n\n\
-         | max_substeps | frame ms (median, min–max) | frames at the cap | pass |\n\
+         | max_substeps | frame ms (median, min–max) | frames CFL-clamped | pass |\n\
          |---|---|---|---|\n\
          {table}\n\
          Pre-registered rule (2b-1 spec §6): preview's `max_substeps` is the largest cap whose \

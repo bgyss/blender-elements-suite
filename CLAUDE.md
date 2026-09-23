@@ -15,13 +15,14 @@ The suite is being built product by product. **Core v1** is merged. **Ember**
 persistent state, a timeline with a frame cache, staggered vector fields, and
 multi-consumer graph outputs. Piece 2 is split at a speed gate. **2a** is
 complete: the `elements-ember` crate, a GPU smoke solver that passed the 128³
-gate at 34 ms a step with 160 pressure iterations. **2b** is split into three cycles. **2b-1**, solver
-correctness, is complete: CFL substeps, RK2 + MacCormack advection, vorticity
-confinement, dissipation, per-face boundaries, and the `preview` and `final`
-presets (`docs/bench/presets.md`). Preview runs one CFL-clamped substep at about
-92 ms a 128³ frame; why that is so far above 2a's 34 ms is open risk (j) in §6
-of the piece 2 spec. **2b-2**, scene content (emitters, colliders, wind, flame),
-is next. **2b-3**, the Mantaflow benchmark, follows it.
+gate at 34 ms a step with 160 pressure iterations. **2b** is split into three
+cycles. **2b-1**, solver correctness, is complete: CFL substeps, RK2 +
+MacCormack advection, vorticity confinement, dissipation, per-face boundaries,
+and the `preview` and `final` presets (`docs/bench/presets.md`). Preview runs
+one CFL-clamped substep at about 92 ms a 128³ frame; why that is so far above
+2a's 34 ms is open risk (j) in §6 of the piece 2 spec. **2b-2**, scene content
+(emitters, colliders, wind, flame), is next. **2b-3**, the Mantaflow benchmark,
+follows it.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`

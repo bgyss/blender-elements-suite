@@ -3,10 +3,10 @@
 - Machine: Apple M1 Max (Apple M1 Max)
 - OS: macOS 27.0
 - Ember commit: fe51fa6
-- Date: 2026-09-23
+- Date: 2026-09-23 (UTC; 2026-09-22 local)
 - Scene: `plume`, 128³, N = 160, cfl 1.0, advection MacCormack, vorticity 0. Frames 25–48 timed after 24 warm-up frames, each as `eval_frame` (the CFL measurement and every substep) plus a blocking wait; median of 3 runs' medians. The min–max range is pooled over all timed frames of all runs.
 
-| max_substeps | frame ms (median, min–max) | frames at the cap | pass |
+| max_substeps | frame ms (median, min–max) | frames CFL-clamped | pass |
 |---|---|---|---|
 | 1 | 91.77 (91.28–93.90) | 72 of 72 | yes |
 | 2 | 182.77 (181.59–184.88) | 51 of 72 | no |
