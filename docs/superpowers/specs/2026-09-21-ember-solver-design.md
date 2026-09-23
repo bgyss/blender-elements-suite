@@ -437,3 +437,32 @@ part of (g), and (j).
   per-iteration slope, which isolates (1), and one frame with
   `advection: semi_lagrangian` isolates (3). A fix may let preview afford 2
   substeps, which would reopen the preset decision in `docs/bench/presets.md`.
+
+  **Measured 2026-09-23, on main after 2b-1 (19cbbe0).** Both runs were under a
+  load average of about 8–10, so the numbers are upper bounds; the split between
+  causes held on both the medians and the fastest frames.
+
+  | 128³, N = 160, one substep | Frame |
+  |---|---|
+  | 2a, semi-Lagrangian (gate) | ~34 ms |
+  | now, semi-Lagrangian | 54.6 ms |
+  | now, MacCormack (preview) | 91.8 ms |
+
+  - **The pressure solve is about 2× slower per iteration.** `just bench-sweep
+    20,160` fits 0.33–0.42 ms per iteration against 2a's 0.19
+    (`docs/bench/iteration-sweep-2026-09-23.md`), about +20 ms at N = 160. The
+    semi-Lagrangian frame's 54.6 ms against 2a's 34 matches this, so cause (1)
+    is real.
+  - **MacCormack costs about 37 ms per substep.** It accounts for essentially all
+    of the sweep's ~38 ms fixed cost (2a: 3.6 ms)
+    (`docs/bench/presets-semi-lagrangian-2026-09-23.md`). With semi-Lagrangian
+    advection the non-pressure work is back to a few ms, so cause (2), the
+    sampling loops on their own, is not significant. The cost is cause (3):
+    the backward pass and the correction pass that recomputes the RK2 backtrace,
+    over five grids.
+  - **What a fix buys.** Restoring the pressure kernel to 2a's per-iteration cost
+    brings a semi-Lagrangian substep to about 34 ms (2 substeps ≈ 70 ms) and a
+    MacCormack substep to about 70 ms (still one substep). Two MacCormack
+    substeps also need MacCormack to get cheaper, for example by storing the
+    backtrace point instead of recomputing it and unrolling the corner loops.
+    Semi-Lagrangian at 2 substeps takes 107 ms today, over the budget.
