@@ -9,7 +9,7 @@ use std::io::{BufRead, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// The wire protocol version. Bumped whenever a message changes shape.
-pub const ELEMENTS_PROTOCOL_VERSION: u32 = 1;
+pub const ELEMENTS_PROTOCOL_VERSION: u32 = 2;
 
 /// The largest single message accepted, to bound a desynced peer's damage.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -41,6 +41,8 @@ pub enum ErrorKind {
     Graph,
     Gpu,
     DeviceLost,
+    /// The GPU ran out of memory; a retry at the same resolution will fail again.
+    OutOfMemory,
     Io,
 }
 

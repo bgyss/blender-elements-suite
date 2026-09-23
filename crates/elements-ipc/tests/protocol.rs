@@ -45,7 +45,7 @@ fn commands_round_trip_as_ndjson() {
     assert!(matches!(
         a,
         Command::Hello {
-            protocol_version: 1
+            protocol_version: 2
         }
     ));
     assert!(matches!(b, Command::Render { frame: 12 }));
@@ -202,4 +202,12 @@ fn blank_lines_are_skipped() {
     let mut reader = BufReader::new(Cursor::new(buf));
     let msg: Command = read_message(&mut reader).unwrap().unwrap();
     assert!(matches!(msg, Command::Shutdown));
+}
+
+#[test]
+fn out_of_memory_has_its_own_wire_name() {
+    assert_eq!(
+        serde_json::to_string(&ErrorKind::OutOfMemory).unwrap(),
+        "\"out_of_memory\""
+    );
 }

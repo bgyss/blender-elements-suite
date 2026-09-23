@@ -17,10 +17,11 @@ pub fn evaluate_document(path: &Path) -> anyhow::Result<(Vec<f32>, [u32; 3])> {
     let gpu = GpuContext::new_headless().context("acquiring a GPU device")?;
 
     // Reject a document whose implied fields would not fit this device's
-    // `max_buffer_size` before any GPU texture is allocated. See
-    // `Document::validate_for`'s doc comment: this is what turns an
-    // oversized document into a clean error instead of a panic from
-    // `Field::read_back` or `Queue`'s staging-buffer allocation.
+    // `max_buffer_size` (requested from the adapter itself, via
+    // `elements_core::gpu::required_limits`, not a fixed cap) before any GPU
+    // texture is allocated. See `Document::validate_for`'s doc comment: this
+    // is what turns an oversized document into a clean error instead of a
+    // panic from `Field::read_back` or `Queue`'s staging-buffer allocation.
     doc.validate_for(&gpu.device().limits())
         .context("validating document dimensions against this device's limits")?;
 

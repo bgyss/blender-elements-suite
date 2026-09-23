@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use elements_core::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
+use elements_core::gpu::{FieldDims, FieldPool, GpuContext, GpuError, PipelineCache};
 use elements_core::graph::{Document, Graph, NodeRegistry, Timeline};
 use elements_ipc::{
     Command, ELEMENTS_PROTOCOL_VERSION, EngineError, ErrorKind, FrameWriter, Response,
@@ -124,10 +124,12 @@ fn load(session: &mut Session, path: &Path) -> Result<Response, EngineError> {
     // Reject a document whose implied fields would not fit this device's
     // `max_buffer_size`, before the frame channel or any GPU texture is
     // allocated. This is a distinct check from the `max_texture_dimension_3d`
-    // loop below: `max_buffer_size` (256 MiB) is reachable well inside the
-    // adapter's texture-dimension limit (2048 on Apple Silicon), since a
-    // padded R32Float readback of a domain far under 2048^3 is already
-    // gigabytes. See `Document::validate_for`'s doc comment.
+    // loop below: `max_buffer_size` (requested from the adapter itself, via
+    // `elements_core::gpu::required_limits`, not a fixed 256 MiB) is still
+    // reachable well inside the adapter's texture-dimension limit (2048 on
+    // Apple Silicon), since a padded R32Float readback of a domain far under
+    // 2048^3 is already tens of gigabytes. See `Document::validate_for`'s doc
+    // comment.
     doc.validate_for(&session.gpu.device().limits())
         .map_err(|e| EngineError::new(ErrorKind::Document, e.to_string()))?;
 
@@ -226,9 +228,7 @@ fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
         Ok(evaluated) => evaluated,
         Err(e) => {
             let err = map_node_error(e);
-            if err.kind == ErrorKind::DeviceLost {
-                timeline.discard();
-            }
+            recover(err.kind, timeline, &mut session.pool);
             return Err(err);
         }
     };
@@ -242,7 +242,7 @@ fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
             let kind = if session.gpu.device_lost().is_some() {
                 ErrorKind::DeviceLost
             } else {
-                ErrorKind::Gpu
+                gpu_kind(&e)
             };
             EngineError::new(kind, e.to_string())
         }),
@@ -252,9 +252,7 @@ fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
     let values = match values {
         Ok(values) => values,
         Err(e) => {
-            if e.kind == ErrorKind::DeviceLost {
-                timeline.discard();
-            }
+            recover(e.kind, timeline, &mut session.pool);
             return Err(e);
         }
     };
@@ -274,12 +272,34 @@ fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
     })
 }
 
+/// Put the timeline and pool back in a usable state after a failed render.
+fn recover(kind: ErrorKind, timeline: &mut Timeline, pool: &mut FieldPool) {
+    match kind {
+        // The device is gone, so its textures cannot go back to a pool.
+        ErrorKind::DeviceLost => timeline.discard(),
+        // Give the memory back, so that a smaller document can load. The
+        // device is still good, so the timeline's textures return to the
+        // pool, and then the pool itself lets them go.
+        ErrorKind::OutOfMemory => {
+            timeline.reset(pool);
+            pool.clear();
+        }
+        _ => {}
+    }
+}
+
+fn gpu_kind(e: &GpuError) -> ErrorKind {
+    match e {
+        GpuError::DeviceLost(_) => ErrorKind::DeviceLost,
+        GpuError::OutOfMemory(_) => ErrorKind::OutOfMemory,
+        _ => ErrorKind::Gpu,
+    }
+}
+
 fn map_node_error(e: elements_core::graph::NodeError) -> EngineError {
-    use elements_core::gpu::GpuError;
     use elements_core::graph::NodeError;
     let kind = match &e {
-        NodeError::Gpu(GpuError::DeviceLost(_)) => ErrorKind::DeviceLost,
-        NodeError::Gpu(_) => ErrorKind::Gpu,
+        NodeError::Gpu(g) => gpu_kind(g),
         _ => ErrorKind::Graph,
     };
     EngineError::new(kind, e.to_string())
@@ -297,5 +317,11 @@ mod tests {
         let e = NodeError::Gpu(GpuError::DeviceLost("test".into()));
         let mapped = map_node_error(e);
         assert_eq!(mapped.kind, ErrorKind::DeviceLost);
+    }
+
+    #[test]
+    fn out_of_memory_maps_to_its_own_kind_not_a_generic_gpu_error() {
+        let e = NodeError::Gpu(GpuError::OutOfMemory("test".into()));
+        assert_eq!(map_node_error(e).kind, ErrorKind::OutOfMemory);
     }
 }

@@ -19,7 +19,7 @@ import socket
 import struct
 import sys
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 CHANNEL_MAGIC = 0x4346_4C45  # "ELFC" little-endian
 CHANNEL_VERSION = 1

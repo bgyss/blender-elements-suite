@@ -14,6 +14,7 @@ import bpy
 
 from .bakecmd import bake_command
 from .client import ElementsError
+from .errors import describe
 
 VOLUME_NAME = "ElementsVolume"
 
@@ -154,6 +155,13 @@ def _on_draw() -> None:
         except ElementsError as e:
             if e.kind == "device_lost":
                 ops.shutdown_engine()
+            status, stop_live = describe(e.kind, e.message)
+            if stop_live:
+                # Report the described line rather than letting the generic
+                # handler below overwrite it: it says what the user must do.
+                settings.live = False
+                settings.status = status
+                return
             raise
 
         try:

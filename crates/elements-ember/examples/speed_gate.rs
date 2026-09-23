@@ -48,10 +48,7 @@ fn median(values: &[f64]) -> f64 {
 }
 
 fn wait(gpu: &GpuContext) -> Res<()> {
-    gpu.device()
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(gpu.wait()?)
 }
 
 /// Step the scene's graph through `eval_frame`, the path the timeline uses,

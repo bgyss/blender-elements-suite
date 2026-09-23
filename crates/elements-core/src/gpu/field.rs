@@ -158,8 +158,8 @@ impl Field {
         // The staging buffer's `size` is untrusted-input-derived (it scales with
         // the document's `dims`), so it must be created INSIDE the error scope.
         // `create_buffer` validates `size` against `device.limits().max_buffer_size`
-        // and, outside a scope, an over-limit request goes to wgpu's
-        // uncaptured-error handler, which panics rather than returning an error.
+        // and, outside a scope, an over-limit request goes to the uncaptured-error
+        // handler, which defers it to a later, unrelated `scoped` call.
         let staging = ctx.scoped(|| {
             let staging = ctx.device().create_buffer(&wgpu::BufferDescriptor {
                 label: Some("field-readback"),
@@ -196,12 +196,15 @@ impl Field {
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        ctx.device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| GpuError::DeviceLost(e.to_string()))?;
+        // wgpu reports a `map_async` error synchronously, during the call, so
+        // the scope catches it here rather than leaving it to surface again as
+        // a stray error in the next, unrelated `scoped` call.
+        ctx.scoped(|| {
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            })
+        })?;
+        ctx.wait()?;
         rx.recv()
             .map_err(|e| GpuError::Validation(e.to_string()))?
             .map_err(|e| GpuError::Validation(e.to_string()))?;
@@ -231,7 +234,7 @@ impl Field {
                 }
             }
         }
-        staging.unmap();
+        ctx.scoped(|| staging.unmap())?;
 
         Ok(out)
     }

@@ -125,7 +125,7 @@ Each must be proven able to fail by a single mutation, per CLAUDE.md.
 | Snapshot memory at 256³+ exceeds RAM | Medium | Cache budget with eviction (piece 1); disk-backed cache (piece 3) |
 | Metal and lavapipe numerics diverge | Medium | Bit-exactness only within one backend; tolerances across backends; CI must run before piece 2 |
 | `downlevel_defaults` allows only 4 storage textures per shader stage | Medium | Solver kernels read through `texture_3d<f32>` + `textureLoad` and write through storage; six velocity faces are never all bound as storage |
-| `max_buffer_size` is 256 MiB; a 512³ `R32Float` readback is 512 MiB | Medium | Piece 3 exports read back in z-slabs |
+| A 512³ `R32Float` readback is 512 MiB, above the 256 MiB downlevel `max_buffer_size` | Medium | `GpuContext` now requests the adapter's `max_buffer_size` (eac0cc3); devices with small limits will still need piece 3's exports to read back in z-slabs |
 | "Ember" name collision (Ember.js) | Low | Trademark search before public release (suite spec §7) |
 
 **Precondition.** The Core v1 close-out items in `.superpowers/sdd/progress.md`

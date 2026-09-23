@@ -130,10 +130,11 @@ parser, with `vdb-rs` used as the read-back oracle in tests.
 - **Crate manifests use `dep.workspace = true`.** Versions live only in the
   workspace `Cargo.toml`.
 - **Every stochastic node takes an explicit `seed: u64`.** No implicit entropy.
-- **`GpuContext` requests the adapter's resolution limits** on top of
-  `downlevel_defaults`, which otherwise caps 3D textures at 256. Everything else
-  in `downlevel_defaults` still applies. Notably, **4 storage textures per shader
-  stage**: read fields through `texture_3d<f32>` + `textureLoad`, and write through storage.
+- **`gpu::required_limits` takes the resolution limits and `max_buffer_size`
+  from the adapter**, since `downlevel_defaults` caps 3D textures at 256 and
+  buffers at 256 MiB. Everything else stays at `downlevel_defaults`. Notably,
+  **4 storage textures per shader stage**: read fields through
+  `texture_3d<f32>` + `textureLoad`, and write through storage.
 - **A snapshot for frame N is the state entering N.** Producing N is always
   "restore or reach the entering state, then one `eval`". Never cache outputs.
 - Blender extension ZIPs put `__init__.py` and `blender_manifest.toml` at the
@@ -168,10 +169,12 @@ decorative tests already merged:
 
 Other things that matter here:
 
-- `GpuContext::scoped` captures **encoding-time** validation only. `queue.submit`
-  returns before the GPU runs anything, so it cannot catch device-timeline
-  faults; `Field::read_back`'s `poll` is what actually waits. Do not claim more
-  than this in error handling.
+- `GpuContext::scoped` captures validation, out-of-memory and internal errors
+  **at encoding time**. An error raised outside any scope is reported by the
+  next `scoped` call, possibly an unrelated one. `queue.submit` returns before
+  the GPU runs anything, so it still cannot catch device-timeline faults.
+  Blocking waits go through `GpuContext::wait`, which turns a panicking `poll`
+  into `DeviceLost`. Do not claim more than this in error handling.
 - Bit-exact assertions are legitimate **within one backend on one machine**
   (determinism). Cross-backend comparisons use tolerance — Metal and software
   Vulkan genuinely disagree about what counts as a validation error.

@@ -9,6 +9,7 @@ import tempfile
 import bpy
 
 from .client import ControlClient, ElementsError, FrameReader
+from .errors import describe
 
 # Module-level engine state. Blender operators are stateless, and the process
 # and its sockets must outlive any single invocation.
@@ -168,13 +169,15 @@ class ELEMENTS_OT_render_frame(bpy.types.Operator):
             # Contract: device_lost means the GPU device is gone, not merely
             # that this render failed. Retrying against it cannot succeed, so
             # tear the engine down and require an explicit restart. Any other
-            # error (a bad graph, a transient GPU error) leaves the engine
-            # running -- the user can fix the graph and try again.
+            # error (a bad graph, a transient GPU error, out of memory) leaves
+            # the engine running -- the user can fix the graph and try again.
             if e.kind == "device_lost":
                 shutdown_engine()
-                settings.status = f"device_lost: {e.message} — restart the engine"
-            else:
-                settings.status = f"{e.kind}: {e.message}"
+            settings.status, stop_live = describe(e.kind, e.message)
+            # An error that will recur on the next frame must not leave Live
+            # mode re-rendering into it on every frame change.
+            if stop_live and hasattr(settings, "live"):
+                settings.live = False
             self.report({"ERROR"}, settings.status)
             return {"CANCELLED"}
 

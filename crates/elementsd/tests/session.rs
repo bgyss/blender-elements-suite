@@ -378,18 +378,20 @@ fn dims_exceeding_the_devices_texture_limit_are_rejected_at_load_not_render() {
     ));
 }
 
-/// A 512^3 `R32Float` field is 512 MiB unpadded, well over the 256 MiB
-/// `max_buffer_size` every adapter reports (`using_resolution` raises
-/// `max_texture_dimension_3d` to the adapter's real cap, but never raises
-/// `max_buffer_size`). Before the byte-cap check in `Document::validate_for`,
-/// this dodged the `max_texture_dimension_3d` loop entirely (512 is far under
-/// 2048) and answered `Loaded`, only to crash `Field::read_back`'s staging
-/// buffer allocation on the first `Render`. It must instead fail right here,
-/// at `LoadGraph`, with a `Document` error naming the size — and load costs
-/// nothing (no texture is touched), so this is cheap. Do not render a 512^3
-/// graph in any test.
+/// A 2047^3 `R32Float` field is about 34 GB unpadded, over any adapter's
+/// `max_buffer_size` seen so far (`GpuContext` now requests the adapter's own
+/// `max_buffer_size` via `elements_core::gpu::required_limits`, but even that
+/// real hardware cap tops out far below 34 GB). 2047 stays under the
+/// `max_texture_dimension_3d` cap (2048 on Apple Silicon), so only the
+/// byte-cap check in `Document::validate_for` can catch this — the
+/// `max_texture_dimension_3d` loop would not. Before that byte-cap check
+/// existed, this dodged the texture-dimension loop entirely and answered
+/// `Loaded`, only to crash `Field::read_back`'s staging buffer allocation on
+/// the first `Render`. It must instead fail right here, at `LoadGraph`, with
+/// a `Document` error naming the size — and load costs nothing (no texture is
+/// touched), so this is cheap. Do not render such a graph in any test.
 #[test]
-fn a_512_cubed_document_is_rejected_at_load_with_the_size_named() {
+fn a_document_over_the_buffer_limit_is_rejected_at_load_with_the_size_named() {
     let daemon = Daemon::start();
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("huge.elements");
@@ -397,7 +399,7 @@ fn a_512_cubed_document_is_rejected_at_load_with_the_size_named() {
         &bad,
         r#"{
           "version": 1,
-          "dims": [512, 512, 512],
+          "dims": [2047, 2047, 2047],
           "nodes": [
             { "id": 0, "kind": "core.noise_field", "params": { "seed": 7 } },
             { "id": 1, "kind": "core.output", "params": {} }
@@ -430,7 +432,7 @@ fn a_512_cubed_document_is_rejected_at_load_with_the_size_named() {
         Response::Error(e) => {
             assert_eq!(e.kind, ErrorKind::Document);
             assert!(
-                e.message.contains("512"),
+                e.message.contains("2047"),
                 "message should name the offending size: {}",
                 e.message
             );
