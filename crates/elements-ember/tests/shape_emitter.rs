@@ -4,7 +4,7 @@ use common::*;
 use elements_core::gpu::{
     Field, FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache, StaggeredField,
 };
-use elements_core::graph::DocError;
+use elements_core::graph::{DocError, Document, StateStore, Time};
 use elements_ember::shape_emitter::{EmitterFields, EmitterParams, fill_emitter};
 use elements_ember::transform::{Key, Rotate, Shape, Transform};
 use elements_ember::unions::union_emitters;
@@ -310,4 +310,66 @@ fn bad_emitter_parameters_are_rejected() {
         serde_json::json!({ "box": { "half_extents": [0.1, 0.0, 0.1] } })
     )));
     assert!(rejected(with("colour", serde_json::json!(1.0))));
+}
+
+/// A 16³ document: one sphere emitter wired straight to the output, with
+/// `active` as its activity window.
+fn window_doc(active: &str) -> Document {
+    serde_json::from_str(&format!(
+        r#"{{
+      "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+      "nodes": [
+        {{ "id": 0, "kind": "ember.emitter", "params": {{
+            "shape": {{ "sphere": {{ "radius": 0.4 }} }},
+            "transform": {{ "keys": [ {{ "frame": 1, "translate": [1.0, 1.0, 1.0] }} ] }},
+            "density_rate": 1.0, "active_frames": {active} }} }},
+        {{ "id": 1, "kind": "core.output", "params": {{}} }}
+      ],
+      "edges": [ {{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }} ],
+      "output": 1
+    }}"#
+    ))
+    .unwrap()
+}
+
+/// The emitter's density output at `frame`.
+fn density_at(doc: Document, frame: u32) -> Vec<f32> {
+    let gpu = gpu();
+    let registry = elements_ember::registry();
+    let (graph, dims) = doc.into_graph(&registry).unwrap();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let mut state = StateStore::new();
+    let time = Time::at(frame, 1, 24.0);
+    let out = graph
+        .eval_frame(&gpu, &mut pool, &mut cache, &mut state, time, dims)
+        .unwrap();
+    out.value.as_field().unwrap().read_back(&gpu).unwrap()
+}
+
+/// Spec §3: the emitter emits on its first and last active frames, and
+/// nothing on the frame after.
+#[test]
+fn an_emitter_is_silent_outside_its_active_frames() {
+    let on_last = density_at(window_doc("[1, 60]"), 60);
+    assert!(on_last.iter().any(|&d| d > 0.0), "frame 60 emits");
+    let on_first = density_at(window_doc("[5, 60]"), 5);
+    assert!(on_first.iter().any(|&d| d > 0.0), "frame 5 emits");
+    let after = density_at(window_doc("[1, 60]"), 61);
+    assert!(after.iter().all(|&d| d == 0.0), "frame 61 is silent");
+    let before = density_at(window_doc("[5, 60]"), 4);
+    assert!(before.iter().all(|&d| d == 0.0), "frame 4 is silent");
+    let always = density_at(window_doc("null"), 500);
+    assert!(always.iter().any(|&d| d > 0.0), "no window is always on");
+}
+
+#[test]
+fn an_active_range_must_not_run_backwards() {
+    let registry = elements_ember::registry();
+    assert!(
+        window_doc("[60, 60]").into_graph(&registry).is_ok(),
+        "a one-frame window is valid"
+    );
+    let err = window_doc("[61, 60]").into_graph(&registry).err();
+    assert!(matches!(err, Some(DocError::BadParams { .. })), "{err:?}");
 }
