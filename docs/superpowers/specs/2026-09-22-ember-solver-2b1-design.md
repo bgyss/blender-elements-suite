@@ -28,8 +28,11 @@ wall test (§4.2). No collider work is done here.
 `ember.smoke_solver` gains these fields. Each has a default, so existing
 documents still load. They do not step identically: the `preview` defaults
 switch them to RK2, MacCormack and CFL substeps. A 2a document that needs 2a's
-behaviour sets `advection = "semi_lagrangian"` and `max_substeps = 1`, which
-leaves the RK2 backtrace as the only difference.
+behaviour sets `advection = "semi_lagrangian"` and `max_substeps = 1`. Two
+differences from 2a remain: the RK2 backtrace (§4.1), and scalars sampling the
+ambient value 0 beyond an open face instead of clamping to the edge layer
+(§4.2). Rounding also differs slightly, because the pressure slot now holds p
+rather than h·p (§4.3).
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -55,8 +58,10 @@ or boundary kind is also a `DocError`.
 
 ## 3. One frame
 
-1. **CFL.** A max-reduction (§4.6) over `|u|` on all three face textures, then a
-   4-byte readback through `GpuContext::wait`:
+1. **CFL.** Reductions (§4.6) over all three face textures, then a 6-slot
+   (24-byte) readback through `GpuContext::wait`: MaxAbs and Sum per face. The
+   Sum is there to catch a NaN that WGSL's `max` may hide, since a sum carries
+   NaN and infinity through. Then
    `n = clamp(ceil(max|u| · dt / (cfl · dx)), 1, max_substeps)`, and `h = dt / n`
    for the whole frame (user decision: one measurement per frame, before stepping).
    `n` depends only on the entering state, so frames stay bit-deterministic
@@ -69,9 +74,16 @@ or boundary kind is also a `DocError`.
 When the cap binds (the uncapped `n` would exceed `max_substeps`), the frame
 still runs at `max_substeps`, and `EvalStats` gains a `cfl_clamped` count, so
 the add-on can say "raise quality or max substeps" instead of failing silently.
+As built, `cfl_clamped` is counted but nothing reads it yet: neither the daemon
+nor the add-on reports it, and `Timeline::goto` drops the stats of the
+intermediate frames it steps through to reach the requested one. Wiring it up
+is deferred to add-on work.
 
-A non-finite maximum speed is a new `NodeError::SolverDiverged { node }`. It is
-never cast to an integer (`ceil(NaN) as u32` is 0).
+A non-finite maximum speed, or a non-finite face sum, is a new
+`NodeError::SolverDiverged { node }`. It is never cast to an integer
+(`ceil(NaN) as u32` is 0). Because the check reads the entering state, it fires
+on the frame *after* the one whose substeps produced the non-finite values;
+that earlier frame completes and writes its state back.
 
 Mantaflow orders its step differently: dissolve, advect, vorticity, buoyancy,
 forces, walls, pressure (§8). Ember keeps umbrella §3's order. The difference
@@ -103,9 +115,21 @@ With `advection = "semi_lagrangian"`, only the forward pass runs.
 
 ### 4.2 Boundaries
 
-The uniform gains `open_mask: u32`, one bit per face. `is_wall(axis, i)` reads
-it. **Everything wall-related goes through that one function**, and in 2b-2 it
-becomes `face_is_wall || solid(cell)`.
+The uniform gains `open_mask: u32`, one bit per face, read through
+`is_open(axis, side)`. The face grids' wall test is `is_wall(axis, i)`, used by
+advection, the MacCormack correction, the gradient subtract and `confine`; in
+2b-2 it becomes `face_is_wall || solid(cell)`. Not everything goes through it.
+These places have their own boundary logic, and 2b-2's collider mask must touch
+each of them too:
+
+- `pressure.wgsl`: counts each out-of-domain neighbour through `is_open`
+  (Dirichlet) or leaves it out (Neumann), per domain face only.
+- `texel()` in `common.wgsl`: clamps a face grid to its edge, and for a cell
+  grid returns 0 beyond an open face or clamps beyond a wall.
+- `curl.wgsl` and `confine.wgsl`: clamp cell indices into the domain at its
+  edge.
+- `buoyancy.wgsl`: skips the `z = 0` and `z = n` faces by hard-coded index,
+  whether they are open or walls.
 
 - **Wall face:** zero normal velocity, before projection and after. Pressure is
   Neumann: the out-of-domain neighbour is left out of the sum.
@@ -114,8 +138,8 @@ becomes `face_is_wall || solid(cell)`.
   **Scalars sample the ambient value 0 beyond an open face.** A backtrace that
   leaves through an open face picks up clean air instead of the edge layer. This
   resolves risk (d). Inflow through an open face stays allowed.
-- **Buoyancy** skips boundary faces through `is_wall` and the open mask. It no
-  longer hard-codes `z = 0` and `z = n`.
+- **Buoyancy** leaves the `z = 0` and `z = n` faces alone, by hard-coded
+  index: a wall stays zero, and an open face takes its value from projection.
 - **Fully closed domain** (`open_mask == 0`): the Neumann system is singular,
   and p is defined only up to a constant. After the solve, p's mean is
   removed with a GPU sum reduction and a subtract pass, with no readback, so
@@ -134,7 +158,9 @@ becomes `face_is_wall || solid(cell)`.
 - The `pressure` slot **stores `p`**, not `φ = h·p`. The sweep solves
   `∇²p = div / h`, and the gradient stage does `u −= h·∇p`. The warm start no
   longer depends on `h`, which resolves risk (b) as CFL varies `h` between
-  frames. The uniform carries `dx² / h` precomputed.
+  frames. The uniform carries `dx2 = dx²` and `pressure_scale = h`, and
+  `pressure.wgsl` computes `dx2 * div / pressure_scale` per cell in every
+  sweep.
 - **Submission splitting (risk f).** The pressure loop flushes the
   `ComputeBatch` every `K = max(1, ⌊2³⁰ / cells⌋)` iterations. At the measured
   0.19 ms per iteration at 128³, that is about 100 ms of GPU work per submission.

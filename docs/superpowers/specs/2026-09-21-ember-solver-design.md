@@ -350,9 +350,9 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 
 ## 6. Risks carried into piece 2b
 
-Found by piece 2a's whole-branch review. (a) is resolved and (g) mostly;
-(b) and the open remainder of (g) should be the first things 2b's plan
-addresses.
+Found by piece 2a's whole-branch review. (a) was resolved in 2a, and (g)
+mostly. 2b-1 resolved (b), (c), (d), (f) and (h). Still open: (e), the open
+part of (g), and (j).
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
@@ -414,3 +414,26 @@ addresses.
   N (`docs/bench/presets.md`). That leaves about 8 ms of headroom at one
   substep, with CFL clamped on every frame. The increase is unexplained and
   should be profiled before 2b-3.
+
+  2b-1's final review narrowed it down. The preset sweep is linear in the
+  substep count, at about 90.5 ms per substep plus about 1 ms per frame
+  (cap 1 = 91.77 ms, cap 2 = 182.77 ms, cap 3 = 272.31 ms). The per-frame
+  work, the CFL readback and the output copies, is therefore not the cause:
+  the regression is inside the substep. The likely causes, most likely first:
+
+  1. `pressure.wgsl`'s runtime axis loop, with dynamic vector indexing,
+     `is_open` reads of the uniform, and a division per cell. naga's Metal
+     backend adds loop bounding to every loop (`force_loop_bounding`), which
+     tends to block unrolling. The kernel runs in 320 dispatches per substep
+     at N = 160.
+  2. The sampling path's runtime loops and the local `array<f32, 8>` in
+     `texel()` and `corners()`.
+  3. MacCormack plus RK2, which raise texel reads per grid cell by about 5×,
+     including the forward backtrace the correction pass recomputes.
+
+  The cheap way to tell them apart: `just bench-sweep 20,160` (the
+  recipe sets `SPEED_GATE_ITERATIONS` itself, so an outer value is
+  overridden; it rewrites `docs/bench/iteration-sweep.md`) gives the
+  per-iteration slope, which isolates (1), and one frame with
+  `advection: semi_lagrangian` isolates (3). A fix may let preview afford 2
+  substeps, which would reopen the preset decision in `docs/bench/presets.md`.
