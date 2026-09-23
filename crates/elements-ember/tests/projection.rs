@@ -4,7 +4,8 @@ use common::*;
 use elements_core::gpu::{ComputeBatch, FieldDims, FieldFormat, FieldPool, PipelineCache};
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::kernels::{
-    StepConstants, Uniforms, divergence, pressure, solve_pressure, subtract_gradient,
+    StepConstants, Uniforms, divergence, iterations_per_submit, pressure, solve_pressure,
+    subtract_gradient,
 };
 
 const CELLS: FieldDims = FieldDims { x: 8, y: 6, z: 5 };
@@ -70,7 +71,7 @@ fn red_black_sweeps_match_the_cpu_reference() {
 
         let u = Uniforms::new(&gpu, &c).unwrap();
         let mut batch = ComputeBatch::new();
-        pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 3).unwrap();
+        pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 3, 3).unwrap();
         batch.submit(&gpu).unwrap();
 
         let mut want = p0.clone();
@@ -221,10 +222,44 @@ fn a_converged_projection_removes_divergence() {
     let u = Uniforms::new(&gpu, &constants(dx)).unwrap();
     let mut batch = ComputeBatch::new();
     divergence(&gpu, &mut cache, &mut batch, &u, &velocity, &div).unwrap();
-    pressure(&gpu, &mut cache, &mut batch, &u, &phi, &div, 2000).unwrap();
+    pressure(&gpu, &mut cache, &mut batch, &u, &phi, &div, 2000, 2000).unwrap();
     subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &phi).unwrap();
     batch.submit(&gpu).unwrap();
 
     let after = cpu_max_divergence(&read_staggered(&gpu, &velocity), CELLS, dx);
     assert!(after < 1e-3 * before, "max |div| {before} -> {after}");
+}
+
+/// Spec §4.3, risk (f): splitting the pressure loop into several
+/// submissions changes nothing, bit for bit.
+#[test]
+fn splitting_the_pressure_loop_changes_nothing() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let c = constants(1.0);
+    let mut run = |per_submit: u32| -> Vec<u32> {
+        let mut pool = FieldPool::new();
+        let div = upload(&gpu, &mut pool, CELLS, &pattern(CELLS, 8));
+        let p = upload(&gpu, &mut pool, CELLS, &pattern(CELLS, 9));
+        let u = Uniforms::new(&gpu, &c).unwrap();
+        let mut batch = ComputeBatch::new();
+        pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 7, per_submit).unwrap();
+        batch.submit(&gpu).unwrap();
+        p.read_back(&gpu)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let whole = run(7);
+    assert!(run(1) == whole, "one iteration per submission");
+    assert!(run(3) == whole, "three iterations per submission");
+}
+
+/// About 2³⁰ cell sweeps per submission: 100 ms of work at 128³.
+#[test]
+fn the_submission_budget_is_two_to_the_thirty_cell_sweeps() {
+    assert_eq!(iterations_per_submit(FieldDims::new(128, 128, 128)), 512);
+    assert_eq!(iterations_per_submit(FieldDims::new(512, 512, 512)), 8);
+    assert_eq!(iterations_per_submit(FieldDims::new(2048, 2048, 2048)), 1);
 }

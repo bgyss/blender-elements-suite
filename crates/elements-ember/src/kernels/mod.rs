@@ -11,7 +11,10 @@ mod project;
 
 pub use advect::{advect_scalar, advect_velocity};
 pub use forces::{buoyancy, emit};
-pub use project::{divergence, pressure, remove_mean, solve_pressure, subtract_gradient};
+pub use project::{
+    CELL_SWEEPS_PER_SUBMIT, divergence, iterations_per_submit, pressure, remove_mean,
+    solve_pressure, subtract_gradient,
+};
 
 use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError};
 use wgpu::util::DeviceExt;

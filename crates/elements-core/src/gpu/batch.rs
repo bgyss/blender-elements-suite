@@ -12,12 +12,13 @@ use super::{FieldDims, GpuContext, GpuError, WORKGROUP};
 /// earlier dispatch's writes: WebGPU makes each dispatch its own usage scope
 /// and orders storage writes between them.
 ///
-/// Nothing touches the GPU until `submit`, so dropping a batch unsubmitted is
-/// harmless. Fields a batch reads or writes must stay alive, and must not be
-/// released to a pool for reuse, until `submit` returns.
+/// Nothing touches the GPU until `flush` or `submit`, so dropping a batch
+/// unsubmitted is harmless. Fields a batch reads or writes must stay alive,
+/// and must not be released to a pool for reuse, until `submit` returns.
 #[derive(Default)]
 pub struct ComputeBatch {
     dispatches: Vec<Dispatch>,
+    submissions: u32,
 }
 
 struct Dispatch {
@@ -73,11 +74,17 @@ impl ComputeBatch {
         self.dispatches.is_empty()
     }
 
-    /// Encode every recorded dispatch into one compute pass and submit it once.
-    pub fn submit(self, ctx: &GpuContext) -> Result<(), GpuError> {
+    /// Submit everything recorded so far as one submission, then keep
+    /// recording. Dispatches recorded after a flush still see every write
+    /// before it: the queue runs submissions in order.
+    ///
+    /// Fields the flushed work uses may still be in use on the GPU, so they
+    /// must not go back to a pool until the batch's last submission.
+    pub fn flush(&mut self, ctx: &GpuContext) -> Result<(), GpuError> {
         if self.dispatches.is_empty() {
             return Ok(());
         }
+        let dispatches = std::mem::take(&mut self.dispatches);
         ctx.scoped(|| {
             let mut encoder =
                 ctx.device()
@@ -89,7 +96,7 @@ impl ComputeBatch {
                     label: Some("elements-batch"),
                     timestamp_writes: None,
                 });
-                for d in &self.dispatches {
+                for d in &dispatches {
                     pass.set_pipeline(&d.pipeline);
                     pass.set_bind_group(0, &d.bind_group, &[]);
                     let [x, y, z] = d.workgroups;
@@ -97,6 +104,18 @@ impl ComputeBatch {
                 }
             }
             ctx.queue().submit(Some(encoder.finish()));
-        })
+        })?;
+        self.submissions += 1;
+        Ok(())
+    }
+
+    /// Whether any recorded work has reached the queue.
+    pub fn submitted_any(&self) -> bool {
+        self.submissions > 0
+    }
+
+    /// Submit everything still recorded.
+    pub fn submit(mut self, ctx: &GpuContext) -> Result<(), GpuError> {
+        self.flush(ctx)
     }
 }

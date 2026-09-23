@@ -289,11 +289,17 @@ impl Substep {
         result
     }
 
-    /// Discard everything recorded without running it.
+    /// Discard everything still recorded without running it.
     ///
-    /// The state passed to the stages may now hold fields that were never
-    /// written, so the caller must discard the state too.
-    pub fn abandon(self, pool: &mut FieldPool) {
+    /// Work already flushed may still be reading retired fields, so this
+    /// waits for the GPU before releasing them (spec §5). The state passed to
+    /// the stages may now hold fields that were never written, so the caller
+    /// must discard the state too.
+    pub fn abandon(self, gpu: &GpuContext, pool: &mut FieldPool) {
+        if self.batch.submitted_any() {
+            // The step has already failed; a second error adds nothing.
+            let _ = gpu.wait();
+        }
         for field in self.retired {
             pool.release(field);
         }
@@ -318,7 +324,7 @@ pub fn substep(
     match recorded {
         Ok(()) => step.submit(gpu, pool),
         Err(e) => {
-            step.abandon(pool);
+            step.abandon(gpu, pool);
             Err(e)
         }
     }

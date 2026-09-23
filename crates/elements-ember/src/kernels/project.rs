@@ -1,8 +1,8 @@
 //! Pressure projection (stage 4).
 
 use elements_core::gpu::{
-    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, ReduceOp, ReduceTarget,
-    StaggeredField, reduce,
+    Axis, ComputeBatch, Field, FieldDims, GpuContext, GpuError, PipelineCache, ReduceOp,
+    ReduceTarget, StaggeredField, reduce,
 };
 
 use super::{Bind, Uniforms, bind_group, expect_dims};
@@ -66,8 +66,20 @@ pub fn divergence(
     Ok(())
 }
 
+/// About 100 ms of pressure sweeps per submission at the measured 0.19 ms
+/// per iteration at 128³, well inside GPU watchdog limits (spec §4.3).
+pub const CELL_SWEEPS_PER_SUBMIT: u64 = 1 << 30;
+
+/// Pressure iterations per submission for a domain of `cells`: at least 1.
+pub fn iterations_per_submit(cells: FieldDims) -> u32 {
+    let per = CELL_SWEEPS_PER_SUBMIT / (cells.voxel_count() as u64).max(1);
+    u32::try_from(per).unwrap_or(u32::MAX).max(1)
+}
+
 /// `iterations` red-black Gauss–Seidel sweeps on `p`, solving ∇²p = div/h,
-/// in place, starting from whatever `p` holds (the warm start).
+/// in place, starting from whatever `p` holds (the warm start). The loop is
+/// split across submissions of at most `per_submit` iterations each.
+#[allow(clippy::too_many_arguments)] // every arg is load-bearing; see the doc above.
 pub fn pressure(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -76,6 +88,7 @@ pub fn pressure(
     p: &Field,
     div: &Field,
     iterations: u32,
+    per_submit: u32,
 ) -> Result<(), GpuError> {
     expect_dims("pressure p", p, u.cells())?;
     expect_dims("pressure divergence", div, u.cells())?;
@@ -86,7 +99,13 @@ pub fn pressure(
     let entries = [Bind::Tex(p), Bind::Tex(div), Bind::Buf(u.any())];
     let red_group = bind_group(gpu, &red, &entries)?;
     let black_group = bind_group(gpu, &black, &entries)?;
-    for _ in 0..iterations {
+    // A long loop is split across submissions, so one submission never runs
+    // long enough to trip a GPU watchdog (risk f). Order is unchanged.
+    let per_submit = per_submit.max(1);
+    for i in 0..iterations {
+        if i > 0 && i % per_submit == 0 {
+            batch.flush(gpu)?;
+        }
         batch.dispatch(&red, &red_group, u.cells());
         batch.dispatch(&black, &black_group, u.cells());
     }
@@ -133,7 +152,16 @@ pub fn solve_pressure(
     div: &Field,
     iterations: u32,
 ) -> Result<(), GpuError> {
-    pressure(gpu, cache, batch, u, p, div, iterations)?;
+    pressure(
+        gpu,
+        cache,
+        batch,
+        u,
+        p,
+        div,
+        iterations,
+        iterations_per_submit(u.cells()),
+    )?;
     if u.open_mask() == 0 {
         let sum = ReduceTarget::new(gpu, 1)?;
         remove_mean(gpu, cache, batch, u, p, &sum)?;
