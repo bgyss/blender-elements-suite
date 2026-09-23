@@ -85,7 +85,7 @@ impl ComputeBatch {
             return Ok(());
         }
         let dispatches = std::mem::take(&mut self.dispatches);
-        ctx.scoped(|| {
+        let submitted = ctx.scoped(|| {
             let mut encoder =
                 ctx.device()
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -104,9 +104,14 @@ impl ComputeBatch {
                 }
             }
             ctx.queue().submit(Some(encoder.finish()));
-        })?;
+        });
+        // The closure always reaches `submit`, so count it even when the scope
+        // reports an error: that error may be a stray one from unrelated
+        // earlier work, and the queue may still be running this batch.
+        // `Substep::abandon` relies on `submitted_any` to know it must wait
+        // before releasing fields the batch reads.
         self.submissions += 1;
-        Ok(())
+        submitted
     }
 
     /// Whether any recorded work has reached the queue.

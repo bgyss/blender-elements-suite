@@ -87,6 +87,11 @@ struct KernelParams {
     _pad: [u32; 3],
 }
 
+// `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
+// its WGSL twin (or padding) fails the build instead of silently shifting
+// every uniform the kernels read.
+const _: () = assert!(std::mem::size_of::<KernelParams>() == 64);
+
 pub(crate) fn axis_index(axis: Axis) -> u32 {
     match axis {
         Axis::X => 0,

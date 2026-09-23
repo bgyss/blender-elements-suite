@@ -316,7 +316,9 @@ impl Substep {
         })
     }
 
-    /// Stages 1–3: emit, buoyancy, vorticity confinement, advect velocity.
+    /// Everything before projection, four passes: emit, buoyancy, vorticity
+    /// confinement, advect velocity. That is stages 1–3 of the piece 2
+    /// spec's table, with 2b-1's confinement between forces and advection.
     pub fn pre_projection(
         &mut self,
         gpu: &GpuContext,

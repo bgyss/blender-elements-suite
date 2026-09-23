@@ -6,9 +6,11 @@ use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
     StateStore, Time, Timeline, TimelineConfig, Value,
 };
+use elements_ember::cfl;
 use elements_ember::kernels::Advection;
 use elements_ember::kernels::StepConstants;
 use elements_ember::solver::{KIND, SolverParams, SolverState, Sources, resolve_params, substep};
+use std::sync::{Arc, Mutex};
 
 fn rejected(params: serde_json::Value) -> bool {
     matches!(
@@ -134,26 +136,34 @@ fn a_still_domain_stays_exactly_still() {
     }
 }
 
-const PLUME_16: &str = r#"{
+/// A 16³ plume whose output is density. `solver` is the solver's params
+/// object.
+fn plume_16(solver: &str) -> String {
+    format!(
+        r#"{{
   "version": 3,
   "dims": [16, 16, 16],
   "fps": 24.0,
   "domain_size": 2.0,
   "nodes": [
-    { "id": 0, "kind": "ember.sphere_emitter",
-      "params": { "center": [1.0, 1.0, 0.4], "radius": 0.3,
-                  "density_rate": 1.0, "temperature_rate": 2.0 } },
-    { "id": 1, "kind": "ember.smoke_solver",
-      "params": { "pressure_iterations": 40, "buoyancy_temperature": 1.0 } },
-    { "id": 2, "kind": "core.output", "params": {} }
+    {{ "id": 0, "kind": "ember.sphere_emitter",
+      "params": {{ "center": [1.0, 1.0, 0.4], "radius": 0.3,
+                  "density_rate": 1.0, "temperature_rate": 2.0 }} }},
+    {{ "id": 1, "kind": "ember.smoke_solver", "params": {solver} }},
+    {{ "id": 2, "kind": "core.output", "params": {{}} }}
   ],
   "edges": [
-    { "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 },
-    { "from_node": 0, "from_index": 1, "to_node": 1, "to_index": 1 },
-    { "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 0 }
+    {{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }},
+    {{ "from_node": 0, "from_index": 1, "to_node": 1, "to_index": 1 }},
+    {{ "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 0 }}
   ],
   "output": 2
-}"#;
+}}"#
+    )
+}
+
+/// The preview defaults: one substep, no confinement, no dissipation, open top.
+const PREVIEW: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0 }"#;
 
 struct Session {
     gpu: GpuContext,
@@ -164,8 +174,8 @@ struct Session {
 }
 
 impl Session {
-    fn new() -> Self {
-        let (graph, dims) = Document::from_json(PLUME_16)
+    fn new(doc: &str) -> Self {
+        let (graph, dims) = Document::from_json(doc)
             .unwrap()
             .into_graph(&elements_ember::registry())
             .unwrap();
@@ -213,9 +223,8 @@ fn timeline(budget_bytes: u64) -> Timeline {
 
 /// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
 /// back and forth, and after eviction forced a recompute.
-#[test]
-fn frame_40_is_bit_identical_however_it_is_reached() {
-    let mut s = Session::new();
+fn assert_frame_40_is_bit_identical(solver: &str) {
+    let mut s = Session::new(&plume_16(solver));
 
     let mut in_order = timeline(0);
     let mut reference = Vec::new();
@@ -243,6 +252,141 @@ fn frame_40_is_bit_identical_however_it_is_reached() {
         s.density_bits(&mut evicting, 40) == reference,
         "after eviction"
     );
+}
+
+#[test]
+fn frame_40_is_bit_identical_however_it_is_reached() {
+    assert_frame_40_is_bit_identical(PREVIEW);
+}
+
+/// Everything 2b-1 added, switched on: a CFL count that varies from frame to
+/// frame, confinement, and dissipation. `cfl` is small enough that the count
+/// changes within the first 40 frames (`substep_counts` shows it does).
+const STRESSED: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0,
+    "max_substeps": 8, "cfl": 0.1, "vorticity": 2.0,
+    "density_dissipation": 0.2, "temperature_dissipation": 0.5 }"#;
+
+/// `STRESSED` in a box with every face a wall, so the closed-domain pressure
+/// mean removal runs too.
+const STRESSED_CLOSED: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0,
+    "max_substeps": 8, "cfl": 0.1, "vorticity": 2.0,
+    "density_dissipation": 0.2, "temperature_dissipation": 0.5,
+    "boundaries": { "-x": "wall", "+x": "wall", "-y": "wall",
+                    "+y": "wall", "-z": "wall", "+z": "wall" } }"#;
+
+/// Passes density through, and records the fastest face speed of the
+/// velocity it is given: a copy of the state entering the next frame.
+struct SpeedProbe(Arc<Mutex<Vec<f32>>>);
+
+impl Node for SpeedProbe {
+    fn kind(&self) -> &'static str {
+        "test.speed_probe"
+    }
+
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Field, SocketType::VectorField],
+            outputs: vec![SocketType::Field],
+        }
+    }
+
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let velocity = ctx.take_input(1)?;
+        let speed = ctx.with_gpu(|gpu, cache| {
+            cfl::measure_speed(gpu, cache, velocity.as_vector_field().unwrap())
+        });
+        ctx.release(velocity);
+        self.0.lock().unwrap().push(speed?);
+        Ok(vec![ctx.take_input(0)?])
+    }
+}
+
+/// The substep count each of frames 1..=40 runs with, reconstructed from
+/// outside: the solver plans from the state entering a frame (spec §3),
+/// which is what `SpeedProbe` saw at the end of the frame before.
+fn substep_counts(solver: &str) -> Vec<u32> {
+    let doc: serde_json::Value = serde_json::from_str(&plume_16(solver)).unwrap();
+    let params = resolve_params(&doc["nodes"][1]["params"]).unwrap();
+    let registry = elements_ember::registry();
+    let build = |i: usize| {
+        let node = &doc["nodes"][i];
+        registry
+            .build(node["kind"].as_str().unwrap(), &node["params"])
+            .unwrap()
+    };
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(build(0));
+    let solver = graph.add_node(build(1));
+    let speeds = Arc::new(Mutex::new(Vec::new()));
+    let probe = graph.add_node(Box::new(SpeedProbe(Arc::clone(&speeds))));
+    let output = graph.add_node(build(2));
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    for (from, to) in [
+        (socket(emitter, 0), socket(solver, 0)),
+        (socket(emitter, 1), socket(solver, 1)),
+        (socket(solver, 0), socket(probe, 0)),
+        (socket(solver, 2), socket(probe, 1)),
+        (socket(probe, 0), socket(output, 0)),
+    ] {
+        graph.connect(from, to).unwrap();
+    }
+    graph.set_output(output);
+    graph.set_domain_size(2.0);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut in_order = timeline(0);
+    for frame in 1..=39 {
+        let evaluated = in_order
+            .goto(
+                &graph,
+                &gpu,
+                &mut pool,
+                &mut pipelines,
+                FieldDims::new(16, 16, 16),
+                frame,
+            )
+            .unwrap();
+        evaluated.value.release_to(&mut pool);
+    }
+    // Frame 1 starts still; frame N + 1 plans from the speed after frame N.
+    let after = speeds.lock().unwrap().clone();
+    std::iter::once(0.0)
+        .chain(after)
+        .map(|speed| {
+            cfl::plan_substeps(
+                speed,
+                1.0 / 24.0,
+                2.0 / 16.0,
+                params.cfl,
+                params.max_substeps,
+            )
+            .expect("a finite speed")
+            .count
+        })
+        .collect()
+}
+
+fn assert_counts_vary(solver: &str) {
+    let counts = substep_counts(solver);
+    eprintln!("substep counts, frames 1..=40: {counts:?}");
+    assert!(
+        counts.iter().any(|&c| c != counts[0]),
+        "the CFL count must change within 40 frames: {counts:?}"
+    );
+}
+
+#[test]
+fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation() {
+    assert_counts_vary(STRESSED);
+    assert_frame_40_is_bit_identical(STRESSED);
+}
+
+#[test]
+fn frame_40_is_bit_identical_in_a_closed_domain() {
+    assert_counts_vary(STRESSED_CLOSED);
+    assert_frame_40_is_bit_identical(STRESSED_CLOSED);
 }
 
 /// Outputs a zero field one cell larger than the domain: a mis-sized source.
@@ -339,7 +483,7 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
 
     // Replace `pressure` with a field one cell larger along x. `project`
-    // acquires `div` at the domain's dims and only then discovers `phi`
+    // acquires `div` at the domain's dims and only then discovers `p`
     // (state.pressure) is the wrong size, in `kernels::pressure`'s dims check.
     let wrong_dims = FieldDims::new(cells.x + 1, cells.y, cells.z);
     let wrong_pressure = pool.acquire_zeroed(&gpu, &mut cache, wrong_dims).unwrap();

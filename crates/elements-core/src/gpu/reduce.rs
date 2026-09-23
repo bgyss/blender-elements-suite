@@ -39,6 +39,11 @@ struct ReduceParams {
     _pad: [u32; 2],
 }
 
+// `ReduceParams` in `shaders/reduce_common.wgsl` is 32 bytes; a field added
+// here without its WGSL twin (or padding) fails the build instead of
+// silently shifting every uniform the shader reads.
+const _: () = assert!(std::mem::size_of::<ReduceParams>() == 32);
+
 /// Where reductions land: `slots` values in one GPU buffer, zero at creation.
 ///
 /// A later kernel in the same batch can bind `buffer()` as

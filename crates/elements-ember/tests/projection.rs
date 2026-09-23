@@ -128,13 +128,13 @@ fn subtracting_the_gradient_zeroes_solid_walls_and_matches_the_cpu() {
     let dx = 0.125;
     let c = constants(dx);
     let faces = velocity_pattern(CELLS);
-    let phi_values = pattern(CELLS, 10);
+    let p_values = pattern(CELLS, 10);
     let velocity = upload_staggered(&gpu, &mut pool, CELLS, &faces);
-    let phi = upload(&gpu, &mut pool, CELLS, &phi_values);
+    let p = upload(&gpu, &mut pool, CELLS, &p_values);
 
     let u = Uniforms::new(&gpu, &c).unwrap();
     let mut batch = ComputeBatch::new();
-    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &phi).unwrap();
+    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p).unwrap();
     batch.submit(&gpu).unwrap();
 
     let got = read_staggered(&gpu, &velocity);
@@ -151,13 +151,13 @@ fn subtracting_the_gradient_zeroes_solid_walls_and_matches_the_cpu() {
                         continue;
                     }
                     let upper = if ijk[a] < n {
-                        phi_values[index(CELLS, i, j, k)]
+                        p_values[index(CELLS, i, j, k)]
                     } else {
                         0.0
                     };
                     let mut low = ijk;
                     low[a] -= 1;
-                    let lower = phi_values[index(CELLS, low[0], low[1], low[2])];
+                    let lower = p_values[index(CELLS, low[0], low[1], low[2])];
                     let want = faces[a][at] - c.h * (upper - lower) / dx;
                     assert!(
                         (got[a][at] - want).abs() <= 1e-4,
@@ -217,13 +217,13 @@ fn a_converged_projection_removes_divergence() {
     );
     let velocity = upload_staggered(&gpu, &mut pool, CELLS, &faces);
     let div = pool.acquire(&gpu, CELLS, FieldFormat::R32Float).unwrap();
-    let phi = pool.acquire_zeroed(&gpu, &mut cache, CELLS).unwrap();
+    let p = pool.acquire_zeroed(&gpu, &mut cache, CELLS).unwrap();
 
     let u = Uniforms::new(&gpu, &constants(dx)).unwrap();
     let mut batch = ComputeBatch::new();
     divergence(&gpu, &mut cache, &mut batch, &u, &velocity, &div).unwrap();
-    pressure(&gpu, &mut cache, &mut batch, &u, &phi, &div, 2000, 2000).unwrap();
-    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &phi).unwrap();
+    pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 2000, 2000).unwrap();
+    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p).unwrap();
     batch.submit(&gpu).unwrap();
 
     let after = cpu_max_divergence(&read_staggered(&gpu, &velocity), CELLS, dx);
