@@ -441,3 +441,29 @@ pub fn walled_velocity_pattern(cells: FieldDims) -> [Vec<f32>; 3] {
     }
     faces
 }
+
+/// Mirrors `face_solid` in solid.wgsl: face `p` of `axis`'s grid touches a
+/// solid cell (mask > 0.5) on either side.
+pub fn face_solid_cpu(mask: &[f32], cells: FieldDims, axis: usize, p: [u32; 3]) -> bool {
+    let n = [cells.x, cells.y, cells.z];
+    let solid = |q: [i64; 3]| {
+        (0..3).all(|a| q[a] >= 0 && q[a] < i64::from(n[a]))
+            && mask[index(cells, q[0] as u32, q[1] as u32, q[2] as u32)] > 0.5
+    };
+    let mut below = p.map(i64::from);
+    below[axis] -= 1;
+    solid(below) || solid(p.map(i64::from))
+}
+
+/// A mask with a solid block of cells i in 4..7, j in 3..6 and k in 2..5.
+pub fn block_mask(cells: FieldDims) -> Vec<f32> {
+    let mut mask = vec![0.0; cells.voxel_count()];
+    for k in 2..5 {
+        for j in 3..6 {
+            for i in 4..7 {
+                mask[index(cells, i, j, k)] = 1.0;
+            }
+        }
+    }
+    mask
+}

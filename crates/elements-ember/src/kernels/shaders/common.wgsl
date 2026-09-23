@@ -14,8 +14,8 @@ struct Params {
     open_mask: u32,      // bit 2·axis + side is set when that domain face is open
     decay: f32,          // exp(−rate·h) for the scalar a pass carries; 1 otherwise
     confinement: f32,    // ε·dx, the vorticity confinement strength scaled to this grid
-    _pad0: u32,
-    _pad1: u32,
+    face_accel: f32,     // wind along this uniform's axis, m/s²; 0 for cell grids
+    has_solids: u32,     // 1 when a collider's solid mask is bound (2b-2 spec §3.2)
     _pad2: u32,
 };
 

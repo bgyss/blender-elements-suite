@@ -4,7 +4,7 @@ use common::*;
 use elements_core::gpu::{ComputeBatch, FieldDims, FieldFormat, FieldPool, PipelineCache};
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::kernels::{
-    StepConstants, Uniforms, divergence, iterations_per_submit, pressure, solve_pressure,
+    Solids, StepConstants, Uniforms, divergence, iterations_per_submit, pressure, solve_pressure,
     subtract_gradient,
 };
 
@@ -71,7 +71,7 @@ fn red_black_sweeps_match_the_cpu_reference() {
 
         let u = Uniforms::new(&gpu, &c).unwrap();
         let mut batch = ComputeBatch::new();
-        pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 3, 3).unwrap();
+        pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 3, 3, None).unwrap();
         batch.submit(&gpu).unwrap();
 
         let mut want = p0.clone();
@@ -102,7 +102,7 @@ fn an_open_face_sees_zero_pressure_beyond_it() {
     let p = upload(&gpu, &mut pool, CELLS, &p_values);
     let u = Uniforms::new(&gpu, &c).unwrap();
     let mut batch = ComputeBatch::new();
-    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p).unwrap();
+    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p, None).unwrap();
     batch.submit(&gpu).unwrap();
 
     let got = read_staggered(&gpu, &velocity);
@@ -134,7 +134,7 @@ fn subtracting_the_gradient_zeroes_solid_walls_and_matches_the_cpu() {
 
     let u = Uniforms::new(&gpu, &c).unwrap();
     let mut batch = ComputeBatch::new();
-    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p).unwrap();
+    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p, None).unwrap();
     batch.submit(&gpu).unwrap();
 
     let got = read_staggered(&gpu, &velocity);
@@ -187,7 +187,7 @@ fn a_closed_domain_solve_leaves_p_with_zero_mean() {
     let p = upload(&gpu, &mut pool, CELLS, &p0);
     let u = Uniforms::new(&gpu, &c).unwrap();
     let mut batch = ComputeBatch::new();
-    solve_pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 40).unwrap();
+    solve_pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 40, None).unwrap();
     batch.submit(&gpu).unwrap();
 
     let got = p.read_back(&gpu).unwrap();
@@ -222,8 +222,8 @@ fn a_converged_projection_removes_divergence() {
     let u = Uniforms::new(&gpu, &constants(dx)).unwrap();
     let mut batch = ComputeBatch::new();
     divergence(&gpu, &mut cache, &mut batch, &u, &velocity, &div).unwrap();
-    pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 2000, 2000).unwrap();
-    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p).unwrap();
+    pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 2000, 2000, None).unwrap();
+    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p, None).unwrap();
     batch.submit(&gpu).unwrap();
 
     let after = cpu_max_divergence(&read_staggered(&gpu, &velocity), CELLS, dx);
@@ -243,7 +243,10 @@ fn splitting_the_pressure_loop_changes_nothing() {
         let p = upload(&gpu, &mut pool, CELLS, &pattern(CELLS, 9));
         let u = Uniforms::new(&gpu, &c).unwrap();
         let mut batch = ComputeBatch::new();
-        pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 7, per_submit).unwrap();
+        pressure(
+            &gpu, &mut cache, &mut batch, &u, &p, &div, 7, per_submit, None,
+        )
+        .unwrap();
         batch.submit(&gpu).unwrap();
         p.read_back(&gpu)
             .unwrap()
@@ -262,4 +265,113 @@ fn the_submission_budget_is_two_to_the_thirty_cell_sweeps() {
     assert_eq!(iterations_per_submit(FieldDims::new(128, 128, 128)), 512);
     assert_eq!(iterations_per_submit(FieldDims::new(512, 512, 512)), 8);
     assert_eq!(iterations_per_submit(FieldDims::new(2048, 2048, 2048)), 1);
+}
+
+/// Spec §3.2: after projection, every face touching a solid cell carries the
+/// collider's velocity exactly, solid cells hold p = 0, and the fluid is
+/// divergence-free. The input already carries the collider's velocity on
+/// solid faces, as advection leaves it.
+#[test]
+fn projection_honours_solid_cells() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(12, 10, 8);
+    let dx = 0.125;
+    let c = StepConstants {
+        has_solids: true,
+        ..StepConstants::new(cells, 0.1, dx)
+    };
+    let mask_values = block_mask(cells);
+    let obstacle_faces = velocity_pattern(cells);
+    let mut faces = walled_velocity_pattern(cells);
+    for a in 0..3 {
+        let d = face_dims(cells, a);
+        for k in 0..d.z {
+            for j in 0..d.y {
+                for i in 0..d.x {
+                    if !is_wall(cells, a, [i, j, k][a])
+                        && face_solid_cpu(&mask_values, cells, a, [i, j, k])
+                    {
+                        faces[a][index(d, i, j, k)] = obstacle_faces[a][index(d, i, j, k)];
+                    }
+                }
+            }
+        }
+    }
+    let mask = upload(&gpu, &mut pool, cells, &mask_values);
+    let obstacle = upload_staggered(&gpu, &mut pool, cells, &obstacle_faces);
+    let velocity = upload_staggered(&gpu, &mut pool, cells, &faces);
+    let p = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
+    let div = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let solids = Some(Solids {
+        mask: &mask,
+        velocity: &obstacle,
+    });
+    let mut batch = ComputeBatch::new();
+    divergence(&gpu, &mut cache, &mut batch, &u, &velocity, &div).unwrap();
+    solve_pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 200, solids).unwrap();
+    subtract_gradient(&gpu, &mut cache, &mut batch, &u, &velocity, &p, solids).unwrap();
+    batch.submit(&gpu).unwrap();
+
+    let got = read_staggered(&gpu, &velocity);
+    for a in 0..3 {
+        let d = face_dims(cells, a);
+        for k in 0..d.z {
+            for j in 0..d.y {
+                for i in 0..d.x {
+                    if !is_wall(cells, a, [i, j, k][a])
+                        && face_solid_cpu(&mask_values, cells, a, [i, j, k])
+                    {
+                        let at = index(d, i, j, k);
+                        assert_eq!(
+                            got[a][at],
+                            obstacle_faces[a][at],
+                            "solid face {a} {:?}",
+                            [i, j, k]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let pv = p.read_back(&gpu).unwrap();
+    for (n, m) in mask_values.iter().enumerate() {
+        if *m > 0.5 {
+            assert_eq!(pv[n], 0.0, "solid cell {n} holds p");
+        }
+    }
+    // RMS divergence over fluid cells, before and after.
+    let rms = |f: &[Vec<f32>; 3]| {
+        let (xd, yd, zd) = (
+            face_dims(cells, 0),
+            face_dims(cells, 1),
+            face_dims(cells, 2),
+        );
+        let (mut sum, mut n) = (0.0f64, 0.0f64);
+        for k in 0..cells.z {
+            for j in 0..cells.y {
+                for i in 0..cells.x {
+                    if mask_values[index(cells, i, j, k)] > 0.5 {
+                        continue;
+                    }
+                    let d = (f[0][index(xd, i + 1, j, k)] - f[0][index(xd, i, j, k)]
+                        + f[1][index(yd, i, j + 1, k)]
+                        - f[1][index(yd, i, j, k)]
+                        + f[2][index(zd, i, j, k + 1)]
+                        - f[2][index(zd, i, j, k)])
+                        / dx;
+                    sum += f64::from(d * d);
+                    n += 1.0;
+                }
+            }
+        }
+        (sum / n).sqrt()
+    };
+    let (before, after) = (rms(&faces), rms(&got));
+    assert!(
+        after <= 0.1 * before,
+        "fluid divergence {before} -> {after}"
+    );
 }

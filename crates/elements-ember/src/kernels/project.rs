@@ -5,7 +5,7 @@ use elements_core::gpu::{
     ReduceTarget, StaggeredField, reduce,
 };
 
-use super::{Bind, Uniforms, bind_group, expect_dims};
+use super::{Bind, Solids, Uniforms, bind_group, expect_dims, solid_views};
 
 const DIVERGENCE: &str = concat!(
     include_str!("shaders/common.wgsl"),
@@ -14,11 +14,13 @@ const DIVERGENCE: &str = concat!(
 
 const PRESSURE: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/pressure.wgsl"),
 );
 
 const GRADIENT: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/gradient.wgsl"),
 );
 
@@ -78,7 +80,8 @@ pub fn iterations_per_submit(cells: FieldDims) -> u32 {
 
 /// `iterations` red-black Gauss–Seidel sweeps on `p`, solving ∇²p = div/h,
 /// in place, starting from whatever `p` holds (the warm start). The loop is
-/// split across submissions of at most `per_submit` iterations each.
+/// split across submissions of at most `per_submit` iterations each. Cells of
+/// `solids` are not solved and hold 0; fluid cells treat them as walls.
 #[allow(clippy::too_many_arguments)] // every arg is load-bearing; see the doc above.
 pub fn pressure(
     gpu: &GpuContext,
@@ -89,14 +92,21 @@ pub fn pressure(
     div: &Field,
     iterations: u32,
     per_submit: u32,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     expect_dims("pressure p", p, u.cells())?;
     expect_dims("pressure divergence", div, u.cells())?;
+    let (solid, _) = solid_views(u, solids, None)?;
     let red = cache.get_or_create(gpu, "ember.pressure.red", PRESSURE, "red")?;
     let black = cache.get_or_create(gpu, "ember.pressure.black", PRESSURE, "black")?;
     // Auto layouts are never shared between pipelines, so each colour needs
     // its own bind group. Both are built once and reused every iteration.
-    let entries = [Bind::Tex(p), Bind::Tex(div), Bind::Buf(u.any())];
+    let entries = [
+        Bind::Tex(p),
+        Bind::Tex(div),
+        Bind::Buf(u.any()),
+        Bind::View(solid),
+    ];
     let red_group = bind_group(gpu, &red, &entries)?;
     let black_group = bind_group(gpu, &black, &entries)?;
     // A long loop is split across submissions, so one submission never runs
@@ -143,6 +153,7 @@ pub fn remove_mean(
 /// from whatever `p` holds (the warm start). In a closed domain (every face
 /// a wall) the Neumann system defines p only up to a constant, so p's mean
 /// is removed afterwards and the warm start cannot drift (spec §4.2).
+#[allow(clippy::too_many_arguments)]
 pub fn solve_pressure(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -151,6 +162,7 @@ pub fn solve_pressure(
     p: &Field,
     div: &Field,
     iterations: u32,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     pressure(
         gpu,
@@ -161,6 +173,7 @@ pub fn solve_pressure(
         div,
         iterations,
         iterations_per_submit(u.cells()),
+        solids,
     )?;
     if u.open_mask() == 0 {
         let sum = ReduceTarget::new(gpu, 1)?;
@@ -169,7 +182,8 @@ pub fn solve_pressure(
     Ok(())
 }
 
-/// `velocity -= h·∇p`, with solid-wall faces forced to zero.
+/// `velocity -= h·∇p`, with solid-wall faces forced to zero and faces
+/// touching `solids` set to the collider's velocity (spec §3.2).
 pub fn subtract_gradient(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -177,16 +191,24 @@ pub fn subtract_gradient(
     u: &Uniforms,
     velocity: &StaggeredField,
     p: &Field,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     expect_velocity("subtract_gradient", velocity, u)?;
     expect_dims("subtract_gradient p", p, u.cells())?;
     let pipeline = cache.get_or_create(gpu, "ember.gradient", GRADIENT, "main")?;
     for axis in Axis::ALL {
         let face = velocity.face(axis);
+        let (solid, obstacle) = solid_views(u, solids, Some(axis))?;
         let group = bind_group(
             gpu,
             &pipeline,
-            &[Bind::Tex(face), Bind::Tex(p), Bind::Buf(u.axis(axis))],
+            &[
+                Bind::Tex(face),
+                Bind::Tex(p),
+                Bind::Buf(u.axis(axis)),
+                Bind::View(solid),
+                Bind::View(obstacle),
+            ],
         )?;
         batch.dispatch(&pipeline, &group, face.dims());
     }

@@ -4,15 +4,17 @@ use elements_core::gpu::{
     Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
 };
 
-use super::{Bind, Uniforms, bind_group, expect_dims};
+use super::{Bind, Solids, Uniforms, bind_group, expect_dims, solid_views};
 
 const CURL: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/curl.wgsl"),
 );
 
 const CONFINE: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/confine.wgsl"),
 );
 
@@ -36,7 +38,8 @@ fn check(
 }
 
 /// Record ω = ∇ × `velocity` into `omega`: its x, y and z components, then
-/// |ω|, all at cell centres.
+/// |ω|, all at cell centres. Differences treat cells of `solids` like the
+/// domain edge.
 pub fn curl(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -44,8 +47,10 @@ pub fn curl(
     u: &Uniforms,
     velocity: &StaggeredField,
     omega: [&Field; 4],
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     check("curl", u, velocity, omega)?;
+    let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.curl", CURL, "main")?;
     let group = bind_group(
         gpu,
@@ -59,14 +64,15 @@ pub fn curl(
             Bind::Tex(omega[2]),
             Bind::Tex(omega[3]),
             Bind::Buf(u.any()),
+            Bind::View(solid),
         ],
     )?;
     batch.dispatch(&pipeline, &group, u.cells());
     Ok(())
 }
 
-/// Record u += h·ε·dx·(N × ω) on every non-wall face of `velocity`, from the
-/// `omega` that `curl` wrote.
+/// Record u += h·ε·dx·(N × ω) on every face of `velocity` that is neither a
+/// wall nor touching `solids`, from the `omega` that `curl` wrote.
 pub fn confine(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -74,8 +80,10 @@ pub fn confine(
     u: &Uniforms,
     velocity: &StaggeredField,
     omega: [&Field; 4],
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     check("confine", u, velocity, omega)?;
+    let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.confine", CONFINE, "main")?;
     for axis in Axis::ALL {
         let face = velocity.face(axis);
@@ -89,6 +97,7 @@ pub fn confine(
                 Bind::Tex(omega[2]),
                 Bind::Tex(omega[3]),
                 Bind::Buf(u.axis(axis)),
+                Bind::View(solid),
             ],
         )?;
         batch.dispatch(&pipeline, &group, face.dims());

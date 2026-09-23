@@ -10,6 +10,7 @@
 @group(0) @binding(5) var omega_z: texture_storage_3d<r32float, write>;
 @group(0) @binding(6) var omega_mag: texture_storage_3d<r32float, write>;
 @group(0) @binding(7) var<uniform> params: Params;
+@group(0) @binding(8) var solid: texture_3d<f32>;
 
 // Velocity at the centre of cell `c`, clamped into the domain.
 fn centre_velocity(c: vec3<i32>) -> vec3<f32> {
@@ -27,9 +28,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let c = vec3<i32>(gid);
-    let ddx = centre_velocity(c + vec3<i32>(1, 0, 0)) - centre_velocity(c - vec3<i32>(1, 0, 0));
-    let ddy = centre_velocity(c + vec3<i32>(0, 1, 0)) - centre_velocity(c - vec3<i32>(0, 1, 0));
-    let ddz = centre_velocity(c + vec3<i32>(0, 0, 1)) - centre_velocity(c - vec3<i32>(0, 0, 1));
+    // A solid neighbour is replaced by `c` itself, like the domain edge (spec §3.2).
+    let ddx = centre_velocity(fluid_neighbour(c, vec3<i32>(1, 0, 0)))
+        - centre_velocity(fluid_neighbour(c, vec3<i32>(-1, 0, 0)));
+    let ddy = centre_velocity(fluid_neighbour(c, vec3<i32>(0, 1, 0)))
+        - centre_velocity(fluid_neighbour(c, vec3<i32>(0, -1, 0)));
+    let ddz = centre_velocity(fluid_neighbour(c, vec3<i32>(0, 0, 1)))
+        - centre_velocity(fluid_neighbour(c, vec3<i32>(0, 0, -1)));
     let w = 0.5 * params.inv_dx * vec3<f32>(ddy.z - ddz.y, ddz.x - ddx.z, ddx.y - ddy.x);
     textureStore(omega_x, c, vec4<f32>(w.x, 0.0, 0.0, 0.0));
     textureStore(omega_y, c, vec4<f32>(w.y, 0.0, 0.0, 0.0));

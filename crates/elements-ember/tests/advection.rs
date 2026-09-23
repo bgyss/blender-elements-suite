@@ -7,7 +7,7 @@ use elements_core::gpu::{
 };
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::kernels::{
-    Advection, Carried, Pass, StepConstants, Uniforms, advect, maccormack,
+    Advection, Carried, Pass, Solids, StepConstants, Uniforms, advect, maccormack,
 };
 
 const CELLS: FieldDims = FieldDims { x: 8, y: 6, z: 5 };
@@ -47,6 +47,7 @@ fn an_integer_uniform_velocity_shifts_a_scalar_exactly() {
         &velocity,
         &src,
         &dst,
+        None,
     )
     .unwrap();
     batch.submit(&gpu).unwrap();
@@ -91,6 +92,7 @@ fn a_fractional_velocity_advects_a_scalar_like_the_cpu_reference() {
         &velocity,
         &src,
         &dst,
+        None,
     )
     .unwrap();
     batch.submit(&gpu).unwrap();
@@ -135,6 +137,7 @@ fn velocity_advection_matches_the_cpu_reference_and_zeroes_solid_walls() {
             &src,
             src.face(*axis),
             dst.face(*axis),
+            None,
         )
         .unwrap();
         let _ = a;
@@ -200,6 +203,7 @@ fn inflow_across_an_open_face_carries_clean_air() {
         &velocity,
         &src,
         &dst,
+        None,
     )
     .unwrap();
     batch.submit(&gpu).unwrap();
@@ -262,6 +266,7 @@ fn rk2_follows_a_rotation_like_the_cpu_reference() {
         &velocity,
         &src,
         &dst,
+        None,
     )
     .unwrap();
     batch.submit(&gpu).unwrap();
@@ -307,6 +312,7 @@ fn maccormack_step(
         velocity,
         src,
         &fwd,
+        None,
     )
     .unwrap();
     advect(
@@ -319,10 +325,11 @@ fn maccormack_step(
         velocity,
         &fwd,
         &bwd,
+        None,
     )
     .unwrap();
     maccormack(
-        gpu, cache, &mut batch, u, carried, velocity, src, &fwd, &bwd, dst,
+        gpu, cache, &mut batch, u, carried, velocity, src, &fwd, &bwd, dst, None,
     )
     .unwrap();
     batch.submit(gpu).unwrap();
@@ -426,6 +433,7 @@ fn carry_along_x(values: &[f32], steps: u32, advection: Advection) -> Vec<f32> {
                     &velocity,
                     &q,
                     &next,
+                    None,
                 )
                 .unwrap();
                 batch.submit(&gpu).unwrap();
@@ -522,6 +530,7 @@ fn dissipation_decays_by_exp_of_rate_times_h() {
                         &velocity,
                         &src,
                         &dst,
+                        None,
                     )
                     .unwrap();
                     batch.submit(&gpu).unwrap();
@@ -540,6 +549,61 @@ fn dissipation_decays_by_exp_of_rate_times_h() {
                 1e-6,
                 &format!("{advection:?} {carried:?}"),
             );
+        }
+    }
+}
+
+/// Spec §3.2 (as corrected): scalar sampling never reads a solid's contents.
+/// Solid cells hold 100 and fluid cells 1. After a short advection step every
+/// fluid cell still holds exactly 1, because solid corners are replaced by
+/// the mean of the fluid corners.
+#[test]
+fn scalars_next_to_a_solid_never_sample_its_contents() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(12, 10, 8);
+    // 0.6 m/s × 0.02 s / 0.125 m ≈ 0.1 cell, so every stencil keeps a fluid corner.
+    let c = StepConstants {
+        has_solids: true,
+        open_mask: 0,
+        ..StepConstants::new(cells, 0.02, 0.125)
+    };
+    let mask_values = block_mask(cells);
+    let src_values: Vec<f32> = mask_values
+        .iter()
+        .map(|&m| if m > 0.5 { 100.0 } else { 1.0 })
+        .collect();
+    let mask = upload(&gpu, &mut pool, cells, &mask_values);
+    let obstacle = pool
+        .acquire_staggered_zeroed(&gpu, &mut cache, cells)
+        .unwrap();
+    let velocity = upload_staggered(&gpu, &mut pool, cells, &velocity_pattern(cells));
+    let src = upload(&gpu, &mut pool, cells, &src_values);
+    let dst = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let mut batch = ComputeBatch::new();
+    advect(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &u,
+        Carried::Density,
+        Pass::SemiLagrangian,
+        &velocity,
+        &src,
+        &dst,
+        Some(Solids {
+            mask: &mask,
+            velocity: &obstacle,
+        }),
+    )
+    .unwrap();
+    batch.submit(&gpu).unwrap();
+    let got = dst.read_back(&gpu).unwrap();
+    for (n, m) in mask_values.iter().enumerate() {
+        if *m < 0.5 {
+            assert!((got[n] - 1.0).abs() <= 1e-5, "fluid cell {n}: {}", got[n]);
         }
     }
 }

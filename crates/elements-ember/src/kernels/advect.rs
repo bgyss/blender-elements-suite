@@ -6,16 +6,18 @@ use elements_core::gpu::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{Bind, Uniforms, bind_group, expect_dims};
+use super::{Bind, Solids, Uniforms, bind_group, expect_dims, solid_views};
 
 const ADVECT: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/velocity.wgsl"),
     include_str!("shaders/advect.wgsl"),
 );
 
 const MACCORMACK: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/velocity.wgsl"),
     include_str!("shaders/maccormack.wgsl"),
 );
@@ -42,6 +44,14 @@ pub enum Carried {
 }
 
 impl Carried {
+    /// The face axis this grid lies on, or `None` for a cell-centred scalar.
+    fn axis(self) -> Option<Axis> {
+        match self {
+            Self::Face(axis) => Some(axis),
+            Self::Density | Self::Temperature => None,
+        }
+    }
+
     /// The texel dims of this grid in a domain of `cells`.
     pub fn dims(self, cells: FieldDims) -> FieldDims {
         match self {
@@ -84,7 +94,9 @@ fn check(
 }
 
 /// Record one pass carrying `src` through `velocity` into `dst`. Solid-wall
-/// faces of a velocity face grid come out zero.
+/// faces of a velocity face grid come out zero, and faces touching `solids`
+/// carry the collider's velocity; a scalar never samples a solid cell's
+/// contents (spec §3.2).
 #[allow(clippy::too_many_arguments)]
 pub fn advect(
     gpu: &GpuContext,
@@ -96,8 +108,10 @@ pub fn advect(
     velocity: &StaggeredField,
     src: &Field,
     dst: &Field,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     check("advect", u, carried, velocity, &[src, dst])?;
+    let (solid, obstacle) = solid_views(u, solids, carried.axis())?;
     let (key, entry) = match pass {
         Pass::SemiLagrangian => ("ember.advect.semi_lagrangian", "semi_lagrangian"),
         Pass::Forward => ("ember.advect.forward", "forward"),
@@ -114,6 +128,8 @@ pub fn advect(
             Bind::Tex(src),
             Bind::Tex(dst),
             Bind::Buf(u.carried(carried)),
+            Bind::View(solid),
+            Bind::View(obstacle),
         ],
     )?;
     batch.dispatch(&pipeline, &group, dst.dims());
@@ -134,8 +150,10 @@ pub fn maccormack(
     fwd: &Field,
     bwd: &Field,
     dst: &Field,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     check("maccormack", u, carried, velocity, &[orig, fwd, bwd, dst])?;
+    let (solid, obstacle) = solid_views(u, solids, carried.axis())?;
     let pipeline = cache.get_or_create(gpu, "ember.maccormack", MACCORMACK, "main")?;
     let group = bind_group(
         gpu,
@@ -149,6 +167,8 @@ pub fn maccormack(
             Bind::Tex(bwd),
             Bind::Tex(dst),
             Bind::Buf(u.carried(carried)),
+            Bind::View(solid),
+            Bind::View(obstacle),
         ],
     )?;
     batch.dispatch(&pipeline, &group, dst.dims());

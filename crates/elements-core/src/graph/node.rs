@@ -38,6 +38,14 @@ pub enum NodeError {
     StateShape { node: NodeId, slot: &'static str },
     #[error("node {node:?} diverged: its velocity is no longer finite")]
     SolverDiverged { node: NodeId },
+    #[error(
+        "node {node:?} input {connected} is connected but input {missing}, which it needs, is not"
+    )]
+    IncompletePair {
+        node: NodeId,
+        connected: u32,
+        missing: u32,
+    },
     #[error(transparent)]
     Gpu(#[from] GpuError),
 }
@@ -281,6 +289,17 @@ impl EvalCtx<'_> {
                 node: self.node,
                 index,
             })
+    }
+
+    /// Whether input `index` has an edge. The graph lets an input stay
+    /// unconnected until a node reads it, so a node with optional inputs asks
+    /// here before reading.
+    pub fn input_connected(&self, index: u32) -> bool {
+        self.sources
+            .get(index as usize)
+            .copied()
+            .flatten()
+            .is_some()
     }
 
     /// Take ownership of input `index`.

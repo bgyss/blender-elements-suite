@@ -6,7 +6,7 @@ An open-source, Rust-based suite of real-time VFX authoring tools for Blender. T
 
 ## Status
 
-Early. The engine and the first two milestones of its smoke solver work; fire, colliders and the rest of what a production smoke scene needs are still to come.
+Early. The engine, its smoke solver and the solver's scene content work; fire, a live viewport preview and the rest of what a production smoke tool needs are still to come.
 
 **What exists today**
 
@@ -19,9 +19,12 @@ Early. The engine and the first two milestones of its smoke solver work; fire, c
   - Boussinesq buoyancy, vorticity confinement and dissipation;
   - red-black Gauss–Seidel pressure projection, warm-started from the previous frame, with walls or open faces chosen per side;
   - `preview` and `final` quality presets;
-  - a sphere emitter.
+  - keyframed sphere and box emitters that add density and temperature, modulated by seeded noise measured in metres, and can pull the fluid toward a target velocity;
+  - keyframed sphere and box colliders, moving or still, whose surfaces carry their own velocity;
+  - unions of emitters and of colliders;
+  - uniform wind.
 
-  A frame is bit-identical however you reach it: playing forward, scrubbing back, or restoring from the cache.
+  Emitters and colliders are node kinds in an `.elements` document; the Blender add-on does not expose them yet. A frame is bit-identical however you reach it: playing forward, scrubbing back, or restoring from the cache, including with animated emitters and colliders.
 
 **How fast it is.** Piece 2a's speed gate, on a 128³ grid on an Apple M1 Max (Metal), with semi-Lagrangian advection and a fixed single substep, and the pass/fail rule fixed before anything was measured:
 
@@ -35,9 +38,9 @@ The full tables and conditions are in [`docs/bench/speed-gate.md`](docs/bench/sp
 
 **Not yet**
 
-- Fire, colliders, wind and animated emitters. These are next. The plume above is smooth and laminar because vorticity confinement, though implemented, is off by default (`vorticity` is 0 in both presets) and off in the example scene.
+- Fire. The plume above is smooth and laminar because vorticity confinement, though implemented, is off by default (`vorticity` is 0 in both presets) and off in the example scene.
 - A live preview in the Blender viewport. Today you bake to VDB and load the sequence.
-- A benchmark against Blender's built-in Mantaflow solver. It follows the scene content above, and it will report where Mantaflow wins.
+- A benchmark against Blender's built-in Mantaflow solver. It is next, and it will report where Mantaflow wins.
 
 The design documents are in [`docs/superpowers/specs/`](docs/superpowers/specs/), and the risks the next milestone starts from are in §6 of [the solver spec](docs/superpowers/specs/2026-09-21-ember-solver-design.md).
 

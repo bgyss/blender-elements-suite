@@ -67,6 +67,7 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(
         serde_json::json!({ "temperature_dissipation": 1e39 })
     ));
+    assert!(rejected(serde_json::json!({ "wind": [1e39, 0.0, 0.0] })));
 }
 
 /// Spec §6: a preset fills only the fields a document leaves unset, and
@@ -92,7 +93,7 @@ fn step_constants_carry_every_solver_parameter() {
         "advection": "semi_lagrangian", "vorticity": 3.0,
         "density_dissipation": 0.5, "temperature_dissipation": 0.25,
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
-        "boundaries": { "-x": "open" }
+        "boundaries": { "-x": "open" }, "wind": [0.5, 0.0, -1.0]
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -103,6 +104,7 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.alpha, 0.75);
     assert_eq!(c.beta, 2.0);
     assert_eq!(c.open_mask, 0b100001);
+    assert_eq!(c.wind, [0.5, 0.0, -1.0]);
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.
@@ -121,10 +123,7 @@ fn a_still_domain_stays_exactly_still() {
         beta: 2.0,
         ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
     };
-    let sources = Sources {
-        density: &zero,
-        temperature: &zero,
-    };
+    let sources = Sources::new(&zero, &zero);
     for _ in 0..10 {
         substep(
             &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
@@ -224,7 +223,11 @@ fn timeline(budget_bytes: u64) -> Timeline {
 /// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
 /// back and forth, and after eviction forced a recompute.
 fn assert_frame_40_is_bit_identical(solver: &str) {
-    let mut s = Session::new(&plume_16(solver));
+    assert_doc_frame_40_is_bit_identical(&plume_16(solver));
+}
+
+fn assert_doc_frame_40_is_bit_identical(doc: &str) {
+    let mut s = Session::new(doc);
 
     let mut in_order = timeline(0);
     let mut reference = Vec::new();
@@ -257,6 +260,47 @@ fn assert_frame_40_is_bit_identical(solver: &str) {
 #[test]
 fn frame_40_is_bit_identical_however_it_is_reached() {
     assert_frame_40_is_bit_identical(PREVIEW);
+}
+
+/// A 16³ document with an animated, noisy box emitter (all four outputs
+/// wired) and an animated sphere collider (inputs 4 and 5).
+const ANIMATED: &str = r#"{
+  "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+  "nodes": [
+    { "id": 0, "kind": "ember.emitter", "params": {
+        "shape": { "box": { "half_extents": [0.2, 0.2, 0.1] } },
+        "transform": { "keys": [
+          { "frame": 1, "translate": [0.7, 1.0, 0.3] },
+          { "frame": 40, "translate": [1.3, 1.0, 0.3], "rotate": { "axis": [0, 0, 1], "degrees": 90 } } ] },
+        "density_rate": 1.0, "temperature_rate": 2.0,
+        "velocity": [0.0, 0.0, 0.5], "velocity_blend": 4.0,
+        "noise": { "seed": 9, "scale_m": 0.2, "amplitude": 0.6, "evolution": 1.5 } } },
+    { "id": 1, "kind": "ember.collider", "params": {
+        "shape": { "sphere": { "radius": 0.2 } },
+        "transform": { "keys": [
+          { "frame": 1, "translate": [0.6, 1.0, 1.2] },
+          { "frame": 40, "translate": [1.4, 1.0, 1.1] } ] } } },
+    { "id": 2, "kind": "ember.smoke_solver", "params": { "pressure_iterations": 40, "buoyancy_temperature": 1.0, "vorticity": 2.0 } },
+    { "id": 3, "kind": "core.output", "params": {} }
+  ],
+  "edges": [
+    { "from_node": 0, "from_index": 0, "to_node": 2, "to_index": 0 },
+    { "from_node": 0, "from_index": 1, "to_node": 2, "to_index": 1 },
+    { "from_node": 0, "from_index": 2, "to_node": 2, "to_index": 2 },
+    { "from_node": 0, "from_index": 3, "to_node": 2, "to_index": 3 },
+    { "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 4 },
+    { "from_node": 1, "from_index": 1, "to_node": 2, "to_index": 5 },
+    { "from_node": 2, "from_index": 0, "to_node": 3, "to_index": 0 }
+  ],
+  "output": 3
+}"#;
+
+/// Umbrella §4: frame 40 is bit-identical in order, after scrubbing and after
+/// eviction, with an animated collider and an animated, noisy emitter,
+/// because poses, masks and noise are recomputed from the document's time.
+#[test]
+fn frame_40_is_bit_identical_with_animated_emitter_and_collider() {
+    assert_doc_frame_40_is_bit_identical(ANIMATED);
 }
 
 /// Everything 2b-1 added, switched on: a CFL count that varies from frame to
@@ -496,10 +540,7 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
         beta: 2.0,
         ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
     };
-    let sources = Sources {
-        density: &zero,
-        temperature: &zero,
-    };
+    let sources = Sources::new(&zero, &zero);
 
     let err = substep(
         &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
@@ -711,4 +752,235 @@ fn outputs_nobody_reads_are_never_copied() {
         4,
         "all {all}, density only {density_only}"
     );
+}
+
+/// Spec §3.1: velocity emission needs its weight and its target together.
+#[test]
+fn a_velocity_weight_without_a_target_is_an_error() {
+    let registry = elements_ember::registry();
+    let build = |with_target: bool| {
+        let mut graph = Graph::new();
+        let emitter = graph.add_node(
+            registry
+                .build(
+                    elements_ember::shape_emitter::KIND,
+                    &serde_json::json!({
+                        "shape": { "box": { "half_extents": [0.2, 0.2, 0.2] } },
+                        "transform": { "keys": [{ "frame": 0, "translate": [1.0, 1.0, 0.4] }] },
+                        "density_rate": 1.0, "velocity": [0.0, 0.0, 1.0], "velocity_blend": 10.0
+                    }),
+                )
+                .unwrap(),
+        );
+        let solver = graph.add_node(
+            registry
+                .build(KIND, &serde_json::json!({ "pressure_iterations": 4 }))
+                .unwrap(),
+        );
+        let output = graph.add_node(
+            registry
+                .build("core.output", &serde_json::json!({}))
+                .unwrap(),
+        );
+        let socket = |node: NodeId, index: u32| SocketId { node, index };
+        let last = if with_target { 4 } else { 3 };
+        for index in 0..last {
+            graph
+                .connect(socket(emitter, index), socket(solver, index))
+                .unwrap();
+        }
+        graph.connect(socket(solver, 0), socket(output, 0)).unwrap();
+        graph.set_output(output);
+        graph
+    };
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let run = |graph: &Graph, pool: &mut FieldPool, pipelines: &mut PipelineCache| {
+        let mut state = StateStore::new();
+        let result = graph.eval_frame(
+            &gpu,
+            pool,
+            pipelines,
+            &mut state,
+            Time::at(1, 1, 24.0),
+            FieldDims::new(8, 8, 8),
+        );
+        state.clear(pool);
+        result.map(|evaluated| evaluated.value.release_to(pool))
+    };
+    let err = run(&build(false), &mut pool, &mut pipelines).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NodeError::IncompletePair {
+                connected: 2,
+                missing: 3,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    run(&build(true), &mut pool, &mut pipelines).unwrap();
+}
+
+/// `plume_16(solver)` plus an `ember.collider` wired to solver inputs 4 and
+/// 5: a sphere of radius 0.1 at [10, 10, 10], wholly outside the domain.
+/// With `velocity: false`, only the SDF (input 4) is wired.
+fn plume_16_with_far_collider(solver: &str, velocity: bool) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(&plume_16(solver)).unwrap();
+    doc["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": 3, "kind": "ember.collider",
+            "params": {
+                "shape": { "sphere": { "radius": 0.1 } },
+                "transform": { "keys": [{ "frame": 0, "translate": [10.0, 10.0, 10.0] }] }
+            }
+        }));
+    let edges = doc["edges"].as_array_mut().unwrap();
+    edges.push(serde_json::json!({ "from_node": 3, "from_index": 0, "to_node": 1, "to_index": 4 }));
+    if velocity {
+        edges.push(
+            serde_json::json!({ "from_node": 3, "from_index": 1, "to_node": 1, "to_index": 5 }),
+        );
+    }
+    doc.to_string()
+}
+
+/// Spec §3.1: a collider entirely outside the domain changes nothing, bit for
+/// bit, so the solid code paths are exact when nothing is solid.
+#[test]
+fn a_collider_outside_the_domain_changes_nothing() {
+    let mut plain = Session::new(&plume_16(PREVIEW));
+    let mut far = Session::new(&plume_16_with_far_collider(PREVIEW, true));
+    let (mut a, mut b) = (timeline(0), timeline(0));
+    for frame in 1..=10 {
+        assert!(
+            plain.density_bits(&mut a, frame) == far.density_bits(&mut b, frame),
+            "frame {frame}"
+        );
+    }
+}
+
+/// Spec §3.1: a collider SDF without its velocity is an error naming both inputs.
+#[test]
+fn a_collider_sdf_without_its_velocity_is_an_error() {
+    let text = plume_16_with_far_collider(PREVIEW, false);
+    let (graph, dims) = Document::from_json(&text)
+        .unwrap()
+        .into_graph(&elements_ember::registry())
+        .unwrap();
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let err = timeline(0)
+        .goto(&graph, &gpu, &mut pool, &mut pipelines, dims, 1)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NodeError::IncompletePair {
+                connected: 4,
+                missing: 5,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// Like `a_failed_step_returns_every_field_to_the_pool`, with a collider
+/// wired to inputs 4 and 5. The solid mask is built before the first emit,
+/// which is where the mis-sized source fails, so the mask must go back to
+/// the pool on the error path too.
+#[test]
+fn a_failed_step_with_a_collider_returns_the_mask_to_the_pool() {
+    let registry = elements_ember::registry();
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(
+        registry
+            .build(
+                "ember.sphere_emitter",
+                &serde_json::json!({ "center": [1.0, 1.0, 0.4], "radius": 0.3 }),
+            )
+            .unwrap(),
+    );
+    let wrong = graph.add_node(Box::new(WrongSize));
+    let collider = graph.add_node(
+        registry
+            .build(
+                "ember.collider",
+                &serde_json::json!({
+                    "shape": { "sphere": { "radius": 0.2 } },
+                    "transform": { "keys": [{ "frame": 0, "translate": [1.0, 1.0, 1.2] }] }
+                }),
+            )
+            .unwrap(),
+    );
+    let solver = graph.add_node(registry.build(KIND, &serde_json::json!({})).unwrap());
+    let output = graph.add_node(
+        registry
+            .build("core.output", &serde_json::json!({}))
+            .unwrap(),
+    );
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    graph
+        .connect(socket(emitter, 0), socket(solver, 0))
+        .unwrap();
+    graph.connect(socket(wrong, 0), socket(solver, 1)).unwrap();
+    graph
+        .connect(socket(collider, 0), socket(solver, 4))
+        .unwrap();
+    graph
+        .connect(socket(collider, 1), socket(solver, 5))
+        .unwrap();
+    graph.connect(socket(solver, 0), socket(output, 0)).unwrap();
+    graph.set_output(output);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut timeline = timeline(0);
+    let err = timeline
+        .goto(
+            &graph,
+            &gpu,
+            &mut pool,
+            &mut pipelines,
+            FieldDims::new(8, 8, 8),
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, NodeError::Gpu(GpuError::Validation(_))),
+        "got {err:?}"
+    );
+    assert!(pool.allocation_count() > 0);
+    assert_eq!(
+        pool.pooled_count() as u64,
+        pool.allocation_count(),
+        "every allocated texture, the solid mask included, must be back in the pool"
+    );
+}
+
+/// With a collider in the domain, the per-frame solid mask goes back to the
+/// pool after every successful step. The pool reaches a steady state within
+/// a few frames, so a mask that leaked each frame would show as allocations
+/// growing between frames 3 and 6.
+#[test]
+fn a_collider_mask_does_not_leak_across_frames() {
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&plume_16_with_far_collider(PREVIEW, true)).unwrap();
+    doc["nodes"][3]["params"]["transform"]["keys"][0]["translate"] =
+        serde_json::json!([1.0, 1.0, 1.2]);
+    let mut session = Session::new(&doc.to_string());
+    let mut timeline = timeline(0);
+    let mut counts = Vec::new();
+    for frame in 1..=6 {
+        session.density_bits(&mut timeline, frame);
+        counts.push(session.pool.allocation_count());
+    }
+    assert_eq!(counts[2], counts[5], "allocations per frame: {counts:?}");
 }

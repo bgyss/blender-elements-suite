@@ -8,6 +8,7 @@
 @group(0) @binding(3) var omega_z: texture_3d<f32>;
 @group(0) @binding(4) var omega_mag: texture_3d<f32>;
 @group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var solid: texture_3d<f32>;
 
 fn magnitude(c: vec3<i32>) -> f32 {
     let q = clamp(c, vec3<i32>(0), vec3<i32>(params.dims) - vec3<i32>(1));
@@ -17,9 +18,12 @@ fn magnitude(c: vec3<i32>) -> f32 {
 // The confinement force at the centre of cell `c`, which is inside the domain.
 fn force(c: vec3<i32>) -> vec3<f32> {
     let g = 0.5 * params.inv_dx * vec3<f32>(
-        magnitude(c + vec3<i32>(1, 0, 0)) - magnitude(c - vec3<i32>(1, 0, 0)),
-        magnitude(c + vec3<i32>(0, 1, 0)) - magnitude(c - vec3<i32>(0, 1, 0)),
-        magnitude(c + vec3<i32>(0, 0, 1)) - magnitude(c - vec3<i32>(0, 0, 1)),
+        magnitude(fluid_neighbour(c, vec3<i32>(1, 0, 0)))
+            - magnitude(fluid_neighbour(c, vec3<i32>(-1, 0, 0))),
+        magnitude(fluid_neighbour(c, vec3<i32>(0, 1, 0)))
+            - magnitude(fluid_neighbour(c, vec3<i32>(0, -1, 0))),
+        magnitude(fluid_neighbour(c, vec3<i32>(0, 0, 1)))
+            - magnitude(fluid_neighbour(c, vec3<i32>(0, 0, -1))),
     );
     let n = g / (length(g) + 1e-6);
     let w = vec3<f32>(
@@ -37,10 +41,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let i = gid[axis];
-    if (is_wall(axis, i)) {
+    let p = vec3<i32>(gid);
+    // Walls, and faces touching a collider (spec §3.2), are left alone.
+    if (is_wall(axis, i) || face_solid(axis, p)) {
         return;
     }
-    let p = vec3<i32>(gid);
     var e = vec3<i32>(0);
     e[axis] = 1;
     // Face i lies between cells i − 1 and i. An open boundary face has only one.

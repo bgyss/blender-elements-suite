@@ -5,7 +5,8 @@
 160 pressure iterations (`docs/bench/speed-gate.md`). §5 is the benchmark design,
 whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
 Piece 2b-1 (solver correctness) is complete; see `2026-09-22-ember-solver-2b1-design.md`.
-Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e), the open part of (g), and (j) remain.
+2b-2 (scene content) is complete; see `2026-09-23-ember-scene-content-2b2-design.md`.
+Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e), the open part of (g), (j) and (k) remain.
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
 ## 1. Goal and split
@@ -352,7 +353,7 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 
 Found by piece 2a's whole-branch review. (a) and (i) were resolved in 2a, and
 (g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). Still open: (e), the open
-part of (g), and (j).
+part of (g), (j), and (k), which 2b-2 added.
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
@@ -496,3 +497,14 @@ part of (g), and (j).
      - **Next steps:** measure on an idle machine, over a sustained run, with a
        Metal GPU capture or Instruments' GPU counters. Treat presets.md's
        timings as upper bounds until then.
+- **(k) Preview budget after solids.** 2b-2 added work to every kernel: the
+  solid-mask branches (`face_solid`, `fluid_neighbour`), `fluid_corners` in
+  the sampling path, and a uniform buffer per substep. Nobody has measured
+  their cost on an idle machine. The 2b-2 plan's Task 6 ran the sweep under
+  load: the pressure solve went from 0.377 to 0.331 ms per iteration, which
+  is inside the noise and so inconclusive, and frames at N = 160 were about
+  6.5% higher. Before 2b-2, preview was about 92 ms against its 100 ms budget
+  (see (j)), so 6.5% would use most of the headroom. Rerun
+  `just bench-presets` on an idle machine before 2b-3's benchmark, and
+  reopen the preview preset in `docs/bench/presets.md` if the frame no longer
+  fits.

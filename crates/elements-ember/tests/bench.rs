@@ -73,9 +73,9 @@ fn the_gate_fails_when_no_n_meets_both_limits() {
     );
 }
 
-#[test]
-fn the_plume_scene_loads_and_steps() {
-    let text = Scene::plume(16).document().to_json().unwrap();
+/// The scene's document round-trips through JSON, builds, and emits by frame 2.
+fn loads_and_steps(scene: &Scene) {
+    let text = scene.document().to_json().unwrap();
     let doc = Document::from_json(&text).unwrap();
     let config = doc.timeline_config();
     let (graph, dims) = doc.into_graph(&elements_ember::registry()).unwrap();
@@ -87,5 +87,45 @@ fn the_plume_scene_loads_and_steps() {
         .goto(&graph, &gpu, &mut pool, &mut pipelines, dims, 2)
         .unwrap();
     let density = frame.value.as_field().unwrap().read_back(&gpu).unwrap();
-    assert!(density.iter().any(|&v| v > 0.0), "the plume must emit");
+    assert!(density.iter().any(|&v| v > 0.0), "{} must emit", scene.name);
+}
+
+#[test]
+fn the_plume_scene_loads_and_steps() {
+    loads_and_steps(&Scene::plume(16));
+}
+
+#[test]
+fn the_plume_collider_scene_loads_and_steps() {
+    let scene = Scene::plume_collider(16);
+    assert!(
+        scene
+            .document()
+            .nodes
+            .iter()
+            .any(|n| n.kind == elements_ember::collider::KIND)
+    );
+    loads_and_steps(&scene);
+}
+
+#[test]
+fn the_plume_wind_scene_loads_and_steps() {
+    let scene = Scene::plume_wind(16);
+    assert_eq!(scene.solver.wind, [0.5, 0.0, 0.0]);
+    // The document is what 2b-3's Mantaflow side and the daemon read, so the
+    // wind must survive serialisation, not just sit on the struct.
+    let text = scene.document().to_json().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let solver = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == 1)
+        .expect("node 1 is the solver");
+    assert_eq!(
+        solver["params"]["wind"],
+        serde_json::json!([0.5, 0.0, 0.0]),
+        "the serialised solver params must carry the wind"
+    );
+    loads_and_steps(&scene);
 }
