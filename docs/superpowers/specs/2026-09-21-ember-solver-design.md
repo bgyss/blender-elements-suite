@@ -346,8 +346,9 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 
 ## 6. Risks carried into piece 2b
 
-Found by piece 2a's whole-branch review. (a), (b) and (g) should be the first
-things 2b's plan addresses.
+Found by piece 2a's whole-branch review. (a) is resolved and (g) mostly;
+(b) and the open remainder of (g) should be the first things 2b's plan
+addresses.
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
@@ -372,13 +373,22 @@ things 2b's plan addresses.
   dispatches. At 256³–512³ with offline iteration counts that can run for
   seconds and trip GPU watchdogs, which surface as `DeviceLost`. Split
   submissions every K iterations on large grids.
-- **(g) Resolved, partly open (37c01a9).** `GpuContext::scoped` now also
-  pushes an OutOfMemory scope, so an out-of-memory error from texture
-  creation is reported as `GpuError::OutOfMemory`, not panicked through
-  wgpu's default handler. Still open: on unified memory the OS may swap or
-  end the process before wgpu ever reports the condition; the daemon's
-  reset-and-clear path for this error is untested; and an unrecognised
-  `Device::poll` failure still panics through wgpu's `handle_error_fatal`.
+- **(g) Resolved, partly open (37c01a9 and the hardening fix pass).**
+  `GpuContext::scoped` now pushes OutOfMemory, Internal and Validation scopes,
+  so an out-of-memory error from texture creation is reported as
+  `GpuError::OutOfMemory`, not panicked through wgpu's default handler. An
+  uncaptured-error handler holds the most severe error raised outside any
+  scope for the next `scoped` call, and a stray out-of-memory error outranks
+  in-scope internal and validation errors. Blocking waits go through
+  `GpuContext::wait`, which catches the panic from an unrecognised
+  `Device::poll` failure (wgpu's `handle_error_fatal`, the ordinary Vulkan
+  device-lost path) and reports it as `DeviceLost`; this resolves the earlier
+  `Device::poll` caveat. Still open: on unified memory the OS may swap or end
+  the process before wgpu ever reports the condition; the daemon's
+  reset-and-clear path for this error is untested; and estimating the working
+  set when a document is validated was dropped from the hardening slice by the
+  user's choice to capture the error rather than predict it, so it remains
+  open.
 - **(h) Unused outputs are copied every frame.** All three solver outputs are
   duplicated even when only density is consumed: free at 128³, real bandwidth
   at 512³.
