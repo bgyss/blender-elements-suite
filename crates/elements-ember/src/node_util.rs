@@ -20,6 +20,47 @@ pub(crate) fn take_inputs(ctx: &mut EvalCtx<'_>, n: u32) -> Result<Vec<Value>, N
     Ok(taken)
 }
 
+/// Whether inputs `a` and `b`, which mean something only together, are
+/// connected: both (true), neither (false), or one alone (an error naming both).
+pub(crate) fn pair(ctx: &EvalCtx<'_>, a: u32, b: u32) -> Result<bool, NodeError> {
+    let node = ctx.node_id();
+    match (ctx.input_connected(a), ctx.input_connected(b)) {
+        (true, true) => Ok(true),
+        (false, false) => Ok(false),
+        (true, false) => Err(NodeError::IncompletePair {
+            node,
+            connected: a,
+            missing: b,
+        }),
+        (false, true) => Err(NodeError::IncompletePair {
+            node,
+            connected: b,
+            missing: a,
+        }),
+    }
+}
+
+/// Take the listed inputs, in order, with their indices. On failure, every
+/// input already taken is released.
+pub(crate) fn take_listed(
+    ctx: &mut EvalCtx<'_>,
+    indices: &[u32],
+) -> Result<Vec<(u32, Value)>, NodeError> {
+    let mut taken = Vec::with_capacity(indices.len());
+    for &i in indices {
+        match ctx.take_input(i) {
+            Ok(value) => taken.push((i, value)),
+            Err(e) => {
+                for (_, value) in taken {
+                    ctx.release(value);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(taken)
+}
+
 /// Acquire `n` uninitialised `R32Float` fields at the domain's dims. On
 /// failure, every field already acquired is released.
 fn acquire_cells(ctx: &mut EvalCtx<'_>, n: usize) -> Result<Vec<Field>, NodeError> {

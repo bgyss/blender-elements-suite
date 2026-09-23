@@ -59,10 +59,7 @@ fn projection_ratio(open_mask: u32) -> f64 {
         dx,
     )
     .unwrap();
-    let sources = Sources {
-        density: &density_source,
-        temperature: &temperature_source,
-    };
+    let sources = Sources::new(&density_source, &temperature_source);
     let constants = StepConstants {
         beta: 1.0,
         open_mask,
@@ -134,10 +131,7 @@ fn a_hot_blob_rises_every_frame() {
     )
     .unwrap();
     let zero = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
-    let sources = Sources {
-        density: &zero,
-        temperature: &zero,
-    };
+    let sources = Sources::new(&zero, &zero);
     let constants = StepConstants {
         beta: 1.0,
         ..StepConstants::new(cells, 1.0 / 24.0, dx)
@@ -194,10 +188,7 @@ fn the_warm_start_survives_a_change_of_substep_length() {
         dx,
     )
     .unwrap();
-    let sources = Sources {
-        density: &density_source,
-        temperature: &temperature_source,
-    };
+    let sources = Sources::new(&density_source, &temperature_source);
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
     let warm = StepConstants {
         beta: 1.0,
@@ -254,10 +245,7 @@ fn confinement_strengthens_a_plumes_vorticity() {
             dx,
         )
         .unwrap();
-        let sources = Sources {
-            density: &density_source,
-            temperature: &temperature_source,
-        };
+        let sources = Sources::new(&density_source, &temperature_source);
         let constants = StepConstants {
             beta: 1.0,
             vorticity,

@@ -1,4 +1,4 @@
-//! Emission and buoyancy (stages 1 and 2).
+//! Emission, velocity emission, buoyancy and wind (stages 1 and 2).
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
@@ -14,6 +14,17 @@ const ADD_SCALED: &str = concat!(
 const BUOYANCY: &str = concat!(
     include_str!("shaders/common.wgsl"),
     include_str!("shaders/buoyancy.wgsl"),
+);
+
+const BLEND: &str = concat!(
+    include_str!("shaders/common.wgsl"),
+    include_str!("shaders/weights.wgsl"),
+    include_str!("shaders/blend.wgsl"),
+);
+
+const WIND: &str = concat!(
+    include_str!("shaders/common.wgsl"),
+    include_str!("shaders/wind.wgsl")
 );
 
 /// `dst += src * h`.
@@ -67,5 +78,70 @@ pub fn buoyancy(
         ],
     )?;
     batch.dispatch(&pipeline, &group, velocity_z.dims());
+    Ok(())
+}
+
+/// Pull every non-wall face toward `target` by 1 − exp(−w·h), where w is the
+/// face's velocity weight (spec §3.3).
+pub fn blend_velocity(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    velocity: &StaggeredField,
+    weight: &Field,
+    target: &StaggeredField,
+) -> Result<(), GpuError> {
+    let cells = u.cells();
+    expect_dims("blend weight", weight, cells)?;
+    if velocity.cells() != cells || target.cells() != cells {
+        return Err(GpuError::Validation(format!(
+            "blend_velocity: velocity {:?}, target {:?}, domain {cells:?}",
+            velocity.cells(),
+            target.cells()
+        )));
+    }
+    let pipeline = cache.get_or_create(gpu, "ember.blend", BLEND, "main")?;
+    for axis in Axis::ALL {
+        let face = velocity.face(axis);
+        let group = bind_group(
+            gpu,
+            &pipeline,
+            &[
+                Bind::Tex(face),
+                Bind::Tex(weight),
+                Bind::Tex(target.face(axis)),
+                Bind::Buf(u.axis(axis)),
+            ],
+        )?;
+        batch.dispatch(&pipeline, &group, face.dims());
+    }
+    Ok(())
+}
+
+/// Add h·wind at every non-wall face, on each axis whose wind is nonzero (spec §3.4).
+pub fn wind(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    velocity: &StaggeredField,
+) -> Result<(), GpuError> {
+    if velocity.cells() != u.cells() {
+        return Err(GpuError::Validation(format!(
+            "wind: velocity {:?}, domain {:?}",
+            velocity.cells(),
+            u.cells()
+        )));
+    }
+    let pipeline = cache.get_or_create(gpu, "ember.wind", WIND, "main")?;
+    for (axis, a) in Axis::ALL.into_iter().zip(u.wind()) {
+        if a == 0.0 {
+            continue;
+        }
+        let face = velocity.face(axis);
+        let group = bind_group(gpu, &pipeline, &[Bind::Tex(face), Bind::Buf(u.axis(axis))])?;
+        batch.dispatch(&pipeline, &group, face.dims());
+    }
     Ok(())
 }

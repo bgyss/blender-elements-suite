@@ -11,7 +11,7 @@ mod project;
 mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
-pub use forces::{buoyancy, emit};
+pub use forces::{blend_velocity, buoyancy, emit, wind};
 pub use project::{
     CELL_SWEEPS_PER_SUBMIT, divergence, iterations_per_submit, pressure, remove_mean,
     solve_pressure, subtract_gradient,
@@ -46,6 +46,8 @@ pub struct StepConstants {
     pub temperature_dissipation: f32,
     /// Vorticity confinement strength ε, 1/s; 0 skips the stage (spec §4.4).
     pub vorticity: f32,
+    /// Wind, a uniform acceleration, m/s² (spec §3.4).
+    pub wind: [f32; 3],
 }
 
 impl StepConstants {
@@ -65,6 +67,7 @@ impl StepConstants {
             density_dissipation: 0.0,
             temperature_dissipation: 0.0,
             vorticity: 0.0,
+            wind: [0.0; 3],
         }
     }
 }
@@ -84,7 +87,8 @@ struct KernelParams {
     open_mask: u32,
     decay: f32,
     confinement: f32,
-    _pad: [u32; 3],
+    face_accel: f32,
+    _pad: [u32; 2],
 }
 
 // `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
@@ -110,6 +114,7 @@ pub struct Uniforms {
     temperature: wgpu::Buffer,
     cells: FieldDims,
     open_mask: u32,
+    wind: [f32; 3],
 }
 
 impl Uniforms {
@@ -127,7 +132,8 @@ impl Uniforms {
                 open_mask: c.open_mask,
                 decay,
                 confinement: c.vorticity * c.dx,
-                _pad: [0; 3],
+                face_accel: if axis < 3 { c.wind[axis as usize] } else { 0.0 },
+                _pad: [0; 2],
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -150,6 +156,7 @@ impl Uniforms {
             temperature,
             cells: c.cells,
             open_mask: c.open_mask,
+            wind: c.wind,
         })
     }
 
@@ -161,6 +168,11 @@ impl Uniforms {
     /// Open domain faces, as in `StepConstants::open_mask`.
     pub fn open_mask(&self) -> u32 {
         self.open_mask
+    }
+
+    /// Wind, as in `StepConstants::wind`.
+    pub(crate) fn wind(&self) -> [f32; 3] {
+        self.wind
     }
 
     pub(crate) fn axis(&self, axis: Axis) -> &wgpu::Buffer {

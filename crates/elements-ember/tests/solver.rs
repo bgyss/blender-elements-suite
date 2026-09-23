@@ -67,6 +67,7 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(
         serde_json::json!({ "temperature_dissipation": 1e39 })
     ));
+    assert!(rejected(serde_json::json!({ "wind": [1e39, 0.0, 0.0] })));
 }
 
 /// Spec §6: a preset fills only the fields a document leaves unset, and
@@ -92,7 +93,7 @@ fn step_constants_carry_every_solver_parameter() {
         "advection": "semi_lagrangian", "vorticity": 3.0,
         "density_dissipation": 0.5, "temperature_dissipation": 0.25,
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
-        "boundaries": { "-x": "open" }
+        "boundaries": { "-x": "open" }, "wind": [0.5, 0.0, -1.0]
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -103,6 +104,7 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.alpha, 0.75);
     assert_eq!(c.beta, 2.0);
     assert_eq!(c.open_mask, 0b100001);
+    assert_eq!(c.wind, [0.5, 0.0, -1.0]);
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.
@@ -121,10 +123,7 @@ fn a_still_domain_stays_exactly_still() {
         beta: 2.0,
         ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
     };
-    let sources = Sources {
-        density: &zero,
-        temperature: &zero,
-    };
+    let sources = Sources::new(&zero, &zero);
     for _ in 0..10 {
         substep(
             &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
@@ -496,10 +495,7 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
         beta: 2.0,
         ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
     };
-    let sources = Sources {
-        density: &zero,
-        temperature: &zero,
-    };
+    let sources = Sources::new(&zero, &zero);
 
     let err = substep(
         &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
@@ -711,4 +707,74 @@ fn outputs_nobody_reads_are_never_copied() {
         4,
         "all {all}, density only {density_only}"
     );
+}
+
+/// Spec §3.1: velocity emission needs its weight and its target together.
+#[test]
+fn a_velocity_weight_without_a_target_is_an_error() {
+    let registry = elements_ember::registry();
+    let build = |with_target: bool| {
+        let mut graph = Graph::new();
+        let emitter = graph.add_node(
+            registry
+                .build(
+                    elements_ember::shape_emitter::KIND,
+                    &serde_json::json!({
+                        "shape": { "box": { "half_extents": [0.2, 0.2, 0.2] } },
+                        "transform": { "keys": [{ "frame": 0, "translate": [1.0, 1.0, 0.4] }] },
+                        "density_rate": 1.0, "velocity": [0.0, 0.0, 1.0], "velocity_blend": 10.0
+                    }),
+                )
+                .unwrap(),
+        );
+        let solver = graph.add_node(
+            registry
+                .build(KIND, &serde_json::json!({ "pressure_iterations": 4 }))
+                .unwrap(),
+        );
+        let output = graph.add_node(
+            registry
+                .build("core.output", &serde_json::json!({}))
+                .unwrap(),
+        );
+        let socket = |node: NodeId, index: u32| SocketId { node, index };
+        let last = if with_target { 4 } else { 3 };
+        for index in 0..last {
+            graph
+                .connect(socket(emitter, index), socket(solver, index))
+                .unwrap();
+        }
+        graph.connect(socket(solver, 0), socket(output, 0)).unwrap();
+        graph.set_output(output);
+        graph
+    };
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let run = |graph: &Graph, pool: &mut FieldPool, pipelines: &mut PipelineCache| {
+        let mut state = StateStore::new();
+        let result = graph.eval_frame(
+            &gpu,
+            pool,
+            pipelines,
+            &mut state,
+            Time::at(1, 1, 24.0),
+            FieldDims::new(8, 8, 8),
+        );
+        state.clear(pool);
+        result.map(|evaluated| evaluated.value.release_to(pool))
+    };
+    let err = run(&build(false), &mut pool, &mut pipelines).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NodeError::IncompletePair {
+                connected: 2,
+                missing: 3,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    run(&build(true), &mut pool, &mut pipelines).unwrap();
 }

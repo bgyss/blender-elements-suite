@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::boundaries::Boundaries;
 use crate::cfl;
 use crate::kernels::{self, Advection, Carried, Pass, StepConstants, Uniforms};
+use crate::node_util::{pair, take_listed};
 use crate::params;
 
 pub const KIND: &str = "ember.smoke_solver";
@@ -62,6 +63,7 @@ impl Quality {
             // Provisional until 2b-3 maps parameters to Mantaflow's.
             buoyancy_temperature: 1.0,
             boundaries: Boundaries::default(),
+            wind: [0.0; 3],
         }
     }
 }
@@ -89,6 +91,8 @@ pub struct SolverParams {
     pub buoyancy_temperature: f32,
     /// Which domain faces are open; the rest are walls (spec §4.2).
     pub boundaries: Boundaries,
+    /// Wind, a uniform acceleration, m/s² (spec §3.4).
+    pub wind: [f32; 3],
 }
 
 impl Default for SolverParams {
@@ -115,6 +119,7 @@ struct DocParams {
     buoyancy_density: Option<f32>,
     buoyancy_temperature: Option<f32>,
     boundaries: Option<Boundaries>,
+    wind: Option<[f32; 3]>,
 }
 
 /// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
@@ -155,6 +160,7 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
             .buoyancy_temperature
             .unwrap_or(preset.buoyancy_temperature),
         boundaries: doc.boundaries.unwrap_or(preset.boundaries),
+        wind: doc.wind.unwrap_or(preset.wind),
     };
     validate(&p)?;
     Ok(p)
@@ -191,6 +197,7 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
         "buoyancy",
         &[p.buoyancy_density, p.buoyancy_temperature],
     )?;
+    params::finite(KIND, "wind", &p.wind)?;
     let rates = [
         p.vorticity,
         p.density_dissipation,
@@ -218,6 +225,7 @@ impl SolverParams {
             density_dissipation: self.density_dissipation,
             temperature_dissipation: self.temperature_dissipation,
             vorticity: self.vorticity,
+            wind: self.wind,
             ..StepConstants::new(cells, h, dx)
         }
     }
@@ -283,11 +291,39 @@ impl SolverState {
     }
 }
 
-/// Emission rates per second, at the domain's dims.
+/// Velocity emission for one frame: the velocity weight (1/s) and the
+/// target velocity (spec §3.3).
+#[derive(Clone, Copy)]
+pub struct Emission<'a> {
+    pub weight: &'a Field,
+    pub velocity: &'a StaggeredField,
+}
+
+/// A frame's inputs to the solver.
 #[derive(Clone, Copy)]
 pub struct Sources<'a> {
+    /// Emission rates per second, at the domain's dims.
     pub density: &'a Field,
     pub temperature: &'a Field,
+    /// Velocity emission, when an emitter's weight and target are connected.
+    pub emission: Option<Emission<'a>>,
+}
+
+impl<'a> Sources<'a> {
+    pub fn new(density: &'a Field, temperature: &'a Field) -> Self {
+        Self {
+            density,
+            temperature,
+            emission: None,
+        }
+    }
+
+    pub fn with_emission(self, emission: Emission<'a>) -> Self {
+        Self {
+            emission: Some(emission),
+            ..self
+        }
+    }
 }
 
 /// One substep being recorded. Every stage records into one batch, so a
@@ -303,6 +339,7 @@ pub struct Substep {
     retired: Vec<Field>,
     advection: Advection,
     vorticity: bool,
+    wind: bool,
 }
 
 impl Substep {
@@ -313,6 +350,7 @@ impl Substep {
             retired: Vec::new(),
             advection: constants.advection,
             vorticity: constants.vorticity > 0.0,
+            wind: constants.wind != [0.0; 3],
         })
     }
 
@@ -344,6 +382,17 @@ impl Substep {
             &state.temperature,
             sources.temperature,
         )?;
+        if let Some(e) = sources.emission {
+            kernels::blend_velocity(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &state.velocity,
+                e.weight,
+                e.velocity,
+            )?;
+        }
         kernels::buoyancy(
             gpu,
             cache,
@@ -353,6 +402,9 @@ impl Substep {
             &state.density,
             &state.temperature,
         )?;
+        if self.wind {
+            kernels::wind(gpu, cache, &mut self.batch, u, &state.velocity)?;
+        }
         if self.vorticity {
             self.confine_vorticity(gpu, cache, pool, state)?;
         }
@@ -708,17 +760,15 @@ impl SmokeSolver {
     }
 
     fn run(&self, ctx: &mut EvalCtx<'_>, state: &mut SolverState) -> Result<Vec<Value>, NodeError> {
-        let density_source = ctx.take_input(0)?;
-        let temperature_source = match ctx.take_input(1) {
-            Ok(value) => value,
-            Err(e) => {
-                ctx.release(density_source);
-                return Err(e);
-            }
-        };
-        let stepped = self.step(ctx, state, &density_source, &temperature_source);
-        ctx.release(density_source);
-        ctx.release(temperature_source);
+        let mut wanted = vec![0, 1];
+        if pair(ctx, 2, 3)? {
+            wanted.extend([2, 3]);
+        }
+        let inputs = take_listed(ctx, &wanted)?;
+        let stepped = self.step(ctx, state, &inputs);
+        for (_, value) in inputs {
+            ctx.release(value);
+        }
         stepped?;
 
         // The outputs are copies: the state stays in the store for the next
@@ -727,25 +777,41 @@ impl SmokeSolver {
         ctx.with_gpu_pool(|gpu, _, pool| copy_outputs(gpu, pool, state, wanted))
     }
 
-    fn step<'a>(
+    fn step(
         &self,
         ctx: &mut EvalCtx<'_>,
         state: &mut SolverState,
-        density_source: &'a Value,
-        temperature_source: &'a Value,
+        inputs: &[(u32, Value)],
     ) -> Result<(), NodeError> {
         let node = ctx.node_id();
-        let field = |value: &'a Value, index: u32| -> Result<&'a Field, NodeError> {
-            value.as_field().map_err(|_| NodeError::TypeMismatch {
-                node,
-                index,
-                expected: SocketType::Field,
-            })
+        let find = |index: u32| inputs.iter().find(|(i, _)| *i == index).map(|(_, v)| v);
+        let field = |index: u32| -> Result<&Field, NodeError> {
+            find(index)
+                .ok_or(NodeError::MissingInput { node, index })?
+                .as_field()
+                .map_err(|_| NodeError::TypeMismatch {
+                    node,
+                    index,
+                    expected: SocketType::Field,
+                })
         };
-        let sources = Sources {
-            density: field(density_source, 0)?,
-            temperature: field(temperature_source, 1)?,
+        let vector = |index: u32| -> Result<&StaggeredField, NodeError> {
+            find(index)
+                .ok_or(NodeError::MissingInput { node, index })?
+                .as_vector_field()
+                .map_err(|_| NodeError::TypeMismatch {
+                    node,
+                    index,
+                    expected: SocketType::VectorField,
+                })
         };
+        let mut sources = Sources::new(field(0)?, field(1)?);
+        if find(2).is_some() {
+            sources = sources.with_emission(Emission {
+                weight: field(2)?,
+                velocity: vector(3)?,
+            });
+        }
         // Spec §3: one measurement per frame, from the entering state, so
         // the count is deterministic however the frame is reached.
         let dt = ctx.time().dt;
@@ -776,7 +842,12 @@ impl Node for SmokeSolver {
 
     fn sockets(&self) -> SocketSpec {
         SocketSpec {
-            inputs: vec![SocketType::Field, SocketType::Field],
+            inputs: vec![
+                SocketType::Field,
+                SocketType::Field,
+                SocketType::Field,
+                SocketType::VectorField,
+            ],
             outputs: vec![
                 SocketType::Field,
                 SocketType::Field,

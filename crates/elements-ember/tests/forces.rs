@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use elements_core::gpu::{ComputeBatch, FieldDims, FieldPool, PipelineCache};
-use elements_ember::kernels::{StepConstants, Uniforms, buoyancy, emit};
+use elements_ember::kernels::{StepConstants, Uniforms, blend_velocity, buoyancy, emit, wind};
 
 const CELLS: FieldDims = FieldDims { x: 8, y: 6, z: 5 };
 
@@ -76,6 +76,93 @@ fn buoyancy_matches_the_cpu_reference_and_leaves_boundary_faces_alone() {
                     w_before[index(zd, i, j, k)].to_bits(),
                     "boundary face ({i}, {j}, {k}) must be untouched"
                 );
+            }
+        }
+    }
+}
+
+/// Spec §3.3: where the weight is w, still fluid approaches the target as
+/// 1 − exp(−w·t), independent of the substep. Wall faces are untouched.
+#[test]
+fn velocity_emission_approaches_the_target_exponentially() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let c = StepConstants::new(CELLS, 0.1, 0.125);
+    let zero: [Vec<f32>; 3] = std::array::from_fn(|a| vec![0.0; face_dims(CELLS, a).voxel_count()]);
+    let velocity = upload_staggered(&gpu, &mut pool, CELLS, &zero);
+    let weight = upload(&gpu, &mut pool, CELLS, &vec![2.0; CELLS.voxel_count()]);
+    let target_faces: [Vec<f32>; 3] = std::array::from_fn(|a| {
+        vec![if a == 0 { 1.0 } else { 0.0 }; face_dims(CELLS, a).voxel_count()]
+    });
+    let target = upload_staggered(&gpu, &mut pool, CELLS, &target_faces);
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    for _ in 0..3 {
+        let mut batch = ComputeBatch::new();
+        blend_velocity(
+            &gpu, &mut cache, &mut batch, &u, &velocity, &weight, &target,
+        )
+        .unwrap();
+        batch.submit(&gpu).unwrap();
+    }
+    let got = read_staggered(&gpu, &velocity);
+    let want = 1.0 - (-2.0f32 * 0.3).exp();
+    let d = face_dims(CELLS, 0);
+    for k in 0..d.z {
+        for j in 0..d.y {
+            for i in 0..d.x {
+                let v = got[0][index(d, i, j, k)];
+                if is_wall(CELLS, 0, i) {
+                    assert_eq!(v, 0.0, "wall x face {i}");
+                } else {
+                    assert!(
+                        (v - want).abs() <= 1e-5,
+                        "x face {:?}: {v} vs {want}",
+                        [i, j, k]
+                    );
+                }
+            }
+        }
+    }
+    assert!(got[1].iter().chain(&got[2]).all(|&v| v == 0.0));
+}
+
+/// Spec §3.4: wind is a uniform acceleration on every non-wall face.
+#[test]
+fn wind_accelerates_every_non_wall_face_uniformly() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let c = StepConstants {
+        wind: [0.5, 0.0, -1.0],
+        ..StepConstants::new(CELLS, 0.1, 0.125)
+    };
+    let zero: [Vec<f32>; 3] = std::array::from_fn(|a| vec![0.0; face_dims(CELLS, a).voxel_count()]);
+    let velocity = upload_staggered(&gpu, &mut pool, CELLS, &zero);
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    for _ in 0..4 {
+        let mut batch = ComputeBatch::new();
+        wind(&gpu, &mut cache, &mut batch, &u, &velocity).unwrap();
+        batch.submit(&gpu).unwrap();
+    }
+    let got = read_staggered(&gpu, &velocity);
+    for (a, rate) in [(0usize, 0.5f32), (1, 0.0), (2, -1.0)] {
+        let d = face_dims(CELLS, a);
+        for k in 0..d.z {
+            for j in 0..d.y {
+                for i in 0..d.x {
+                    let want = if is_wall(CELLS, a, [i, j, k][a]) {
+                        0.0
+                    } else {
+                        4.0 * 0.1 * rate
+                    };
+                    let v = got[a][index(d, i, j, k)];
+                    assert!(
+                        (v - want).abs() <= 1e-6,
+                        "face {a} {:?}: {v} vs {want}",
+                        [i, j, k]
+                    );
+                }
             }
         }
     }
