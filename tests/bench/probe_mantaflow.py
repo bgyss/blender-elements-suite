@@ -2,8 +2,8 @@
 """Bake a tiny gas domain headlessly and print what the cache contains.
 
 Run:
-  Blender --background --factory-startup --python tests/bench/probe_mantaflow.py \
-      -- OUT_DIR RES FRAMES [OPTION=VALUE ...]
+  Blender --background --factory-startup --python-exit-code 1 \
+      --python tests/bench/probe_mantaflow.py -- OUT_DIR RES FRAMES [OPTION=VALUE ...]
 
 Options, all optional, for the experiments in docs/bench/mantaflow-notes.md:
   flow=0|1          add the sphere flow object (default 1)
@@ -18,6 +18,8 @@ Options, all optional, for the experiments in docs/bench/mantaflow-notes.md:
   vorticity=V       the domain's vorticity
   wind=S            add a WIND force field of strength S blowing along +x
   closed=0|1        close all six domain walls (default: Blender's default)
+  bench=1           close the sides and floor and leave the top open, as Ember does
+  heat_fill=T       add a second flow filling the domain: temperature T, no density
   script=0|1        also export Blender's generated Mantaflow script
 """
 
@@ -68,6 +70,10 @@ def main() -> None:
     if opts.get("closed") == "1":
         for side in ("front", "back", "right", "left", "top", "bottom"):
             setattr(s, f"use_collision_border_{side}", True)
+    if opts.get("bench") == "1":
+        for side in ("front", "back", "right", "left", "bottom"):
+            setattr(s, f"use_collision_border_{side}", True)
+        s.use_collision_border_top = False
     if opts.get("script") == "1":
         s.export_manta_script = True
 
@@ -94,6 +100,17 @@ def main() -> None:
             f.velocity_normal = 0.0
             f.velocity_coord = floats(opts["init_vel"])
 
+    if "heat_fill" in opts:
+        bpy.ops.mesh.primitive_cube_add(size=2.0, location=(1.0, 1.0, 1.0))
+        heat = bpy.context.active_object.modifiers.new("Fluid", "FLUID")
+        heat.fluid_type = "FLOW"
+        h = heat.flow_settings
+        h.flow_type = "SMOKE"
+        h.flow_behavior = "INFLOW"
+        h.volume_density = 1.0
+        h.density = 0.0
+        h.temperature = float(opts["heat_fill"])
+
     if "wind" in opts:
         # A WIND field blows along its object's local +z; turn that onto +x.
         bpy.ops.object.effector_add(type="WIND", location=(1.0, 1.0, 1.0))
@@ -101,7 +118,13 @@ def main() -> None:
         wind.rotation_euler = (0.0, math.pi / 2, 0.0)
         wind.field.strength = float(opts["wind"])
         wind.field.flow = 0.0
-        wind.field.falloff_type = "NONE"
+        # Blender has no "none" falloff: a sphere falloff of power 0 is 1 everywhere
+        # (effect.cc, falloff_func), and BOTH keeps both sides of the plane.
+        wind.field.falloff_type = "SPHERE"
+        wind.field.falloff_power = 0.0
+        wind.field.use_min_distance = False
+        wind.field.use_max_distance = False
+        wind.field.z_direction = "BOTH"
         wind.field.shape = "PLANE"
 
     keys = ("alpha", "beta", "vorticity", "gravity", "time_scale", "cfl_condition")

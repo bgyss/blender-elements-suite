@@ -1,11 +1,9 @@
 # Mantaflow cache and parameter notes (2b-3 Task 3)
 
-**Status: incomplete, blocked.** `vdb-rs` 0.6 cannot read the velocity
-grid, which is one of the stop conditions in the 2b-3 plan. The finding and
-the options are in "Corrections to the spec" below. The sections below record
-everything found before stopping. Items marked *not yet confirmed by
-experiment* come from reading Blender's source and still need the experiment
-the plan asks for.
+This file records how Blender's Mantaflow cache is laid out, how to read it,
+and how Ember's scene parameters map onto Mantaflow's. Later 2b-3 tasks build
+on these facts: the scene script (Task 6), the cache reader (Task 7) and the
+results (Task 8).
 
 Machine: macOS on Apple Silicon, Blender 5.2.2 LTS (hash d13f752e3b9c, built
 2026-09-15). Date: 2026-09-23. The machine was under load from other
@@ -16,16 +14,17 @@ Sources were read, never copied. Paths are in github.com/blender/blender at
 
 - `intern/mantaflow/intern/MANTA_main.cpp`: which RNA values reach the script
 - `intern/mantaflow/intern/strings/smoke_script.h`, `fluid_script.h`: the generated solver script
-- `extern/mantaflow/preprocessed/plugin/extforces.cpp`: `addBuoyancy`, `vorticityConfinement`, `addForceField`
+- `extern/mantaflow/preprocessed/plugin/extforces.cpp`: `addBuoyancy`, `vorticityConfinement`, `addForceField`, `setInitialVelocity`
 - `extern/mantaflow/preprocessed/plugin/initplugins.cpp`: `applyEmission`
 - `extern/mantaflow/preprocessed/fileio/iovdb.cpp`: the VDB writer
 - `source/blender/blenkernel/intern/fluid.cc`: emission and force-field sampling
-- `source/blender/blenkernel/intern/effect.cc`: the wind field's force
+- `source/blender/blenkernel/intern/effect.cc`: the wind field's force and falloff
 
-The probe is `tests/bench/probe_mantaflow.py`. Setting the domain's
-`export_manta_script = True` also writes the generated solver script to
-`<cache>/script/smoke_script.py`. That is the fastest way to see what a setting
-turns into.
+The probe is `tests/bench/probe_mantaflow.py`. Its options are listed in its
+docstring. The experiments below give the options they used. Setting the
+domain's `export_manta_script = True` (probe option `script=1`) also writes the
+generated solver script to `<cache>/script/smoke_script.py`. That is the
+fastest way to see what a setting turns into.
 
 ## Headless baking
 
@@ -38,9 +37,14 @@ with bpy.context.temp_override(object=domain, active_object=domain):
     bpy.ops.fluid.bake_all()
 ```
 
+**Pass `--python-exit-code 1` before `--python`.** Without it, Blender exits 0
+even when the script raises, with the traceback only on stderr.
+
 Every property name the probe sets exists in 5.2.2, including
 `openvdb_data_depth` (`"32"`), `openvdb_cache_compress_type` (`"NONE"`),
 `timesteps_min` / `timesteps_max`, `use_collision_border_*` and `clipping`.
+One does not: a field's `falloff_type` has no `"NONE"` (its values are `CONE`,
+`SPHERE` and `TUBE`). See the wind row of the mapping.
 
 After a background bake, `domain_settings.domain_resolution` and `cell_size`
 read back as zeros. Do not use them; the resolution is `resolution_max` along
@@ -56,46 +60,86 @@ C/config/config_NNNN.uni       small solver state
 C/script/smoke_script.py       only with export_manta_script = True
 ```
 
-A 16³ frame is 967,548 bytes, a 256³ frame 3.5 to 5 MB in the first ten
-frames (it grows with the smoke).
+A 16³ frame is 967,548 bytes, and an 8³ frame 935,658: uncompressed OpenVDB
+internal nodes store full tile tables for every grid, so the size barely
+depends on resolution. A 256³ frame was 3.5 to 5 MB in the first ten frames,
+and it grows with the smoke.
 
 ## Grids
 
 Grids in `fluid_data_NNNN.vdb` for a `GAS` domain with one smoke flow, no
-noise, 32-bit, uncompressed. Read with `vdb-rs` 0.6 at 16³, frame 5:
+noise, 32-bit, uncompressed. Read at 16³, frame 5 (probe defaults):
 
-| Name | VDB type | Class | Reads as | Active voxels | Index bbox | Tiles |
+| Name | VDB type | Class | Reads as | Values | Index bbox | Stored as |
 |---|---|---|---|---|---|---|
-| `density` | `Tree_float_5_4_3` | fog volume | `f32`: yes | 292 | (3,3,1)–(12,12,7) | none |
-| `temperature` | `Tree_float_5_4_3` | fog volume | `f32`: yes | 284 | (3,3,1)–(12,12,7) | none |
-| `flame` | `Tree_float_5_4_3` | fog volume | `f32`: yes | 0 | empty | none |
-| `shadow` | `Tree_float_5_4_3` | fog volume | `f32`: yes | 8 tiles | (0,0,0)–(8,8,8) | 8 `Node3` tiles, all −1 |
-| `velocity` | `Tree_vec3s_5_4_3` | **staggered** | `[f32; 3]`: **no**, 0 of 292 voxels | 292 (metadata) | (3,3,1)–(12,12,7) (metadata) | — |
+| `density` | `Tree_float_5_4_3` | fog volume | `f32` | 292 | (3,3,1)–(12,12,7) | voxels |
+| `temperature` | `Tree_float_5_4_3` | fog volume | `f32` | 284 | (3,3,1)–(12,12,7) | voxels |
+| `velocity` | `Tree_vec3s_5_4_3` | **staggered** | `[f32; 3]` | 292 | (3,3,1)–(12,12,7) | voxels |
+| `flame` | `Tree_float_5_4_3` | fog volume | `f32` | 0 | empty | — |
+| `shadow` | `Tree_float_5_4_3` | fog volume | `f32` | 8 | (0,0,0)–(15,15,15) | `Node3` tiles, all −1 |
 
 Every grid carries `file_base_resolution` (16,16,16) and `file_voxel_size`
 (0.125) metadata, and `is_saved_as_half_float = false`.
 
-**Grids are clipped to the smoke.** The data file is written with
-`clip = domain.clipping` (default 1e-6) and `clipGrid = density`
-(`smoke_script.h`, `smoke_save_data`; `iovdb.cpp`, `exportVDB`).
-Density and temperature store only voxels above the clip value, and
-`velocity` (a sparse grid) is then clipped to density's active voxels. So the
-cache holds **velocity only where there is smoke**; every other cell reads as
-the background, zero. That is why `velocity` has exactly density's 292 voxels.
+### Reading with vdb-rs
 
-**`vdb-rs` 0.6 cannot read the velocity grid.** It returns an empty tree, no
-error. Its `read_tree_topology` reads the root node's background value as 4
-bytes (`read_u32`) and each root tile's value as 4 bytes, whatever the grid's
-value type. For a `Vec3s` grid those are 12 bytes, so the root-node counts
-that follow are read from the background vector's y and z (both 0.0), and the
-tree has no nodes. A copy of `vdb-rs` in the scratchpad with those two reads
-changed to read `size_of::<ValueTy>()` bytes reads all 292 velocity voxels of
-the same file. `vdb-rs` also does no type check: reading `density` as
-`[f32; 3]` returns 0 voxels without an error, and reading `temperature` as
-`[f32; 3]` gives `IoError`. A reader must check `descriptor.grid_type`
-itself.
+**The workspace uses a patched `vdb-rs` 0.6.0** in `vendor/vdb-rs/`, through
+`[patch.crates-io]` in the root `Cargo.toml`. `vendor/vdb-rs/PATCHED.md` has
+the details. Upstream 0.6.0 reads the root node's background value and each
+root tile's value as 4 bytes, whatever the grid's value type. For a `Vec3s`
+grid those values are 12 bytes, so upstream parses Mantaflow's velocity as an
+empty tree (0 values, no error). **With the patch, velocity reads fully: all
+292 values of the 16³ frame above**, matching its `file_voxel_count`
+metadata. The committed fixture also reads fully: 240 of 240
+(`crates/elements-ember/tests/fixtures/mantaflow_16/README.md`). The float
+grids read the same with and without the patch. The existing `elements-io`
+VDB tests (vdb-rs as the oracle) pass on the patched crate.
 
-## Velocity location
+**`vdb-rs` does not check value types.** Reading `density` as `[f32; 3]`
+returns 0 values without an error, and reading `temperature` as `[f32; 3]`
+gives `IoError`. The Task 7 reader must check `descriptor.grid_type`
+(`Tree_float_5_4_3` for scalars, `Tree_vec3s_5_4_3` for velocity) before
+reading, and must expand tiles (`VdbLevel::Node3` is 8³ voxels, `Node4` is
+128³).
+
+### Clipping: what the cache leaves out
+
+The data file is written with `clip = domain.clipping` (default 1e-6) and
+`clipGrid = density` (`smoke_script.h`, `smoke_save_data`; `iovdb.cpp`,
+`exportVDB`). Density and temperature store only values above the clip value,
+and the sparse grids, `velocity` included, are then clipped to density's
+active voxels. So **the cache holds velocity only where there is smoke**.
+Every other cell reads as zero.
+
+**Clipping test.** Two bakes of the same 32³ scene (probe defaults plus
+`volume=1`, 20 frames) differed only in `clipping`: 1e-6 and 0.
+
+- Density is the same simulation. In every frame, each voxel the 1e-6 bake
+  stores has the identical value in the 0 bake (maximum difference 0.0).
+  Velocity is identical on those voxels too. Total density differs by at most
+  2.7e-7 relative, which is the mass in the extra voxels below 1e-6. The
+  clip affects only the output.
+- Velocity does **not** become dense with `clipping = 0`. It is still clipped
+  to voxels with non-zero density: at frame 20, 22,278 of 32,768 cells
+  (against 4,353 at 1e-6).
+
+**Decision: keep the default `clipping` (1e-6), and compute the velocity
+metrics for both solvers over the mask density > 1e-6.** That mask is exactly
+the set of voxels the cache stores velocity for, and the same mask is applied
+to Ember's fields.
+
+**Tiles can drop values from the other grids.** In a domain-filling test
+(32³, `fill=1 volume=1 alpha=0 beta=0.5`, frame 3), density was constant over whole 8³ blocks and was
+stored as `Node3` tiles. Temperature then lost those blocks (22,904 of 27,000
+values stored, and the rest read as 0), but velocity kept all 27,000.
+OpenVDB's `clip` against a tiled mask evidently keeps only voxel-level
+values, so a grid that is itself tiled there loses them. The bench scenes do
+not make whole 8³ blocks of exactly equal density outside the emitter, but at
+256³ the emitter's interior might. The Task 7 reader should compare each
+grid's value count with density's and report a shortfall, not silently use
+zeros.
+
+## Velocity location and units
 
 **Faces.** Three pieces of evidence:
 
@@ -109,17 +153,28 @@ itself.
   `factor(i,j,k)` and `factor(i,j,k−1)` for the z component). That is
   Ember's face convention.
 
-The initial-velocity experiment in the plan could not separate the two cases:
-velocity is clipped to density's voxels, so the stored extent is density's
-extent in both cases (32³, `init_vel=1,0,0`, frame 1: velocity and density
-both span index (12,12,1)–(19,19,8)).
+The brief's extent experiment cannot separate faces from centres. Velocity is
+clipped to density's voxels, so the stored extent is always density's (32³,
+`init_vel=1,0,0`, frame 1: both span (12,12,1)–(19,19,8)).
 
-Units of the stored velocity: Mantaflow's own, cells per Mantaflow time unit,
-from the scale factors in the generated script. At 25 fps one frame is 0.1
-Mantaflow time units, so 1 s = 2.5 units and u[m/s] = u_stored · dx / 0.4.
-*Not yet confirmed by experiment*: the one attempt (a domain-filling
-`GEOMETRY` flow with initial velocity 1 m/s along x) gave a non-uniform
-x velocity of 0.02–0.08, and the stop came before it was understood.
+**Units: u[m/s] = u_stored · dx / 0.4**, that is 2.5 · dx · u_stored. By the
+generated script's scale factors, a Mantaflow time unit is 0.4 s at any fps,
+and velocity is in cells per time unit. `fluid.cc` scales a flow's initial
+velocity by `n / L · 1 / (25 · 0.1)` into those units.
+
+Confirmed by experiment (64³, `behavior=GEOMETRY volume=1 alpha=0 beta=0.5
+heat_fill=1`): a smoke blob inside a domain of uniform heat rises under a
+nearly uniform velocity. Its density centroid's speed from frame f to f+1 is
+compared with the density-weighted cell-centred vertical velocity at frame f,
+converted by the rule above. Density is advected with the velocity that the
+previous frame saved. The ratio rises from 0.83 while the blob still sits
+near the floor to **0.988, 1.001 and 0.991 over frames 7→8, 8→9 and
+9→10**, once the velocity over the blob is uniform. Mass is conserved to 0.3% over the run.
+
+(The earlier puzzling attempt, a domain-filling flow with an initial velocity,
+is explained by `setInitialVelocity` in `extforces.cpp`. It only raises face
+velocities towards the target, and the pressure solve then removes most of
+it. That makes it a poor units test.)
 
 ## Index space
 
@@ -134,8 +189,6 @@ x velocity of 0.02–0.08, and the stop came before it was understood.
   translation**, so the file's world coordinates put voxel centres at i·dx,
   half a cell off the domain. Readers should use index space, not the VDB
   transform.
-- Grids are sparse: anything absent reads as zero, and `shadow` shows constant
-  regions are stored as `Node3` tiles (8³ voxels), which a reader must expand.
 
 ## Timing
 
@@ -148,43 +201,120 @@ frameLength`, so there is one solver step per frame.
 
 ## Parameter mapping
 
-Unit conversions used below, all from the generated script: with domain size
-L (the longest side) and resolution n, one Mantaflow time unit is 0.4 s
-whatever the fps (`frameLengthRaw = 0.1 · 25`), a frame is 2.5 / fps units
-long, and gravity is converted to cells per unit² by
-`scaleAcceleration = (n / L) · 0.4²`.
+**Final signatures** of `tests/bench/mapping.py`, for Task 6:
+
+```python
+def buoyancy(ember_density: float, ember_temperature: float, domain_size: float, gravity: float) -> tuple[float, float]
+    # (alpha, beta); domain_size = the longest side in m, gravity = |g| in m/s² (Blender default 9.81)
+def inflow(density_rate: float, temperature_rate: float, fps: float) -> tuple[float, float]
+    # the flow's (density, temperature); raises ValueError if density leaves [0, 1]
+def vorticity(ember_confinement: float, fps: float) -> float
+def wind(ember_accel: tuple[float, float, float], fps: float) -> tuple[float, tuple[float, float, float]]
+    # (strength, unit direction); (0.0, (0, 0, 1)) for no wind
+def rotation_to(direction: tuple[float, float, float]) -> tuple[float, float, float, float]
+    # (w, x, y, z) turning the field's local +z onto direction
+```
+
+The brief's signatures lacked the domain size and gravity (`buoyancy`) and
+the fps (`inflow` has it; `vorticity` had dx instead, which cancels; `wind`
+had none). `vorticity` and `wind` assume one solver step per frame, as every
+bench scene uses.
+
+Unit conversions used below, from the generated script: with domain size
+L (the longest side) and resolution n, a Mantaflow time unit is 0.4 s at any
+fps (`frameLengthRaw = 0.1 · 25`), a frame is 2.5 / fps units long, and
+gravity is converted to cells per unit² by `scaleAcceleration = (n / L) · 0.4²`.
 
 | Quantity | Ember | Mantaflow | Conversion | Source | Confirmed |
 |---|---|---|---|---|---|
-| Buoyancy, heat | `buoyancy_temperature` β, upward accel. β·T | domain `beta` | `beta = β · L / abs(g)` | `smoke_script.h` divides `beta` by L; `addBuoyancy` adds −g·dt·coef, g in scene units | no |
-| Buoyancy, density | `buoyancy_density` α, downward accel. α·ρ | domain `alpha`, **upward** for positive values | `alpha = −α · L / abs(g)` | as above | no |
-| Gravity | none (buoyancy is its own term) | scene gravity × effector weights' `global_gravity` | keep defaults: (0, 0, −9.81), weight 1 | `fluid.cc` `update_final_gravity` | — |
-| Vorticity | `vorticity` ε, 1/s; Δu = h·ε·dx·(N×ω) | domain `vorticity`; Δu = v·(dt / frame)·(N×ω) in cells | `vorticity = ε / fps` (dx cancels) | `extforces.cpp` `KnConfForce`; `smoke_script.h` | no; bench ε = 0, so 0 |
-| Wind | uniform acceleration a, m/s², every cell | `WIND` field strength S, falloff `NONE`, `flow = 0` | with one step per frame, `S = a / (0.2 · fps²)`; 0.5 m/s² at 24 fps gives S ≈ 0.00434 | `fluid.cc` `update_effectors_task_cb` (×0.2, clamp ±1), then `scaleSpeedFrames`; `addForceField` adds it each step with no dt | no |
-| Wind direction | the acceleration vector | the field object's local +z | rotate +z onto the direction | `effect.cc`, `PFIELD_WIND` uses `efd->nor` | no |
-| Inflow | adds `density_rate · occupancy · h` each substep | `INFLOW` sets the cell to `density · emission` each step (absolute mode) or adds and clamps to [0, 1] (the default); temperature is raised to the flow's `temperature` | not chosen yet; the plan asks to match Ember's density at the emitter centre at frame 24 | `fluid.cc` `apply_inflow_fields`; `initplugins.cpp` `applyEmission` | no |
-| Emitter volume | a filled sphere (occupancy with a one-cell edge) | a mesh flow emits a **shell** by default: `volume_density = 0`, `surface_distance = 1.5` | set `volume_density = 1` | `fluid.cc`; the 32³ bake showed a hollow emitter | observed |
+| Buoyancy, heat | `buoyancy_temperature` β: upward accel. β·T | domain `beta` | `beta = β · L / |g|` | `smoke_script.h` divides `beta` by L; `addBuoyancy` adds −g·dt·coef | yes, below |
+| Buoyancy, density | `buoyancy_density` α: downward accel. α·ρ | domain `alpha`; positive lifts density | `alpha = −α · L / |g|` | as above | yes: sign and size, below |
+| Gravity | none (buoyancy is its own term) | scene gravity × `effector_weights.global_gravity` | keep the defaults, (0, 0, −9.81) and 1, and pass 9.81 | `fluid.cc` `update_final_gravity` | — |
+| Vorticity | `vorticity` ε, 1/s: Δu = h·ε·dx·(N×ω) | domain `vorticity`: Δu = v·(dt / frame)·(N×ω), grid units | `vorticity = ε / fps` (dx cancels) | `extforces.cpp` `KnConfForce`; `smoke_script.h` | no: bench ε = 0, so 0 |
+| Wind | uniform acceleration a, m/s², every cell | `WIND` field, strength S | `S = |a| / (0.2 · fps)`: 0.5 m/s² at 24 fps gives 0.1042 | `fluid.cc` `update_effectors_task_cb` (× 0.2, clamp ±1); `effect.cc` `do_physical_effector` (÷ fps, `vel_to_sec`); then `scaleSpeedFrames` and `addForceField` | yes, below |
+| Wind falloff | none | `falloff_type = "SPHERE"`, `falloff_power = 0`, `use_min_distance = use_max_distance = False`, `z_direction = "BOTH"`, `flow = 0` | power 0 makes the falloff 1 everywhere; `flow` (default 1 for WIND) would add drag towards the smoke's own velocity | `effect.cc` `effector_falloff`, `falloff_func` | yes (used in the check) |
+| Wind direction | the acceleration vector | the field object's local +z | object rotation `rotation_to(direction)` (quaternion) | `effect.cc`, `PFIELD_WIND` uses `efd->nor` | yes for +x |
+| Inflow | adds `rate · occupancy · h` each substep | `INFLOW` holds `min(density, 1)` and raises heat to `temperature` in the emitter every step | `density = rate · 24 / fps`, `temperature = rate · 24 / fps`: Ember's emitter-centre value at frame 24 | `fluid.cc` `apply_inflow_fields`; `initplugins.cpp` `applyEmission`; Ember measured below | yes, below |
+| Emitter volume | a filled sphere | a mesh flow emits a **shell** by default (`volume_density = 0`) | set `volume_density = 1` | `fluid.cc` `sample_mesh`; a 32³ bake showed a hollow emitter | observed |
+| Emitter activity | `active_frames` [1, 60] | no equivalent setting | keyframe the flow's emission off after frame 60 (spec §5) | — | not tested here |
 | Substeps | `max_substeps` (preview: 1) | `timesteps_min = timesteps_max` | equal | generated script | yes (script) |
-| Boundaries | closed sides and floor, open top | all six sides **open** by default (`xXyYzZ`) | `use_collision_border_{front,back,left,right,bottom} = True`, top `False` | generated script: `boundConditions = 'xXyYzZ'` | yes (script) |
+| Boundaries | closed sides and floor, open top | all six sides **open** by default (`xXyYzZ`) | `use_collision_border_{front,back,left,right,bottom} = True`, `top = False` (probe `bench=1`) | generated script: `boundConditions` | yes (script) |
 | Advection | MacCormack | `advectSemiLagrange(order=2)`, Mantaflow's MacCormack | none needed | generated script | yes (script) |
 | Pressure | 160 red-black Gauss–Seidel iterations | multigrid-preconditioned CG to a tolerance | none possible; the table must say so | generated script | — |
 
-Notes on the table:
+### Experiments behind the table
+
+All baked with the probe. Velocities are converted with the units rule above.
+
+- **Heat buoyancy.** A domain filled with heat 1 (`fill=1 volume=1 alpha=0
+  beta=0.5`), all sides open. The source predicts Δw per frame of
+  |g| · (beta / L) / fps = 0.1022 m/s, which is 1.308 in grid units at 64³.
+  Measured at the domain centre: 1.278, 1.277 and 1.272 per frame at 64³ (97.7%),
+  and 0.624 per frame at 32³ against 0.654 (95.4%). The shortfall halves when
+  the resolution doubles, so it comes from the boundary cell layer, not the
+  formula.
+- **Density buoyancy.** The same with density 1, no heat (`fill=1 volume=1
+  temperature=0 alpha=0.5 beta=0`) at 32³: w = +0.6237, then +1.2466, which is
+  **upward** and identical to the heat case. So `alpha` lifts density, and
+  Ember's `buoyancy_density` α maps to `alpha = −α · L / |g|`.
+- **Inflow.** Ember's bench `plume` at 64³ (`Scene::plume`, read back): the
+  density at the emitter centre (mean of the 2×2 cells about x = y = 1 m in the
+  layer at z = 0.3 m) is 0.25, 0.50 and **0.99** at frames 6, 12 and **24**,
+  so rate · t while the plume is still. Mantaflow with `inflow(1, 1, 24)`
+  = (1, 1) (`bench=1 volume=1 density=1 temperature=1 alpha=0
+  beta=0.2039`) holds density **1.000** and temperature **1.000** at the same
+  cells in every checked frame (12–60). The two differ by design before frame
+  24: Mantaflow's emitter is full from frame 1 and Ember's fills over a second.
+  As a result, Mantaflow's plume holds more mass (0.174 against Ember's
+  0.0855 density·m³ at frame 60) and rises a little faster (centroid height
+  0.87 m against 0.78 m at frame 60). The comparison is on shape-level
+  metrics, and the summary must say that the emitters are not equivalent.
+- **Wind strength.** A domain filled with smoke (`fill=1 volume=1 alpha=0
+  beta=0`), all sides open, at 32³, with `wind = S` along +x. With
+  S = 0.1042 (0.5 m/s² at 24 fps), the centre's u rose 0.0201, 0.0402 and
+  0.0599 m/s by frames 2, 3 and 4, against 0.0208 per frame (96.5%, the
+  same boundary shortfall as buoyancy). The first frame gets no force, because
+  the effectors are sampled before that frame's emission, when the domain
+  holds no smoke yet. The brief's first guess, S = a / (0.2 · fps²), missed
+  the ÷ fps in `do_physical_effector` and was 24× too weak.
+- **Wind check with an emitter** (replaces the brief's no-emitter check).
+  The bench `plume_wind` at 64³ in both solvers (Mantaflow `bench=1 volume=1
+  density=1 temperature=1 alpha=0 beta=0.2039 wind=0.1042`). The horizontal
+  drift is the density centroid's x minus the no-wind plume's:
+
+  | Frame | Ember drift (m) | Mantaflow drift (m) |
+  |---|---|---|
+  | 12 | +0.005 | +0.015 |
+  | 24 | +0.022 | +0.068 |
+  | 36 | +0.061 | +0.155 |
+  | 48 | +0.165 | +0.259 |
+  | 60 | +0.368 | +0.377 |
+
+  The sign is right (+x) and the size agrees by frame 60. Mantaflow drifts
+  earlier because its emitter is full from frame 1 (see Inflow).
+
+### Force fields act only on smoke
+
+Mantaflow applies a force field only in cells that hold smoke:
+`update_effectors_task_cb` in `source/blender/blenkernel/intern/fluid.cc`
+skips every cell whose density (or fuel, when fire is active) is below
+`FLT_EPSILON`, and cells inside obstacles. Ember's wind accelerates every
+cell. **`plume_wind` is kept as it is.** Its results must say that
+Mantaflow's wind pushes only the smoke, while Ember's pushes all the air, so
+the drift compares shape, not a matched force field. The wind force is also
+added once per solver step with no dt, so the mapping holds only for one step
+per frame, which every bench scene uses.
+
+### Other solver notes
 
 - **Buoyancy in Mantaflow is a true acceleration.** `addBuoyancy` multiplies by
   the solver's dt, and with the generated `scale=False` it does not divide by
-  dx. Its SI acceleration per unit density or temperature is abs(g) · coef,
-  where the script's coef is `alpha / L` or `beta / L`. The face value uses the
-  mean of the two cells either side, as Ember's does.
+  dx. The face value uses the mean of the two cells either side, as Ember's
+  does.
 - **The domain's fire fields are on.** The generated script had
   `using_fire = True` for a smoke-only flow. The fuel grid is zero, so burning
-  does nothing, and the flame vorticity term `vorticityConfinement` adds
+  does nothing, and the flame-vorticity term that `vorticityConfinement` adds
   (`strengthCell = fuel · flame_vorticity`) is zero.
-- **Force fields act only where there is smoke.** `update_effectors_task_cb`
-  skips every cell whose density (or fuel) is below `FLT_EPSILON`, so
-  Mantaflow's wind never touches clear air, while Ember's acts on every cell.
-- **Wind has no dt.** The force is added once per solver step. With more than
-  one step per frame it would be applied that many times. The bench uses one.
 
 ## 256³ run time
 
@@ -199,41 +329,33 @@ per-frame time from data-file modification times, frames 2–10:
 
 Extrapolated full benchmark (3 scenes × 120 frames; 1 run at 256³, 3 runs at
 64³ and 128³): 256³ 1,480 s, 128³ 585 s, 64³ 114 s, about **36 minutes**,
-plus about a second of Blender start-up per bake. This is an **upper bound
-for an idle machine** (the load average was 11–28) but only an estimate for
-frames past 10: the smoke, and with it the sparse files, keeps growing. It is
-under the 90-minute stop line.
+plus about a second of Blender start-up per bake. The machine was loaded (load
+average 11–28), so on an idle machine these early frames would run faster.
+Frames past 10 are only estimated, because the smoke, and with it the sparse
+files, keeps growing. The estimate is under the 90-minute stop line.
 
 ## Corrections to the spec
 
-1. **`vdb-rs` 0.6 cannot read Mantaflow's velocity grid** (spec §8 risk (a),
-   the plan's stop condition). The float grids read correctly. The cause is
-   two 4-byte reads in `vdb-rs`'s root-node parser that should be value-sized;
-   fixing them makes the grid readable. Options for the user: patch `vdb-rs`
-   (upstream or a `[patch]` fork; it is MIT/Apache), write the reader's own
-   root-node parse in `elements-ember` or `elements-io`, or take the spec's
-   `.npy` fallback through Blender's OpenVDB module.
-2. **The cache holds velocity only where there is smoke.** Every sparse grid
-   is clipped to density's active voxels at `clipping` (1e-6). Kinetic energy,
-   vorticity and divergence from the cache would cover only smoky cells, and
-   the top-boundary outflow only faces with smoke below them (for outflow that
-   is harmless, since ρ = 0 elsewhere). Setting `clipping = 0` still drops
-   cells whose density is exactly 0.
-3. **Mantaflow's wind acts only on smoky cells**, so the `plume_wind` scenes
-   differ in more than parameters, and the plan's wind check (a closed 32³
-   domain with no emitter) cannot work: with no smoke no force is applied,
-   and in a closed box a uniform force is removed by projection anyway. A
-   check needs smoke everywhere and open sides.
-4. **The fixture cannot be under 200 KB.** An uncompressed 16³ frame is
-   967,548 bytes: uncompressed VDB internal nodes store their full tile tables
-   (32³ values at the top level) for every grid.
-5. **`mapping.py` signatures need more inputs.** `buoyancy` needs the domain
-   size and gravity; `vorticity` needs the fps, not dx; `wind` needs the fps.
-6. **Blender's default borders are all open** and a mesh flow emits a shell by
-   default. Both are settings the scene script must change, not fairness
-   rules the spec already lists.
-7. **The brief's `vdb_probe.rs`** formats `VdbLevel` with `{:?}`, which does
+1. **`vdb-rs` 0.6.0 cannot read Mantaflow's velocity grid** (spec §8 risk
+   (a)). Resolved: the workspace vendors a patched copy (`vendor/vdb-rs/`).
+   The Task 7 reader must add the grid-type check that `vdb-rs` lacks.
+2. **The cache holds velocity only where there is smoke** (density above
+   `clipping`), and `clipping = 0` does not change that. Resolved: the §4.1
+   velocity metrics use the mask density > 1e-6 for both solvers, and
+   `results.md` must say so.
+3. **Mantaflow's wind acts only on smoky cells.** `plume_wind` is kept and
+   documented as above. The brief's no-emitter wind check cannot work, and an
+   emitter check replaces it.
+4. **The fixture cannot be under 200 KB.** An uncompressed frame is about
+   1 MB at any small resolution. The committed 16³ frame is 967,548 bytes.
+5. **`mapping.py` signatures** take the domain size, gravity and fps. See the
+   final signatures above.
+6. **Blender's defaults differ from the bench's.** All borders are open, and a
+   mesh flow emits a shell. The scene script must set both, and must also run
+   Blender with `--python-exit-code 1`.
+7. **The inflow mapping is not an equivalence.** Mantaflow's emitter holds its
+   value from frame 1, and Ember's fills over the first second. See Inflow.
+8. **Tiled density can drop other grids' values** (see Clipping). The reader
+   must report it rather than use zeros.
+9. **The brief's `vdb_probe.rs`** formats `VdbLevel` with `{:?}`, which does
    not compile: `VdbLevel` has no `Debug`.
-
-Not done because of the stop: the buoyancy, inflow and wind experiments,
-`tests/bench/mapping.py`, and the fixture.
