@@ -305,3 +305,103 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
         "every allocated texture must be back in the pool"
     );
 }
+
+/// Which field one probe graph reads out.
+#[derive(Clone, Copy)]
+enum Probe {
+    /// An emitter output, straight into `core.output`.
+    Source(u32),
+    /// A solver output after one frame, fed by the emitter.
+    Solver(u32),
+}
+
+/// Total of the probed field over the domain, after frame 1.
+fn total(probe: Probe) -> f64 {
+    let registry = elements_ember::registry();
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(
+        registry
+            .build(
+                "ember.sphere_emitter",
+                &serde_json::json!({ "center": [1.0, 1.0, 1.0], "radius": 0.5,
+                                     "density_rate": 2.0, "temperature_rate": 5.0 }),
+            )
+            .unwrap(),
+    );
+    let output = graph.add_node(
+        registry
+            .build("core.output", &serde_json::json!({}))
+            .unwrap(),
+    );
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    match probe {
+        Probe::Source(index) => graph
+            .connect(socket(emitter, index), socket(output, 0))
+            .unwrap(),
+        Probe::Solver(index) => {
+            // No buoyancy, so nothing moves and advection returns its input exactly.
+            let solver = graph.add_node(
+                registry
+                    .build(
+                        KIND,
+                        &serde_json::json!({ "buoyancy_density": 0.0,
+                                                      "buoyancy_temperature": 0.0 }),
+                    )
+                    .unwrap(),
+            );
+            graph
+                .connect(socket(emitter, 0), socket(solver, 0))
+                .unwrap();
+            graph
+                .connect(socket(emitter, 1), socket(solver, 1))
+                .unwrap();
+            graph
+                .connect(socket(solver, index), socket(output, 0))
+                .unwrap();
+        }
+    }
+    graph.set_output(output);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut timeline = timeline(0);
+    let frame = timeline
+        .goto(
+            &graph,
+            &gpu,
+            &mut pool,
+            &mut pipelines,
+            FieldDims::new(16, 16, 16),
+            1,
+        )
+        .unwrap();
+    let sum = frame
+        .value
+        .as_field()
+        .unwrap()
+        .read_back(&gpu)
+        .unwrap()
+        .iter()
+        .map(|&v| v as f64)
+        .sum();
+    frame.value.release_to(&mut pool);
+    sum
+}
+
+/// One frame adds exactly rate × dt of each quantity, into the right output.
+/// Density and temperature are emitted at different rates, so swapping them
+/// at the solver's inputs or outputs changes both totals by a factor of 2.5.
+#[test]
+fn one_frame_adds_each_emitted_quantity_to_its_own_output() {
+    let dt = 1.0 / 24.0;
+    for (index, what) in [(0, "density"), (1, "temperature")] {
+        let want = total(Probe::Source(index)) * dt;
+        let got = total(Probe::Solver(index));
+        assert!(want > 0.0, "{what}: the emitter must emit");
+        assert!(
+            ((got - want) / want).abs() <= 1e-5,
+            "{what}: solver holds {got}, emitted {want}"
+        );
+    }
+}
