@@ -1,7 +1,8 @@
 # Ember Piece 2b-3 — Mantaflow Benchmark Design
 
 **Date:** 2026-09-23
-**Status:** Design approved; plan not yet written.
+**Status:** In progress. §4, §5, §6.2 and §8 revised on 2026-09-23 after
+Task 3's findings (`docs/bench/mantaflow-notes.md`) and the user's decisions.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2), whose §5 is the
 benchmark design this cycle builds. Follows 2b-2
 (`2026-09-23-ember-scene-content-2b2-design.md`), which added the
@@ -41,7 +42,9 @@ solvers' fields. User decisions, 2026-09-23:
    record the result in `docs/bench/presets.md`. If a 128³ preview frame no
    longer fits 100 ms, stop and bring the numbers to the user before any
    benchmark work: the benchmark would otherwise measure a preset that is about
-   to change.
+   to change. *The machine was never idle when this ran (load 6–19), so by the
+   user's decision on 2026-09-23 the rerun moves to just before the full
+   benchmark run, where the same stop rule applies.*
 2. **Verify the Mantaflow unknowns** (piece 2 §5.2). Bake a small gas domain
    headlessly in the local Blender (5.2.2 LTS) and record in
    `docs/bench/mantaflow-notes.md`:
@@ -106,20 +109,26 @@ metres, m/s, and density × m³ for mass. They live in
 
 ### 4.1 Velocity
 
-- **Divergence.** If Mantaflow's cache stores face velocities, both solvers
-  use the existing face stencil (`metrics::divergence`), which is the quantity
-  each projection minimises. If it stores cell-centred velocity, both solvers'
-  velocities are resampled to cell centres and divergence uses central
-  differences, as §5.4 of the piece 2 spec says. The table names the rule
-  that applied.
+*Revised after Task 3.* Mantaflow's cache stores velocity on faces, with the
+same convention as Ember (x of cell (i, j, k) on the face between cells i − 1
+and i). But it stores velocity **only where there is smoke** (density above
+the domain's `clipping`, 1e-6), and setting `clipping` to 0 does not change
+that. User decision, 2026-09-23: every velocity metric is computed for both
+solvers over the same smoke mask.
+
+- **Measured cells.** A cell is measured when the cell and all 26 of its
+  neighbours lie inside the domain, none is a collider cell, and all have
+  density above 1e-6. The neighbourhood condition keeps every face and every
+  central difference inside the region where Mantaflow's cache has data.
+  The same rule applies to both solvers.
+- **Divergence:** the face stencil (`metrics::divergence`'s), which is the
+  quantity each projection minimises, over measured cells.
 - **Resampling to cell centres:** the mean of a cell's two faces along each
-  axis. Kinetic energy and vorticity always use cell-centred velocity, for
-  both solvers.
-- **Kinetic energy:** ½ Σ|u|² dV.
-- **Total vorticity magnitude:** Σ|∇×u| dV, with central differences.
-- **Interior only.** Kinetic energy and vorticity skip cells within one voxel
-  of the domain boundary or of a collider cell, so boundary treatment does
-  not dominate the sums. Divergence skips collider cells only.
+  axis. Kinetic energy and vorticity use cell-centred velocity.
+- **Kinetic energy:** ½ Σ|u|² dV over measured cells.
+- **Total vorticity magnitude:** Σ|∇×u| dV over measured cells, with central
+  differences of the cell-centred velocity.
+- The table says that velocity metrics cover only the smoke.
 
 ### 4.2 Density and height
 
@@ -134,10 +143,11 @@ The domain top is open in both solvers (Ember's default boundaries: closed
 sides and floor, open top), so density leaves the domain during frames
 61–120.
 
-- **Outflow per frame:** Σ over top-boundary faces of ρ · w · dA, where ρ is
-  the density of the cell below the face and w the vertical velocity at the
-  face (from cell centres when that is all the cache has), counting only
-  upward flow.
+- **Outflow per frame:** Σ over the z-faces one cell below the top, index
+  nz − 1 (between cells nz − 2 and nz − 1), of ρ · max(w, 0) · dA, where ρ is
+  the density of cell nz − 2 and w the face velocity. The top face itself is
+  not used, because Mantaflow's cache does not store it; the cell layer above
+  the measuring plane is one voxel thick.
 - **Cumulative outflow:** those per-frame fluxes integrated over frame time
   with the trapezoid rule. This is an estimate at frame resolution, not
   substep resolution, and the table says so.
@@ -178,24 +188,44 @@ the JSON path, an output directory and a resolution. Run with
 
 - builds a `GAS` domain under the fairness rules of piece 2 §5.3: no noise,
   no adaptive domain, fixed timesteps equal to Ember's substep count, and an
-  `OPENVDB` cache with `NONE` compression;
+  `OPENVDB` cache with `NONE` compression and 32-bit values;
 - sets the domain walls to match Ember's boundaries: closed sides and floor,
-  open top;
-- adds a sphere mesh as the flow object, with its emission keyframed off
-  after the last active frame;
+  open top (Blender's default is all six open);
+- adds a sphere mesh as the flow object, emitting through its volume, with
+  its emission keyframed off after the last active frame;
 - adds an effector for the collider, and a wind force field for
   `plume_wind`;
 - bakes with `bake_all` and writes `timings.json`, one entry per frame.
 
-Every parameter mapping found in task 2 is written as a table in
-`docs/bench/mantaflow-notes.md` and as a comment beside the code that applies
-it. Where a quantity has no exact equivalent (for example Mantaflow's inflow
-sets density to a value, while Ember's emitter adds a rate), the notes say
-what was chosen and why. Scenes are compared only on §4's metrics, never
-voxel by voxel.
+Blender runs with `--python-exit-code 1`; without it a failing script still
+exits 0.
+
+Every parameter mapping is in `tests/bench/mapping.py` and in the table in
+`docs/bench/mantaflow-notes.md`, with its source and the experiment that
+confirmed it. The ones that are not exact, found in Task 3:
+
+- **Inflow** is additive (`use_absolute = False`, `surface_distance = 0`,
+  density = rate / fps). Mass matches Ember's within 3% over frames 12–60.
+- **Temperature** cannot be additive: Mantaflow raises the emitter's heat to
+  a set value, never above it, while Ember's grows at its rate. The mapping
+  holds it at Ember's frame-24 emitter value, so plume heights differ (at
+  64³, a centroid of 0.925 m against 0.781 m at frame 60). Task 6 may try a
+  flow temperature keyframed to rise as Ember's does, and keeps it only if it
+  brings the heights closer without changing mass.
+- **Wind** acts only on cells holding smoke in Mantaflow
+  (`update_effectors_task_cb` in Blender's `fluid.cc`), but on every cell in
+  Ember. User decision, 2026-09-23: `plume_wind` is kept, and the results say
+  so.
+- **The pressure solve** differs: Mantaflow uses multigrid-preconditioned CG
+  to a tolerance, Ember a fixed number of Gauss–Seidel iterations.
+- The inflow, wind and vorticity mappings hold for one solver step per frame,
+  which every bench scene uses.
+
+Scenes are compared only on §4's metrics, never voxel by voxel.
 
 The script is checked by `ruff` like the add-on. It cannot run in CI, which
-has no Blender. Task 2's bake and a `plume` run at 64³ in task 7 check it.
+has no Blender. A `plume` bake at 32³ in Task 6 and a `plume` run at 64³ in
+Task 8 check it.
 
 ## 6. Runners
 
@@ -215,10 +245,20 @@ resolution:
 ### 6.2 Mantaflow
 
 A second example, or a mode of the same one, runs the Blender script for each
-scene and resolution, then reads the cache with `vdb-rs` into the same layout
-as §6.1 and computes the same metrics.
+scene and resolution, then reads the cache into the same layout as §6.1 and
+computes the same metrics.
 
-- A missing grid is an error, never a zero.
+- **Reader.** `vdb-rs` 0.6.0 parses a `Vec3s` grid's root values at 4 bytes
+  and returns Mantaflow's velocity as an empty tree without an error. User
+  decision, 2026-09-23: the workspace vendors a patched copy in
+  `vendor/vdb-rs/` through `[patch.crates-io]` (`vendor/vdb-rs/PATCHED.md`).
+- `vdb-rs` does not check value types, so the reader checks each grid's type
+  (`Tree_float_5_4_3`, `Tree_vec3s_5_4_3`) before reading it, and expands
+  tiles to their full extent.
+- Index (0, 0, 0) is the domain's first cell; the VDB transform is ignored.
+  Velocity converts to m/s as stored · dx / 0.4.
+- A missing grid, a wrong grid type, or a velocity grid holding fewer values
+  than density is an error, never a zero.
 - The reader's test runs on the committed 16³ fixture from task 2, so reading
   the cache is checked in CI without Blender.
 
@@ -246,9 +286,8 @@ of `just check`.
 
 ## 8. Risks
 
-- **(a) `vdb-rs` cannot read Mantaflow's cache**, or reads the float grids
-  but not the vector grid. Fallback in task 2: `.npy` conversion inside
-  Blender.
+- **(a) Resolved.** `vdb-rs` could read the float grids but not the vector
+  grid. The workspace vendors a patched copy (§6.2).
 - **(b) Parameter mappings are approximate.** Mantaflow's inflow and
   buoyancy do not correspond one to one with Ember's. Mitigation: the metrics
   are integral and shape-level, the mappings are written down, and the
@@ -257,5 +296,5 @@ of `just check`.
   load. `just bench` records the load average at the start and end of each
   run, and the results header says to rerun on an idle machine if it was
   above 2.
-- **(d) Run time at 256³.** Estimated 30–90 minutes in total; task 2 measures
-  it. If it is far worse, bring the number to the user before task 7.
+- **(d) Run time at 256³.** Task 3 measured 4.1 s a frame at 256³ under load,
+  about 36 minutes for the whole benchmark.

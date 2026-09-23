@@ -64,6 +64,17 @@ Blender 5.2.2 LTS (`bpy`), Python linted by `ruff`, `just`.
   The frame cache is off in every run (`cache_budget_mb: 0`), so its size is
   0 and the table says so.
 
+- **After Task 3** (user decisions, 2026-09-23; spec §4.1, §5, §6.2 revised):
+  - `vdb-rs` is vendored and patched (`vendor/vdb-rs/`) and is a
+    dev-dependency of `elements-ember`, so the Mantaflow reader lives in
+    `examples/common/mantaflow.rs`, not in the library (Task 7).
+  - Both solvers give face velocities, so `metrics` has no cell-centred input
+    or divergence rule; every velocity metric uses the smoke mask (Task 4).
+  - Mantaflow's inflow is additive; wind, heat and pressure differences are
+    documented, not matched (Task 6, Task 8).
+  - The idle-machine preset rerun moves from Task 2 to the start of Task 8's
+    run.
+
 ## File structure
 
 | File | Responsibility | Task |
@@ -84,7 +95,7 @@ Blender 5.2.2 LTS (`bpy`), Python linted by `ruff`, `just`.
 | `crates/elements-ember/src/bench/report.rs` (with `bench.rs` → `bench/mod.rs`) | result file types and `results.md` assembly | 5, 8 |
 | `crates/elements-ember/examples/benchmark.rs` | Ember runner, Mantaflow runner, report | 5, 8 |
 | `tests/bench/mantaflow_scene.py` | builds and bakes the Mantaflow scene from JSON | 6 |
-| `crates/elements-ember/src/mantaflow.rs` | reads a Mantaflow cache frame into arrays | 7 |
+| `crates/elements-ember/examples/common/mantaflow.rs` | reads a Mantaflow cache frame into arrays | 7 |
 | `crates/elements-ember/tests/mantaflow.rs` | reader test on the fixture | 7 |
 | `justfile` | `bench` recipe | 8 |
 | `docs/bench/results.md`, `docs/bench/results/*` | the results | 8 |
@@ -690,6 +701,12 @@ git commit   # subject: "Record how Blender's Mantaflow cache is laid out, and m
 
 ### Task 4: Metrics
 
+*Revised after Task 3.* Both solvers give face velocities (Mantaflow's cache
+is staggered, with Ember's convention), and the cache holds velocity only
+where density is above 1e-6. So there is no cell-centred input and no
+divergence rule to choose: every velocity metric uses faces and the smoke
+mask (spec §4.1).
+
 **Files:**
 - Modify: `crates/elements-ember/src/metrics.rs`
 - Create: `crates/elements-ember/tests/metrics.rs`
@@ -699,68 +716,71 @@ git commit   # subject: "Record how Blender's Mantaflow cache is laid out, and m
 - Produces:
 
 ```rust
-pub enum Velocity {
-    /// Face values, x-fastest, with each axis's face grid one longer along it.
-    Faces([Vec<f32>; 3]),
-    /// Cell-centred values, x-fastest, at the cell dims.
-    Centred([Vec<f32>; 3]),
-}
+/// Density above which a cell counts as smoke: Mantaflow's default
+/// `clipping`, below which its cache stores no velocity (spec §4.1).
+pub const SMOKE_THRESHOLD: f32 = 1e-6;
 
 pub struct Sample<'a> {
     pub cells: FieldDims,
     /// Voxel edge, metres.
     pub dx: f64,
+    /// x-fastest, at the cell dims.
     pub density: &'a [f32],
-    pub velocity: &'a Velocity,
+    /// Face velocities in m/s, x-fastest, each axis's grid one longer along
+    /// that axis (`StaggeredField::face_dims`), as `Field::read_back` returns.
+    pub faces: &'a [Vec<f32>; 3],
     /// One entry per cell, true inside a collider; empty when there is none.
     pub solid: &'a [bool],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum DivergenceRule { Faces, CentralDifferences }
-
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FrameMetrics {
-    pub divergence_rule: DivergenceRule,
+    /// Over measured cells, 1/s.
     pub divergence_max: f64,
     pub divergence_rms: f64,
-    /// ½ Σ|u|² dV over interior cells, m⁵/s².
+    /// ½ Σ|u|² dV over measured cells, m⁵/s².
     pub kinetic_energy: f64,
-    /// Σ|∇×u| dV over interior cells, m³/s.
+    /// Σ|∇×u| dV over measured cells, m³/s.
     pub vorticity: f64,
-    /// Σ ρ dV, density × m³.
+    /// How many cells the velocity metrics covered.
+    pub measured_cells: u64,
+    /// Σ ρ dV over every cell, density × m³.
     pub mass: f64,
     /// Density-weighted mean height, metres.
     pub centroid_m: Option<f64>,
     /// Height below which 95% of the above-threshold density lies, metres.
     pub top_m: Option<f64>,
-    /// Upward flux of density through the domain top, density × m³ / s.
+    /// Upward flux of density one cell below the domain top, density × m³ / s.
     pub outflow_rate: f64,
 }
 
 pub fn cell_centred(faces: &[Vec<f32>; 3], cells: FieldDims) -> [Vec<f32>; 3];
 pub fn measure(sample: &Sample<'_>) -> FrameMetrics;
-/// Drift from frame index `from` (0-based into the series) at every later
-/// index: (M(n) + outflow integrated from `from` to n) − M(from).
+/// Drift at every frame index from `from` (0-based into the series):
+/// (M(n) + outflow integrated from `from` to n) − M(from). Entries before
+/// `from` are 0.
 pub fn drift(mass: &[f64], outflow_rate: &[f64], frame_seconds: f64, from: usize) -> Vec<f64>;
 ```
 
 Definitions (spec §4):
-- **Divergence.** `Faces` uses the existing `divergence` stencil. `Centred`
-  uses central differences, (u[i+1] − u[i−1]) / 2dx per axis, on cells with
-  both neighbours inside the domain. Both skip solid cells. Rename the
-  existing function's loop into a helper that takes a skip predicate, so
-  `divergence` keeps its signature and behaviour.
-- **Interior** (kinetic energy and vorticity): cells with 1 ≤ i ≤ n − 2 on
-  every axis and no solid cell among their 26 neighbours or themselves.
-- **Vorticity:** |∇×u| using central differences of the cell-centred
-  velocity.
+- **Measured cell:** every one of the cell and its 26 neighbours lies inside
+  the domain (so 1 ≤ i ≤ n − 2 on every axis), is not solid, and has density
+  above `SMOKE_THRESHOLD`. One private function,
+  `fn measured(sample, i, j, k) -> bool`, used by all three velocity metrics.
+- **Divergence:** the face stencil of the existing `divergence`, over measured
+  cells. Refactor the stencil into a private per-cell function that both
+  `divergence` (every cell, unchanged behaviour and signature) and `measure`
+  use.
+- **Kinetic energy and vorticity:** from `cell_centred`, the mean of a cell's
+  two faces per axis. Vorticity is |∇×u| with central differences,
+  (u[i+1] − u[i−1]) / 2dx.
 - **Plume top:** among cells with ρ ≥ 0.01 · max ρ, sort by height
   (k + 0.5) · dx, and return the smallest height at which the cumulative
   density reaches 95% of their total. `None` when max ρ ≤ 0.
-- **Outflow rate:** Σ over top cells (k = nz − 1) of ρ · max(w, 0) · dx²,
-  where w is the top face's value (`Faces`: z-face index k = nz) or the
-  top cell's centred value (`Centred`).
+- **Outflow rate:** Σ over (i, j) of ρ(i, j, nz − 2) · max(w, 0) · dx², where
+  w is the z-face value at index nz − 1 (the face between cells nz − 2 and
+  nz − 1). Mantaflow's cache has no top face (index nz), so neither solver's
+  is used.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -768,9 +788,7 @@ Definitions (spec §4):
 
 ```rust
 use elements_core::gpu::FieldDims;
-use elements_ember::metrics::{
-    DivergenceRule, Sample, Velocity, cell_centred, drift, measure,
-};
+use elements_ember::metrics::{SMOKE_THRESHOLD, Sample, cell_centred, drift, measure};
 
 const N: u32 = 16;
 const DX: f64 = 0.125; // a 2 m domain
@@ -783,101 +801,123 @@ fn idx(i: u32, j: u32, k: u32) -> usize {
     (i + N * (j + N * k)) as usize
 }
 
-/// Centred velocity from a function of the cell centre (metres).
-fn centred(f: impl Fn([f64; 3]) -> [f64; 3]) -> Velocity {
-    let mut out: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; (N * N * N) as usize]);
-    for k in 0..N {
-        for j in 0..N {
-            for i in 0..N {
-                let p = [i, j, k].map(|c| (c as f64 + 0.5) * DX);
-                let u = f(p);
-                for a in 0..3 {
-                    out[a][idx(i, j, k)] = u[a] as f32;
+/// Face velocities from a function of position (metres). The x-face at
+/// index (i, j, k) sits at (i·dx, (j + ½)·dx, (k + ½)·dx), and likewise for
+/// y and z.
+fn faces(f: impl Fn([f64; 3]) -> [f64; 3]) -> [Vec<f32>; 3] {
+    std::array::from_fn(|axis| {
+        let mut dims = [N; 3];
+        dims[axis] += 1;
+        let mut out = vec![0.0f32; (dims[0] * dims[1] * dims[2]) as usize];
+        for k in 0..dims[2] {
+            for j in 0..dims[1] {
+                for i in 0..dims[0] {
+                    let mut p = [i, j, k].map(|c| (c as f64 + 0.5) * DX);
+                    p[axis] -= 0.5 * DX;
+                    out[(i + dims[0] * (j + dims[1] * k)) as usize] = f(p)[axis] as f32;
                 }
             }
         }
-    }
-    Velocity::Centred(out)
+        out
+    })
 }
 
-fn sample<'a>(density: &'a [f32], velocity: &'a Velocity, solid: &'a [bool]) -> Sample<'a> {
-    Sample { cells: cells(), dx: DX, density, velocity, solid }
+/// Density 1 everywhere: every interior cell is smoke.
+fn smoke() -> Vec<f32> {
+    vec![1.0; (N * N * N) as usize]
 }
 
-fn zeros() -> Vec<f32> {
-    vec![0.0; (N * N * N) as usize]
+fn sample<'a>(density: &'a [f32], faces: &'a [Vec<f32>; 3], solid: &'a [bool]) -> Sample<'a> {
+    Sample { cells: cells(), dx: DX, density, faces, solid }
 }
+
+/// Interior cells when the whole domain is smoke: 1..=14 on each axis.
+const INTERIOR: f64 = 14.0 * 14.0 * 14.0;
 
 #[test]
 fn a_uniform_flow_has_no_divergence_or_vorticity() {
-    let v = centred(|_| [0.3, -0.2, 0.5]);
-    let d = zeros();
+    let v = faces(|_| [0.3, -0.2, 0.5]);
+    let d = smoke();
     let m = measure(&sample(&d, &v, &[]));
-    assert_eq!(m.divergence_rule, DivergenceRule::CentralDifferences);
+    assert_eq!(m.measured_cells, INTERIOR as u64);
     assert!(m.divergence_max < 1e-6, "{m:?}");
     assert!(m.vorticity < 1e-6, "{m:?}");
-    // Interior cells: 14³, each with |u|² = 0.38.
-    let expected = 0.5 * 0.38 * 14f64.powi(3) * DX.powi(3);
+    let expected = 0.5 * 0.38 * INTERIOR * DX.powi(3);
     assert!((m.kinetic_energy - expected).abs() < 1e-6 * expected, "{m:?}");
 }
 
-/// Solid-body rotation about z at rate ω has vorticity 2ω everywhere.
+/// Solid-body rotation about z at rate ω has vorticity 2ω everywhere, and no
+/// divergence.
 #[test]
 fn solid_body_rotation_has_vorticity_twice_its_rate() {
     let w = 1.5;
-    let v = centred(|p| [-w * (p[1] - 1.0), w * (p[0] - 1.0), 0.0]);
-    let d = zeros();
+    let v = faces(|p| [-w * (p[1] - 1.0), w * (p[0] - 1.0), 0.0]);
+    let d = smoke();
     let m = measure(&sample(&d, &v, &[]));
-    let expected = 2.0 * w * 14f64.powi(3) * DX.powi(3);
+    let expected = 2.0 * w * INTERIOR * DX.powi(3);
     assert!((m.vorticity - expected).abs() < 1e-4 * expected, "{m:?}");
     assert!(m.divergence_max < 1e-5, "{m:?}");
 }
 
-/// A linear expansion u = (a x, 0, 0) has divergence a in every cell whose
-/// neighbours are both in the domain.
+/// u = (a x, 0, 0) has divergence a in every cell.
 #[test]
-fn central_differences_measure_a_linear_expansion() {
-    let v = centred(|p| [0.8 * p[0], 0.0, 0.0]);
-    let d = zeros();
+fn a_linear_expansion_has_divergence_equal_to_its_slope() {
+    let v = faces(|p| [0.8 * p[0], 0.0, 0.0]);
+    let d = smoke();
     let m = measure(&sample(&d, &v, &[]));
     assert!((m.divergence_max - 0.8).abs() < 1e-5, "{m:?}");
     assert!((m.divergence_rms - 0.8).abs() < 1e-5, "{m:?}");
 }
 
-/// A face velocity whose faces grow linearly along x has divergence equal to
-/// the slope, through the face stencil.
-#[test]
-fn face_velocities_use_the_face_stencil() {
-    let c = cells();
-    let xd = (N + 1) * N * N;
-    let mut x = vec![0.0f32; xd as usize];
-    for k in 0..N {
-        for j in 0..N {
-            for i in 0..=N {
-                x[(i + (N + 1) * (j + N * k)) as usize] = 0.8 * (i as f32 * DX as f32);
-            }
-        }
-    }
-    let faces = [x, vec![0.0; ((N + 1) * N * N) as usize], vec![0.0; ((N + 1) * N * N) as usize]];
-    let v = Velocity::Faces(faces);
-    let d = zeros();
-    let m = measure(&Sample { cells: c, dx: DX, density: &d, velocity: &v, solid: &[] });
-    assert_eq!(m.divergence_rule, DivergenceRule::Faces);
-    assert!((m.divergence_max - 0.8).abs() < 1e-5, "{m:?}");
-}
-
 #[test]
 fn cell_centring_averages_the_two_faces() {
     let c = FieldDims::new(2, 1, 1);
-    let faces = [vec![1.0, 3.0, 7.0], vec![0.0, 0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 0.0]];
-    let [x, _, _] = cell_centred(&faces, c);
+    let f = [vec![1.0, 3.0, 7.0], vec![0.0; 4], vec![0.0; 4]];
+    let [x, _, _] = cell_centred(&f, c);
     assert_eq!(x, vec![2.0, 5.0]);
+}
+
+/// Only cells whose whole neighbourhood is smoke are measured: a 4³ block
+/// of smoke leaves its inner 2³.
+#[test]
+fn velocity_is_measured_only_inside_the_smoke() {
+    let v = faces(|_| [1.0, 0.0, 0.0]);
+    let mut d = vec![0.0; (N * N * N) as usize];
+    for k in 4..8 {
+        for j in 4..8 {
+            for i in 4..8 {
+                d[idx(i, j, k)] = 1.0;
+            }
+        }
+    }
+    let m = measure(&sample(&d, &v, &[]));
+    assert_eq!(m.measured_cells, 8, "{m:?}");
+    assert!((m.kinetic_energy - 0.5 * 8.0 * DX.powi(3)).abs() < 1e-12, "{m:?}");
+}
+
+#[test]
+fn density_at_the_threshold_is_not_smoke() {
+    let v = faces(|_| [1.0, 0.0, 0.0]);
+    let d = vec![SMOKE_THRESHOLD; (N * N * N) as usize];
+    assert_eq!(measure(&sample(&d, &v, &[])).measured_cells, 0);
+}
+
+/// A solid cell removes itself and its 26 neighbours from the measured set.
+#[test]
+fn solids_and_their_neighbours_are_not_measured() {
+    let v = faces(|p| [0.8 * p[0], 0.0, 0.0]);
+    let d = smoke();
+    let mut solid = vec![false; (N * N * N) as usize];
+    solid[idx(8, 8, 8)] = true;
+    let m = measure(&sample(&d, &v, &solid));
+    assert_eq!(m.measured_cells, INTERIOR as u64 - 27, "{m:?}");
+    assert!((m.divergence_rms - 0.8).abs() < 1e-5, "{m:?}");
 }
 
 /// A slab of density 2 in layers k = 4..8: mass, centroid and top follow.
 #[test]
 fn a_density_slab_has_known_mass_centroid_and_top() {
-    let mut d = zeros();
+    let mut d = vec![0.0; (N * N * N) as usize];
     for k in 4..8 {
         for j in 0..N {
             for i in 0..N {
@@ -885,7 +925,7 @@ fn a_density_slab_has_known_mass_centroid_and_top() {
             }
         }
     }
-    let v = centred(|_| [0.0; 3]);
+    let v = faces(|_| [0.0; 3]);
     let m = measure(&sample(&d, &v, &[]));
     let cells_in_slab = (N * N * 4) as f64;
     assert!((m.mass - 2.0 * cells_in_slab * DX.powi(3)).abs() < 1e-9, "{m:?}");
@@ -896,40 +936,25 @@ fn a_density_slab_has_known_mass_centroid_and_top() {
 
 #[test]
 fn cells_below_one_percent_of_the_peak_do_not_move_the_top() {
-    let mut d = zeros();
+    let mut d = vec![0.0; (N * N * N) as usize];
     d[idx(3, 3, 2)] = 1.0;
     d[idx(3, 3, 14)] = 0.009; // below 1% of the peak
-    let v = centred(|_| [0.0; 3]);
+    let v = faces(|_| [0.0; 3]);
     let m = measure(&sample(&d, &v, &[]));
     assert!((m.top_m.unwrap() - 2.5 * DX).abs() < 1e-9, "{m:?}");
 }
 
+/// Outflow is measured on the z-faces at index N − 1 with the density of
+/// layer N − 2, and only upward flow counts.
 #[test]
-fn only_upward_flow_through_the_top_counts_as_outflow() {
-    let mut d = zeros();
-    d[idx(2, 2, N - 1)] = 3.0;
-    d[idx(5, 5, N - 1)] = 3.0;
-    let v = centred(|p| [0.0, 0.0, if p[0] < 0.5 { 0.4 } else { -0.4 }]);
+fn only_upward_flow_one_cell_below_the_top_counts_as_outflow() {
+    let mut d = vec![0.0; (N * N * N) as usize];
+    d[idx(2, 2, N - 2)] = 3.0; // under an upward face
+    d[idx(9, 9, N - 2)] = 3.0; // under a downward face
+    d[idx(2, 2, N - 1)] = 50.0; // the top layer is not the measuring plane
+    let v = faces(|p| [0.0, 0.0, if p[0] < 1.0 { 0.4 } else { -0.4 }]);
     let m = measure(&sample(&d, &v, &[]));
-    // Only (2, 2) has upward flow at the top: 3 × 0.4 × dx².
     assert!((m.outflow_rate - 3.0 * 0.4 * DX * DX).abs() < 1e-9, "{m:?}");
-}
-
-/// A solid cell's neighbourhood is left out of kinetic energy, and the solid
-/// cell itself out of divergence.
-#[test]
-fn solids_are_left_out() {
-    let v = centred(|p| [0.8 * p[0], 0.0, 0.0]);
-    let d = zeros();
-    let mut solid = vec![false; (N * N * N) as usize];
-    solid[idx(8, 8, 8)] = true;
-    let open = measure(&sample(&d, &v, &[]));
-    let with = measure(&sample(&d, &v, &solid));
-    assert!(with.kinetic_energy < open.kinetic_energy, "{with:?} vs {open:?}");
-    // 27 cells excluded from the interior sum.
-    let lost = open.kinetic_energy - with.kinetic_energy;
-    assert!(lost > 0.0);
-    assert!((with.divergence_rms - 0.8).abs() < 1e-5, "{with:?}");
 }
 
 /// Mass 10, falling to 8 while 2 flows out: no drift.
@@ -951,6 +976,12 @@ fn drift_integrates_outflow_with_the_trapezoid_rule() {
     // Trapezoid over one second: (0 + 2) / 2 = 1, so drift = 10 + 1 − 10.
     assert_eq!(drift(&mass, &outflow, 1.0, 0), vec![0.0, 1.0]);
 }
+
+#[test]
+fn drift_is_zero_before_its_start() {
+    let d = drift(&[5.0, 6.0, 7.0], &[0.0; 3], 1.0, 1);
+    assert_eq!(d, vec![0.0, 0.0, 1.0]);
+}
 ```
 
 - [ ] **Step 2: Run them and check they fail**
@@ -960,32 +991,34 @@ Expected: compile errors for the missing items.
 
 - [ ] **Step 3: Implement** in `crates/elements-ember/src/metrics.rs`,
 following the definitions above, with a doc comment per item. Keep sums in
-`f64`. Put the interior predicate in one private function,
-`fn interior(cells, solid, i, j, k) -> bool`, that kinetic energy and
-vorticity share. Add `serde` to `elements-ember`'s dependencies if it is not
-already there (it is, for params).
+`f64`. The existing `divergence` and `centroid_z` keep their signatures and
+behaviour; their callers (the speed gate, the validation tests) must still
+compile and pass unchanged.
 
-- [ ] **Step 4: Run the tests.** Expected: all pass. Existing callers of
-`divergence` and `centroid_z` still compile unchanged.
+- [ ] **Step 4: Run the tests.** Expected: all pass, and
+`cargo nextest run -p elements-ember` passes.
 
 - [ ] **Step 5: Prove each test can fail.** One mutation per test, each
 applied alone, with the output recorded:
 1. Uniform flow: drop the ½ in kinetic energy.
 2. Rotation: use a one-sided difference for the curl's ∂v/∂x term.
-3. Linear expansion: divide central differences by `dx` instead of `2dx`.
-4. Face stencil: make `measure` resample faces to centres and always use
-   central differences.
-5. Cell centring: take the lower face instead of the mean.
-6. Slab: use `k` instead of `k + 0.5` for the plume top's height.
-7. Threshold: drop the 1% threshold.
-8. Outflow: count |w| instead of max(w, 0).
-9. Solids: ignore `solid` in the interior predicate.
-10. Drift, first test: leave outflow out.
-11. Drift, trapezoid: use the rectangle rule at the right end.
+3. Linear expansion: divide the face stencil by `2 * dx`.
+4. Cell centring: take the lower face instead of the mean.
+5. Smoke only: check only the cell itself for smoke, not its neighbours.
+6. Threshold: use `>=` instead of `>` against `SMOKE_THRESHOLD`.
+7. Solids: ignore `solid` in `measured`.
+8. Slab: use `k` instead of `k + 0.5` for the plume top's height.
+9. Top threshold: drop the 1% threshold.
+10. Outflow: use the density of layer nz − 1 instead of nz − 2.
+11. Drift, first test: leave outflow out.
+12. Drift, trapezoid: use the rectangle rule at the right end.
+13. Drift before start: return M(n) − M(from) for every n, including those
+    before `from`.
 
 - [ ] **Step 6: `just check`, then commit.** Subject: "Measure energy,
 vorticity, mass, plume height and outflow from either solver's fields". The
-body says why: one set of functions reads both solvers (spec §4).
+body says why: one set of functions reads both solvers, over the smoke both
+caches hold velocity for (spec §4).
 
 ---
 
@@ -1002,7 +1035,7 @@ body says why: one set of functions reads both solvers (spec §4).
 - Create: `crates/elements-ember/examples/benchmark.rs`
 
 **Interfaces:**
-- Consumes: `metrics::{Sample, Velocity, FrameMetrics, measure}` (Task 4); `EMISSION_FRAMES` (Task 2); `common::{median, shell, commit_label}`.
+- Consumes: `metrics::{Sample, FrameMetrics, measure, drift}` (Task 4); `EMISSION_FRAMES` (Task 2); `common::{median, shell, commit_label}`.
 - Produces:
 
 ```rust
@@ -1192,7 +1225,7 @@ use elements_core::gpu::{Axis, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::report::{RunSummary, load_average, write_summary};
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
-use elements_ember::metrics::{FrameMetrics, Sample, Velocity, drift, measure};
+use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
 use elements_ember::solver;
 
 use common::median;
@@ -1270,12 +1303,12 @@ fn metrics_run(gpu: &GpuContext, registry: &NodeRegistry, scene: &Scene) -> Res<
             .get(SOLVER_NODE, solver::VELOCITY)
             .ok_or("no solver velocity in state")?
             .as_vector_field()?;
-        let velocity = Velocity::Faces([
+        let faces = [
             velocity.face(Axis::X).read_back(gpu)?,
             velocity.face(Axis::Y).read_back(gpu)?,
             velocity.face(Axis::Z).read_back(gpu)?,
-        ]);
-        out.push(measure(&Sample { cells: dims, dx, density: &density, velocity: &velocity, solid: &solid }));
+        ];
+        out.push(measure(&Sample { cells: dims, dx, density: &density, faces: &faces, solid: &solid }));
     }
     state.clear(&mut pool);
     Ok(out)
@@ -1353,6 +1386,30 @@ untimed run (spec §6.1).
 
 ### Task 6: Build the Mantaflow scene from the Ember scene
 
+*Revised after Task 3.* The script below follows `docs/bench/mantaflow-notes.md`
+("Parameter mapping" and "Corrections to the spec"). Where this task's text and
+the notes disagree about a Blender setting, the notes win, and the
+implementer records the difference in the report. Three things are not yet
+settled, and this task settles them by bake:
+- **Switching emission off.** Find the flow property that stops emission
+  when keyframed (candidate: `flow_settings.use_inflow`). Prove it with the
+  32³ check in Step 6.
+- **Temperature ramp (optional).** Mantaflow holds the emitter's heat at a
+  fixed value, while Ember's grows at its rate. Try keyframing the flow's
+  `temperature` to rise linearly, reaching `temperature_rate × f / fps` at
+  frame f, until the last active frame. Compare the density centroid at
+  frames 24 and 60 at 64³ against Ember's (Task 3 measured Ember at 0.371 m
+  and 0.781 m, and the fixed-heat mapping at 0.457 m and 0.925 m). Keep the
+  ramp only if it brings both frames closer without moving mass by more than
+  3%. Record the numbers either way in the notes' Inflow experiment.
+- **`mapping.py` tests.** Add `tests/bench/test_mapping.py`, pure Python with
+  no Blender, and run it with `python3 -m pytest tests/bench` or plain
+  asserts under `python3 tests/bench/test_mapping.py`, whichever the repo's
+  Python tooling supports (check `mise.toml` and `tests/python`). Cover
+  `rotation_to` (+z onto ±x, ±y and −z), `wind` (0.5 m/s² at 24 fps gives
+  0.1042), and `inflow` (1, 1, 24 gives 1/24 and 1). Prove one of them can
+  fail.
+
 **Files:**
 - Modify: `crates/elements-ember/src/bench/mod.rs` (`Scene::mantaflow_json`)
 - Test: `crates/elements-ember/tests/bench.rs`
@@ -1368,7 +1425,7 @@ untimed run (spec §6.1).
   `temperature_dissipation`, `wind` ([x, y, z] m/s²), `collider`
   (`null` or `{ "center": [..], "radius": .. }`), `boundaries` (six strings,
   `"wall"` or `"open"`, keyed `neg_x` … `pos_z`).
-- The script's command line: `Blender --background --factory-startup --python tests/bench/mantaflow_scene.py -- SCENE_JSON OUT_DIR [--no-bake]`. It writes `OUT_DIR/cache/` (the Mantaflow cache) and `OUT_DIR/timings.json`:
+- The script's command line: `Blender --background --factory-startup --python-exit-code 1 --python tests/bench/mantaflow_scene.py -- SCENE_JSON OUT_DIR [--no-bake]`. It writes `OUT_DIR/cache/` (the Mantaflow cache) and `OUT_DIR/timings.json`:
   `{"frames": [{"frame": 1, "mtime_ns": ...}, ...], "blender": "5.2.2 LTS"}`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1411,7 +1468,7 @@ every conversion through `mapping.py`:
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Build and bake the Mantaflow equivalent of an Ember bench scene.
 
-Run: Blender --background --factory-startup --python tests/bench/mantaflow_scene.py -- SCENE_JSON OUT_DIR [--no-bake]
+Run: Blender --background --factory-startup --python-exit-code 1 --python tests/bench/mantaflow_scene.py -- SCENE_JSON OUT_DIR [--no-bake]
 
 Fairness rules (piece 2 spec §5.3): no noise upres, no adaptive domain, fixed
 timesteps equal to Ember's substep count, and an uncompressed 32-bit OpenVDB
@@ -1426,6 +1483,8 @@ import bpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mapping  # noqa: E402
+
+GRAVITY = 9.81  # |g|, Blender's default scene gravity, m/s²
 
 SIDES = {
     "neg_x": "use_collision_border_left",
@@ -1462,8 +1521,10 @@ def build(sc: dict, cache_dir: str) -> bpy.types.Object:
     d.openvdb_cache_compress_type = "NONE"
     d.openvdb_data_depth = "32"
     d.cache_frame_start, d.cache_frame_end = 1, sc["frames"]
-    d.alpha, d.beta = mapping.buoyancy(sc["buoyancy_density"], sc["buoyancy_temperature"])
-    d.vorticity = mapping.vorticity(sc["vorticity"], dx)
+    d.alpha, d.beta = mapping.buoyancy(
+        sc["buoyancy_density"], sc["buoyancy_temperature"], size, GRAVITY
+    )
+    d.vorticity = mapping.vorticity(sc["vorticity"], sc["fps"])
     d.use_dissolve_smoke = False
     for side, prop in SIDES.items():
         setattr(d, prop, sc["boundaries"][side] == "wall")
@@ -1476,8 +1537,13 @@ def build(sc: dict, cache_dir: str) -> bpy.types.Object:
     fs = f.flow_settings
     fs.flow_type = "SMOKE"
     fs.flow_behavior = "INFLOW"
+    fs.flow_source = "MESH"
+    fs.use_absolute = False  # additive: adds density each step, as Ember's rate does
+    fs.surface_distance = 0.0  # no emission band outside the mesh
+    fs.volume_density = 1.0  # emit through the volume, not just the shell
     fs.density, fs.temperature = mapping.inflow(e["density_rate"], e["temperature_rate"], sc["fps"])
     first, last = e["active_frames"]
+    # The property that switches emission off is settled by this task's bake.
     for frame, on in ((first, True), (last, True), (last + 1, False)):
         fs.use_inflow = on
         fs.keyframe_insert("use_inflow", frame=frame)
@@ -1490,12 +1556,18 @@ def build(sc: dict, cache_dir: str) -> bpy.types.Object:
         eff.effector_settings.effector_type = "COLLISION"
 
     if any(sc["wind"]):
-        strength, direction = mapping.wind(tuple(sc["wind"]))
+        strength, direction = mapping.wind(tuple(sc["wind"]), sc["fps"])
         bpy.ops.object.effector_add(type="WIND", location=(size / 2,) * 3)
         wind = bpy.context.active_object
-        wind.field.strength = strength
-        wind.field.falloff_type = "NONE"
-        wind.rotation_mode = "QUATERNION"
+        f = wind.field
+        f.strength = strength
+        f.flow = 0.0  # WIND defaults to 1, which drags towards the smoke's velocity
+        f.falloff_type = "SPHERE"
+        f.falloff_power = 0.0  # a falloff of 1 everywhere
+        f.use_min_distance = False
+        f.use_max_distance = False
+        f.z_direction = "BOTH"
+        wind.rotation_mode = "QUATERNION"  # else rotation_quaternion is ignored
         wind.rotation_quaternion = mapping.rotation_to(direction)
     return domain
 ```
@@ -1534,7 +1606,7 @@ def main() -> None:
 main()
 ```
 
-Replace the cache path pattern with the one recorded in the notes.
+The cache path matches the notes (`cache/data/fluid_data_NNNN.vdb`).
 
 - [ ] **Step 6: Check the script on `plume` at 32³**
 
@@ -1548,7 +1620,7 @@ For this, add a small mode to `benchmark.rs`,
 runner uses it too. Then:
 
 ```bash
-"$B" --background --factory-startup --python tests/bench/mantaflow_scene.py -- "$S/plume32.json" "$S/manta32"
+"$B" --background --factory-startup --python-exit-code 1 --python tests/bench/mantaflow_scene.py -- "$S/plume32.json" "$S/manta32"
 ```
 
 Expected: exit 0, 120 cache frames, and `timings.json`. Check that density
@@ -1563,118 +1635,197 @@ Subject: "Build each bench scene's Mantaflow twin from the same definition".
 
 ### Task 7: Read a Mantaflow cache frame
 
+*Revised after Task 3.* The facts come from `docs/bench/mantaflow-notes.md`:
+grids `density` (`Tree_float_5_4_3`) and `velocity` (`Tree_vec3s_5_4_3`,
+class staggered); index (0, 0, 0) is the domain's first cell; the VDB
+transform is ignored; velocity is stored on faces with Ember's convention,
+only where there is smoke, and never at face index n; units are
+stored · dx / 0.4 m/s. The workspace reads it with the vendored, patched
+`vdb-rs`.
+
+`vdb-rs` is a dev-dependency of `elements-ember`, so the daemon never links
+it. The reader therefore lives beside the benchmark example, in
+`examples/common/mantaflow.rs`, and its test includes the same file with
+`#[path]`.
+
 **Files:**
-- Create: `crates/elements-ember/src/mantaflow.rs` (and `pub mod mantaflow;` in `lib.rs`)
+- Create: `crates/elements-ember/examples/common/mantaflow.rs` (and `pub mod mantaflow;` in `examples/common/mod.rs`)
 - Test: `crates/elements-ember/tests/mantaflow.rs`
 
 **Interfaces:**
-- Consumes: the grid names, value types, velocity location and index-space
-  mapping recorded in `docs/bench/mantaflow-notes.md` (Task 3); `metrics::Velocity`.
+- Consumes: the fixture `crates/elements-ember/tests/fixtures/mantaflow_16/fluid_data_0005.vdb` and its `README.md` (Task 3).
 - Produces:
 
 ```rust
+pub const DENSITY_GRID: &str = "density";
+pub const VELOCITY_GRID: &str = "velocity";
+pub const FLOAT_TREE: &str = "Tree_float_5_4_3";
+pub const VEC3_TREE: &str = "Tree_vec3s_5_4_3";
+
 pub struct CacheFrame {
     pub cells: FieldDims,
+    /// x-fastest, at the cell dims; 0 where the cache stores nothing.
     pub density: Vec<f32>,
-    pub velocity: Velocity,
+    /// Face velocities in m/s, x-fastest, each axis one longer along itself
+    /// (`StaggeredField::face_dims`), as `metrics::Sample::faces` expects.
+    /// Faces the cache does not store, including every face at index n, are 0.
+    pub faces: [Vec<f32>; 3],
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum CacheError {
-    #[error("{path}: {source}")]
     Open { path: PathBuf, source: std::io::Error },
-    #[error("{path}: {message}")]
     Parse { path: PathBuf, message: String },
-    #[error("{path}: no grid named {grid}; found {found:?}")]
     MissingGrid { path: PathBuf, grid: String, found: Vec<String> },
-    #[error("{path}: grid {grid} has a voxel at {index:?}, outside a {cells:?} domain")]
+    WrongType { path: PathBuf, grid: String, expected: &'static str, found: String },
     OutOfDomain { path: PathBuf, grid: String, index: [i32; 3], cells: [u32; 3] },
+    /// The velocity grid holds fewer values than density (notes: tiled
+    /// density can drop other grids' values).
+    Shortfall { path: PathBuf, density: usize, velocity: usize },
 }
+// with `impl std::fmt::Display` and `impl std::error::Error`, written by hand.
 
-/// Read one cache frame into x-fastest arrays at `cells`. Inactive voxels are
-/// zero; tiles fill their whole extent (`VdbLevel::scale`).
-pub fn read_frame(path: &Path, cells: FieldDims) -> Result<CacheFrame, CacheError>;
+/// Read one cache frame of a domain of `cells` with voxel edge `dx` metres.
+pub fn read_frame(path: &Path, cells: FieldDims, dx: f64) -> Result<CacheFrame, CacheError>;
+/// The same, with the grid names given, so a test can ask for a missing one.
+pub fn read_frame_with(path: &Path, cells: FieldDims, dx: f64, density_grid: &str, velocity_grid: &str) -> Result<CacheFrame, CacheError>;
 ```
 
-Check whether `thiserror` is already a workspace dependency; if not, write
-`Display` and `Error` by hand instead of adding one.
+- [ ] **Step 1: Write the failing tests**
 
-- [ ] **Step 1: Write the failing tests**, using the fixture from Task 3.
-Its dims and expected values come from the fixture's `README.md`:
+`crates/elements-ember/tests/mantaflow.rs`:
 
 ```rust
+//! The Mantaflow cache reader, which lives with the benchmark example so
+//! that `vdb-rs` stays a dev-dependency.
+
+#[path = "../examples/common/mantaflow.rs"]
+mod mantaflow;
+
 use std::path::PathBuf;
 
 use elements_core::gpu::FieldDims;
-use elements_ember::mantaflow::{CacheError, read_frame};
-use elements_ember::metrics::Velocity;
+use mantaflow::{CacheError, read_frame, read_frame_with};
+
+const N: u32 = 16;
+const DX: f64 = 0.125;
 
 fn fixture() -> PathBuf {
-    // Replace FILE with the fixture's file name from its README.
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mantaflow_16/FILE"))
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mantaflow_16/fluid_data_0005.vdb"
+    ))
 }
 
 #[test]
 fn a_cache_frame_reads_into_the_domain_layout() {
-    let f = read_frame(&fixture(), FieldDims::new(16, 16, 16)).unwrap();
-    assert_eq!(f.density.len(), 16 * 16 * 16);
-    let total: f64 = f.density.iter().map(|&d| f64::from(d)).sum();
-    assert!(total > 0.0, "the probe's emitter left density");
-    // The emitter sits at (1, 1, 0.3) m in a 2 m domain: the densest cell is
-    // near the domain's x/y centre and low in z.
-    let (imax, _) = f.density.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-    let (i, j, k) = (imax % 16, (imax / 16) % 16, imax / 256);
-    assert!((6..=9).contains(&i) && (6..=9).contains(&j), "({i}, {j}, {k})");
-    assert!(k <= 5, "({i}, {j}, {k})");
-    match &f.velocity {
-        Velocity::Faces(v) | Velocity::Centred(v) => {
-            assert!(v[2].iter().any(|&w| w > 0.0), "the plume rises");
+    let f = read_frame(&fixture(), FieldDims::new(N, N, N), DX).unwrap();
+    assert_eq!(f.density.len(), (N * N * N) as usize);
+    let stored = f.density.iter().filter(|&&d| d != 0.0).count();
+    assert_eq!(stored, 240, "the README's density value count");
+    // The README's index box for density is (4,4,1)–(11,11,7).
+    for (n, &d) in f.density.iter().enumerate() {
+        let (i, j, k) = (n as u32 % N, (n as u32 / N) % N, n as u32 / (N * N));
+        if d != 0.0 {
+            assert!((4..=11).contains(&i) && (4..=11).contains(&j) && (1..=7).contains(&k), "({i}, {j}, {k})");
+        }
+    }
+    // Face grids are one longer along their axis, and face n is empty.
+    assert_eq!(f.faces[2].len(), (N * N * (N + 1)) as usize);
+    let top = &f.faces[2][(N * N * N) as usize..];
+    assert!(top.iter().all(|&w| w == 0.0));
+    // The plume rises, at a plausible speed in m/s (not grid units).
+    let wmax = f.faces[2].iter().copied().fold(f32::MIN, f32::max);
+    assert!(wmax > 0.0 && wmax < 5.0, "{wmax}");
+}
+
+/// Units: a stored value s is s · dx / 0.4 m/s, so halving dx halves every
+/// velocity and leaves density alone.
+#[test]
+fn velocity_scales_with_the_voxel_size() {
+    let a = read_frame(&fixture(), FieldDims::new(N, N, N), DX).unwrap();
+    let b = read_frame(&fixture(), FieldDims::new(N, N, N), DX / 2.0).unwrap();
+    assert_eq!(a.density, b.density);
+    for axis in 0..3 {
+        for (x, y) in a.faces[axis].iter().zip(&b.faces[axis]) {
+            assert!((x / 2.0 - y).abs() <= 1e-7 * x.abs().max(1.0), "{x} {y}");
         }
     }
 }
 
 #[test]
 fn a_smaller_domain_than_the_cache_is_an_error() {
-    let err = read_frame(&fixture(), FieldDims::new(8, 8, 8)).err();
+    let err = read_frame(&fixture(), FieldDims::new(8, 8, 8), DX).err();
     assert!(matches!(err, Some(CacheError::OutOfDomain { .. })), "{err:?}");
 }
 
 #[test]
 fn a_missing_file_is_an_error() {
-    let err = read_frame(&fixture().with_file_name("nope.vdb"), FieldDims::new(16, 16, 16)).err();
+    let err = read_frame(&fixture().with_file_name("nope.vdb"), FieldDims::new(N, N, N), DX).err();
     assert!(matches!(err, Some(CacheError::Open { .. })), "{err:?}");
+}
+
+#[test]
+fn a_missing_grid_is_an_error() {
+    let err = read_frame_with(&fixture(), FieldDims::new(N, N, N), DX, "smoke", "velocity").err();
+    assert!(matches!(err, Some(CacheError::MissingGrid { .. })), "{err:?}");
+}
+
+/// `vdb-rs` does not check value types; the reader must. Reading the vector
+/// grid as density is a type error, not an empty or garbled grid.
+#[test]
+fn a_grid_of_the_wrong_type_is_an_error() {
+    let err = read_frame_with(&fixture(), FieldDims::new(N, N, N), DX, "velocity", "velocity").err();
+    assert!(matches!(err, Some(CacheError::WrongType { .. })), "{err:?}");
 }
 ```
 
-Also add a test that a missing grid is `MissingGrid`. `mantaflow.rs` has
-`pub const DENSITY_GRID` and `pub const VELOCITY_GRID` (names from the
-notes) and `pub fn read_frame_with(path, cells, density_grid: &str,
-velocity_grid: &str)`, which `read_frame` calls with the two constants. The
-test calls `read_frame_with` with a density grid name that does not exist.
+Check the README's exact counts and index box before relying on them, and
+use its reference sums if it gives any (for example, total density) as an
+extra assertion.
 
 - [ ] **Step 2: Run them; they fail to compile.**
 
-- [ ] **Step 3: Implement.** Open with `vdb_rs::VdbReader::new(BufReader)`.
-Read density as `f32` and velocity as `[f32; 3]` (or as the type the notes
-record). Map each iterated index to the domain with the index offset from the
-notes. For each item, fill `scale³` cells starting at the index, where
-`scale = level.scale() as i32`. Any cell outside `cells` is `OutOfDomain`.
-Choose `Velocity::Faces` or `Velocity::Centred` from the notes. For faces,
-the arrays have one more entry along their axis, and index n along that axis
-is the top face. If Mantaflow stores it at index n, include it.
+Run: `cargo nextest run -p elements-ember --test mantaflow`
 
-- [ ] **Step 4: Run the tests; they pass. Prove each can fail:**
-1. Read into the transpose (`k + n * (j + n * i)`): the location assertion fails.
-2. Skip tiles instead of filling them. If the fixture has no tiles, this
-   mutation is equivalent. Record that, then use: drop the index offset,
-   which must fail on location or on `OutOfDomain`.
-3. Remove the bounds check: the smaller-domain test fails (it panics
-   instead of returning the error).
-4. Missing file: return `Parse` for an open error.
-5. Missing grid: substitute a zero grid when the name is absent.
+- [ ] **Step 3: Implement** `examples/common/mantaflow.rs`:
+- Open with `vdb_rs::VdbReader::new(BufReader::new(File::open(path)?))`.
+- For each grid: check `available_grids()` contains it (`MissingGrid`), and
+  check its descriptor's grid type against `FLOAT_TREE` or `VEC3_TREE`
+  (`WrongType`) before `read_grid::<f32>` or `read_grid::<[f32; 3]>`. Find
+  the field that holds the type string in the vendored
+  `vendor/vdb-rs/src/data_structure.rs`.
+- Iterate with `grid.iter()`. Each item is (index as `Vec3`, value, level).
+  Fill `scale³` cells from that index, `scale = level.scale() as i32`. Any
+  filled cell outside `cells` is `OutOfDomain`.
+- Velocity index (i, j, k) is the −x, −y and −z face of cell (i, j, k):
+  write component a into `faces[a]` at face index (i, j, k) of that axis's
+  face grid, scaled by `dx / 0.4`.
+- Count the values each grid stored (voxels, with tiles counted as their
+  full extent). If velocity stored fewer than density, return `Shortfall`.
+- `examples/common/mod.rs` is shared by every example; add
+  `#[allow(dead_code)]` where an example does not use the reader, as the
+  module already does for any unused helpers.
+
+- [ ] **Step 4: Run the tests; they pass. Prove each can fail**, each
+mutation alone, recording the output:
+1. Store density transposed (`k + n * (j + n * i)`): the index-box assertion fails.
+2. Drop the `dx / 0.4` scale: the plausible-speed assertion fails, or the
+   scaling test does. Record which.
+3. Remove the bounds check: the smaller-domain test fails (a panic instead of the error).
+4. Map an open error to `Parse`: the missing-file test fails.
+5. Skip the type check: the wrong-type test fails.
+6. Put velocity index i on face i + 1 (the + side): the top-face assertion
+   fails, or record why it is equivalent on this fixture and replace it with
+   one that is not.
+7. Shortfall: the fixture has equal counts, so no test reaches it. Add a
+   unit test inside `mantaflow.rs` for the pure count comparison (factor
+   it into `fn check_counts(density: usize, velocity: usize) -> Result<(), ...>`),
+   and prove it with `<` changed to `<=`.
 
 - [ ] **Step 5: `just check`, then commit.** Subject: "Read a Mantaflow cache
-frame into the metrics' array layout".
+frame into the metrics' array layout". The body says why the reader lives
+beside the example (the daemon must not link `vdb-rs`).
 
 ---
 
@@ -1753,13 +1904,23 @@ Write the `summary` and `Context` literals in full.
   resolution. Columns:
   - frame ms (median, min–max, and "median of 3" or "1 run");
   - peak MiB;
-  - divergence RMS at frames 60 and 120, with the rule;
+  - divergence RMS at frames 60 and 120, and the measured-cell count;
   - kinetic energy at 60 and 120;
   - vorticity at 60 and 120;
   - centroid and top at 60 and 120 (m);
   - drift at 120, absolute and as a percentage of mass at 60.
 - **Footnotes:**
-  - the outflow estimate is at frame resolution;
+  - velocity metrics cover only cells whose whole 3×3×3 neighbourhood is
+    smoke (density > 1e-6), for both solvers, because Mantaflow's cache
+    stores velocity only there (spec §4.1);
+  - Mantaflow's wind acts only on smoky cells, Ember's on every cell;
+  - Mantaflow's emitter heat is held at a set value (or ramped, if Task 6
+    kept the ramp), not added at Ember's rate, so plume heights carry that
+    difference;
+  - the pressure solvers differ: Mantaflow uses preconditioned CG to a
+    tolerance, Ember a fixed Gauss–Seidel iteration count;
+  - the outflow estimate is at frame resolution, on the faces one cell below
+    the top;
   - Ember's peak memory is the pool's allocated bytes, with the frame cache
     off;
   - Mantaflow's peak memory is resident memory minus the no-bake baseline.
@@ -1793,8 +1954,9 @@ fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<u64> { /* ..
   medians.
 - **Peak memory:** the maximum over the bake runs, minus the baseline.
 - **Metrics:** after the last run, read every frame with
-  `mantaflow::read_frame` and `measure` it with `scene.solid_mask()` and the
-  same `dx` as Ember. Compute drift as in `run_ember`, then write the
+  `common::mantaflow::read_frame(path, cells, dx)` (Task 7) and `measure`
+  it with `scene.solid_mask()` and the same `dx` as Ember. The frame files
+  are `OUT_DIR/cache/data/fluid_data_NNNN.vdb`. Compute drift as in `run_ember`, then write the
   summary.
 
 Add the `report` mode: read every `*.json` in `docs/bench/results/`, build
@@ -1826,8 +1988,17 @@ bench scenes="plume plume_collider plume_wind" resolutions="64 128 256":
 
 - [ ] **Step 6: Run it**
 
-First check the load (`sysctl -n vm.loadavg`); wait for a 1-minute load under
-2, as in Task 2. Then run `just bench scenes=plume resolutions=64` as a smoke
+**First, the preset rerun deferred from Task 2 Step 7** (user decision,
+2026-09-23: the machine was never idle when Task 2 ran). Follow Task 2
+Step 7 exactly: wait for a 1-minute load under 2, run `just bench-presets`,
+and commit `docs/bench/presets.md` with the dated line. If cap 1's median
+frame is above 100 ms, or cap 2 now fits, **stop and report to the user**
+before running the benchmark: the preview preset may change, and the
+benchmark must measure the final one. If the load does not fall under 2
+within 10 minutes, stop and report too; the user must free the machine
+(Backblaze's `bztransmit` and `mediaanalysisd` held it at 6–19 last time).
+
+Then check the load again (`sysctl -n vm.loadavg`), under 2 as above. Then run `just bench scenes=plume resolutions=64` as a smoke
 test. `report` fails with the missing list, which is expected. Check the two
 `plume-64` summaries by eye:
 - both solvers' mass rises to frame 60 and then flattens or falls;
@@ -1856,8 +2027,11 @@ Do not claim more than the numbers show.
 
 Update:
 - `CLAUDE.md`'s status paragraph: 2b-3 is complete; 2b-3b (render and
-  latency) is next. Add the 2b-3 spec, plan and `docs/bench/results.md` to
-  the list.
+  latency) is next. Add the 2b-3 spec, plan, `docs/bench/results.md` and
+  `docs/bench/mantaflow-notes.md` to the list.
+- `CLAUDE.md`'s "Deviations from the spec worth knowing": `vdb-rs` 0.6.0
+  misreads vector grids, so the workspace vendors a patched copy in
+  `vendor/vdb-rs/` (see `PATCHED.md`); it is a dev-dependency only.
 - The 2b-3 spec's status line: "Complete."
 - Piece 2 spec §6: a dated line under risk (k) if Task 2 did not already
   close it, and a pointer to the results.
