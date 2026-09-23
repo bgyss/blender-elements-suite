@@ -18,7 +18,9 @@ pressure projection and scalar advection; `ember.sphere_emitter`; the
 still-domain, divergence-free, buoyant-blob and determinism validation scenes;
 the 128³ speed gate and its recorded decision.
 
-**2b — after the gate (designed later, with the gate's numbers):** vorticity
+**2b — after the gate:** split into three cycles (user decision, 2026-09-22):
+2b-1 solver correctness (`2026-09-22-ember-solver-2b1-design.md`), 2b-2 scene
+content, 2b-3 the Mantaflow benchmark. The original list: vorticity
 confinement, dissipation, flame, box and noise-modulated emitters, sphere and
 box colliders, animatable transforms, CFL substepping, quality presets, the
 collider validation scene, per-face boundary settings, and the Mantaflow
