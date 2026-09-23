@@ -4,7 +4,7 @@ use common::*;
 use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache};
 use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
-    Timeline, TimelineConfig, Value,
+    StateStore, Time, Timeline, TimelineConfig, Value,
 };
 use elements_ember::kernels::StepConstants;
 use elements_ember::solver::{KIND, SolverState, Sources, substep};
@@ -404,4 +404,101 @@ fn one_frame_adds_each_emitted_quantity_to_its_own_output() {
             "{what}: solver holds {got}, emitted {want}"
         );
     }
+}
+
+/// Reads all three solver outputs and passes density on.
+struct Sink;
+
+impl Node for Sink {
+    fn kind(&self) -> &'static str {
+        "test.sink"
+    }
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![
+                SocketType::Field,
+                SocketType::Field,
+                SocketType::VectorField,
+            ],
+            outputs: vec![SocketType::Field],
+        }
+    }
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        Ok(vec![ctx.take_input(0)?])
+    }
+}
+
+/// Pool acquisitions over one frame, with either every solver output read
+/// or only density.
+fn acquisitions_for_one_frame(read_all: bool) -> u64 {
+    let registry = elements_ember::registry();
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(
+        registry
+            .build(
+                "ember.sphere_emitter",
+                &serde_json::json!({ "center": [1.0, 1.0, 0.4], "radius": 0.3 }),
+            )
+            .unwrap(),
+    );
+    let solver = graph.add_node(
+        registry
+            .build(KIND, &serde_json::json!({ "pressure_iterations": 4 }))
+            .unwrap(),
+    );
+    let output = graph.add_node(
+        registry
+            .build("core.output", &serde_json::json!({}))
+            .unwrap(),
+    );
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    graph
+        .connect(socket(emitter, 0), socket(solver, 0))
+        .unwrap();
+    graph
+        .connect(socket(emitter, 1), socket(solver, 1))
+        .unwrap();
+    if read_all {
+        let sink = graph.add_node(Box::new(Sink));
+        for index in 0..3 {
+            graph
+                .connect(socket(solver, index), socket(sink, index))
+                .unwrap();
+        }
+        graph.connect(socket(sink, 0), socket(output, 0)).unwrap();
+    } else {
+        graph.connect(socket(solver, 0), socket(output, 0)).unwrap();
+    }
+    graph.set_output(output);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut state = StateStore::new();
+    let evaluated = graph
+        .eval_frame(
+            &gpu,
+            &mut pool,
+            &mut pipelines,
+            &mut state,
+            Time::at(1, 1, 24.0),
+            FieldDims::new(8, 6, 5),
+        )
+        .unwrap();
+    evaluated.value.release_to(&mut pool);
+    state.clear(&mut pool);
+    pool.acquisitions()
+}
+
+/// Risk (h): outputs nobody reads are never copied. Temperature is one
+/// field and velocity three faces, so reading only density saves four.
+#[test]
+fn outputs_nobody_reads_are_never_copied() {
+    let all = acquisitions_for_one_frame(true);
+    let density_only = acquisitions_for_one_frame(false);
+    assert_eq!(
+        all - density_only,
+        4,
+        "all {all}, density only {density_only}"
+    );
 }

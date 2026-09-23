@@ -95,6 +95,15 @@ impl NodeError {
     }
 }
 
+/// The one rule for whether an output socket is used this evaluation.
+pub(crate) fn is_wanted(
+    result: SocketId,
+    remaining: &HashMap<SocketId, u32>,
+    socket: SocketId,
+) -> bool {
+    socket == result || remaining.get(&socket).copied().unwrap_or(0) > 0
+}
+
 /// Counters describing one evaluation, for tests and profiling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvalStats {
@@ -204,6 +213,8 @@ pub struct EvalCtx<'a> {
     pub(crate) produced: &'a mut HashMap<SocketId, Value>,
     /// Input uses of each produced value that have not finished yet.
     pub(crate) remaining: &'a mut HashMap<SocketId, u32>,
+    /// The graph's result socket, which is wanted even though no node reads it.
+    pub(crate) result: SocketId,
     pub(crate) stats: &'a mut EvalStats,
     /// Persistent state. Only a node whose `stateful()` is true may touch it.
     pub(crate) state: &'a mut StateStore,
@@ -223,6 +234,23 @@ impl EvalCtx<'_> {
 
     pub fn node_id(&self) -> NodeId {
         self.node
+    }
+
+    /// Whether output `index` of this node will be used: it is the graph's
+    /// result, or a node still to run reads it.
+    ///
+    /// A node may skip computing an unwanted output and put any cheap value,
+    /// such as `Value::Scalar(0.0)`, in its slot. The evaluator releases
+    /// unwanted outputs without passing them to any node, so none can see it.
+    pub fn output_wanted(&self, index: u32) -> bool {
+        is_wanted(
+            self.result,
+            self.remaining,
+            SocketId {
+                node: self.node,
+                index,
+            },
+        )
     }
 
     /// Borrow input `index`.

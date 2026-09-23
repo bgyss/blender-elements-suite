@@ -14,6 +14,8 @@ pub struct FieldPool {
     /// Counts fresh GPU allocations. Stamped onto `Field::generation` so tests
     /// can prove a reused field is the same texture, not a lookalike fresh one.
     next_generation: u64,
+    /// Counts successful `acquire` calls, whether reused or freshly allocated.
+    acquisitions: u64,
 }
 
 impl FieldPool {
@@ -41,13 +43,14 @@ impl FieldPool {
         if let Some(bucket) = self.free.get_mut(&(dims, format))
             && let Some(field) = bucket.pop()
         {
+            self.acquisitions += 1;
             return Ok(field);
         }
 
         let generation = self.next_generation;
         self.next_generation += 1;
 
-        ctx.scoped(|| {
+        let field = ctx.scoped(|| {
             let texture = ctx.device().create_texture(&wgpu::TextureDescriptor {
                 label: Some("elements-field"),
                 size: dims.extent(),
@@ -69,7 +72,15 @@ impl FieldPool {
                 format,
                 generation,
             }
-        })
+        })?;
+        self.acquisitions += 1;
+        Ok(field)
+    }
+
+    /// Successful `acquire` calls, whether they reused a texture or created
+    /// one. Every other acquiring method goes through `acquire`.
+    pub fn acquisitions(&self) -> u64 {
+        self.acquisitions
     }
 
     /// Take an `R32Float` field of these dims and fill it with zeros.

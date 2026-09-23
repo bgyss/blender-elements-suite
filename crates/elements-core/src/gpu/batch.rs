@@ -38,14 +38,29 @@ impl ComputeBatch {
         bind_group: &wgpu::BindGroup,
         dims: FieldDims,
     ) {
-        self.dispatches.push(Dispatch {
-            pipeline: pipeline.clone(),
-            bind_group: bind_group.clone(),
-            workgroups: [
+        self.dispatch_workgroups(
+            pipeline,
+            bind_group,
+            [
                 dims.x.div_ceil(WORKGROUP),
                 dims.y.div_ceil(WORKGROUP),
                 dims.z.div_ceil(WORKGROUP),
             ],
+        );
+    }
+
+    /// Record a dispatch of exactly `workgroups`, for kernels that do not
+    /// run one invocation per voxel, such as a reduction.
+    pub fn dispatch_workgroups(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups: [u32; 3],
+    ) {
+        self.dispatches.push(Dispatch {
+            pipeline: pipeline.clone(),
+            bind_group: bind_group.clone(),
+            workgroups,
         });
     }
 

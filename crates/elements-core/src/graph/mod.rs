@@ -363,6 +363,7 @@ impl Graph {
                 taken: vec![false; sources.len()],
                 produced: &mut run.produced,
                 remaining: &mut run.remaining,
+                result: result_socket,
                 stats: &mut run.stats,
                 state: &mut *run.state,
                 stateful: node.stateful(),
@@ -387,8 +388,7 @@ impl Graph {
                     node: id,
                     index: index as u32,
                 };
-                let wanted =
-                    socket == result_socket || run.remaining.get(&socket).copied().unwrap_or(0) > 0;
+                let wanted = node::is_wanted(result_socket, &run.remaining, socket);
                 if wanted {
                     run.produced.insert(socket, value);
                 } else {

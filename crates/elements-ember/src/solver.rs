@@ -399,30 +399,10 @@ impl SmokeSolver {
         ctx.release(temperature_source);
         stepped?;
 
-        // The outputs are copies: the state stays in the store for the next frame.
-        ctx.with_gpu_pool(|gpu, _, pool| {
-            let density = pool.duplicate(gpu, &state.density)?;
-            let temperature = match pool.duplicate(gpu, &state.temperature) {
-                Ok(field) => field,
-                Err(e) => {
-                    pool.release(density);
-                    return Err(e);
-                }
-            };
-            let velocity = match duplicate_velocity(gpu, pool, &state.velocity) {
-                Ok(velocity) => velocity,
-                Err(e) => {
-                    pool.release(density);
-                    pool.release(temperature);
-                    return Err(e);
-                }
-            };
-            Ok(vec![
-                Value::Field(density),
-                Value::Field(temperature),
-                Value::VectorField(velocity),
-            ])
-        })
+        // The outputs are copies: the state stays in the store for the next
+        // frame. Outputs nobody reads are not copied at all.
+        let wanted: [bool; 3] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
+        ctx.with_gpu_pool(|gpu, _, pool| copy_outputs(gpu, pool, state, wanted))
     }
 
     fn step<'a>(
@@ -545,6 +525,39 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
         &[params.buoyancy_density, params.buoyancy_temperature],
     )?;
     Ok(Box::new(SmokeSolver { params }))
+}
+
+/// Pooled copies of the wanted outputs, in socket order, with a
+/// `Value::Scalar(0.0)` placeholder in each unwanted slot (see
+/// `EvalCtx::output_wanted`). On failure, copies already made go back.
+fn copy_outputs(
+    gpu: &GpuContext,
+    pool: &mut FieldPool,
+    state: &SolverState,
+    wanted: [bool; 3],
+) -> Result<Vec<Value>, GpuError> {
+    let mut outputs: Vec<Value> = Vec::with_capacity(3);
+    for (index, wanted) in wanted.into_iter().enumerate() {
+        let copied = if !wanted {
+            Ok(Value::Scalar(0.0))
+        } else {
+            match index {
+                0 => pool.duplicate(gpu, &state.density).map(Value::Field),
+                1 => pool.duplicate(gpu, &state.temperature).map(Value::Field),
+                _ => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
+            }
+        };
+        match copied {
+            Ok(value) => outputs.push(value),
+            Err(e) => {
+                for value in outputs {
+                    value.release_to(pool);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(outputs)
 }
 
 /// A pooled copy of all three faces. On failure, faces already copied go back to the pool.
