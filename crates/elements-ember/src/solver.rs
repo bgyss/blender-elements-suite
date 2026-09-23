@@ -1,7 +1,7 @@
 //! `ember.smoke_solver`: a dense-grid smoke solver (spec §2.4, §3).
 //!
-//! Per substep: emit, buoyancy, advect velocity, project, and advect scalars
-//! with dissipation. Vorticity confinement arrives in the next task.
+//! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
+//! project, and advect scalars with dissipation.
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError,
@@ -45,6 +45,8 @@ pub struct SolverParams {
     pub density_dissipation: f32,
     /// Exponential decay of temperature, 1/s.
     pub temperature_dissipation: f32,
+    /// Vorticity confinement ε, 1/s; 0 turns it off (spec §4.4).
+    pub vorticity: f32,
 }
 
 impl Default for SolverParams {
@@ -61,6 +63,7 @@ impl Default for SolverParams {
             advection: Advection::MacCormack,
             density_dissipation: 0.0,
             temperature_dissipation: 0.0,
+            vorticity: 0.0,
         }
     }
 }
@@ -76,6 +79,7 @@ impl SolverParams {
             advection: self.advection,
             density_dissipation: self.density_dissipation,
             temperature_dissipation: self.temperature_dissipation,
+            vorticity: self.vorticity,
             ..StepConstants::new(cells, h, dx)
         }
     }
@@ -160,6 +164,7 @@ pub struct Substep {
     batch: ComputeBatch,
     retired: Vec<Field>,
     advection: Advection,
+    vorticity: bool,
 }
 
 impl Substep {
@@ -169,10 +174,11 @@ impl Substep {
             batch: ComputeBatch::new(),
             retired: Vec::new(),
             advection: constants.advection,
+            vorticity: constants.vorticity > 0.0,
         })
     }
 
-    /// Stages 1–3: emit, buoyancy, advect velocity.
+    /// Stages 1–3: emit, buoyancy, vorticity confinement, advect velocity.
     pub fn pre_projection(
         &mut self,
         gpu: &GpuContext,
@@ -207,6 +213,9 @@ impl Substep {
             &state.density,
             &state.temperature,
         )?;
+        if self.vorticity {
+            self.confine_vorticity(gpu, cache, pool, state)?;
+        }
         let cells = self.uniforms.cells();
         let mut faces = Vec::with_capacity(3);
         for axis in Axis::ALL {
@@ -233,6 +242,35 @@ impl Substep {
         let old = std::mem::replace(&mut state.velocity, advected);
         self.retired.extend(old.into_faces());
         Ok(())
+    }
+
+    /// Vorticity confinement onto the velocity, through four pooled scratch
+    /// fields for ω and |ω|.
+    fn confine_vorticity(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        state: &SolverState,
+    ) -> Result<(), GpuError> {
+        let cells = self.uniforms.cells();
+        let mut omega = Vec::with_capacity(4);
+        for _ in 0..4 {
+            match pool.acquire(gpu, cells, FieldFormat::R32Float) {
+                Ok(field) => omega.push(field),
+                Err(e) => {
+                    self.retired.extend(omega);
+                    return Err(e);
+                }
+            }
+        }
+        let refs = [&omega[0], &omega[1], &omega[2], &omega[3]];
+        let u = &self.uniforms;
+        let recorded = kernels::curl(gpu, cache, &mut self.batch, u, &state.velocity, refs)
+            .and_then(|()| kernels::confine(gpu, cache, &mut self.batch, u, &state.velocity, refs));
+        // The batch may reference them whether or not recording finished.
+        self.retired.extend(omega);
+        recorded
     }
 
     /// Stage 4: make the velocity divergence-free, warm-starting from `state.pressure`.
@@ -667,11 +705,21 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
     )?;
     params::finite(
         KIND,
-        "dissipation",
-        &[params.density_dissipation, params.temperature_dissipation],
+        "vorticity and dissipation",
+        &[
+            params.vorticity,
+            params.density_dissipation,
+            params.temperature_dissipation,
+        ],
     )?;
-    if params.density_dissipation < 0.0 || params.temperature_dissipation < 0.0 {
-        return Err(params::bad(KIND, "dissipation rates must be at least 0"));
+    if params.vorticity < 0.0
+        || params.density_dissipation < 0.0
+        || params.temperature_dissipation < 0.0
+    {
+        return Err(params::bad(
+            KIND,
+            "vorticity and dissipation rates must be at least 0",
+        ));
     }
     Ok(Box::new(SmokeSolver { params }))
 }

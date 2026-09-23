@@ -375,6 +375,55 @@ pub fn cpu_max_divergence(faces: &[Vec<f32>; 3], cells: FieldDims, dx: f32) -> f
     worst
 }
 
+/// Mirrors `centre_velocity` in `curl.wgsl`: face velocities averaged to
+/// the centre of cell `c`, with `c` clamped into the domain.
+pub fn centre_velocity(faces: &[Vec<f32>; 3], cells: FieldDims, c: [i32; 3]) -> [f32; 3] {
+    let n = [cells.x as i32, cells.y as i32, cells.z as i32];
+    let q: [u32; 3] = std::array::from_fn(|a| c[a].clamp(0, n[a] - 1) as u32);
+    std::array::from_fn(|a| {
+        let d = face_dims(cells, a);
+        let mut hi = q;
+        hi[a] += 1;
+        0.5 * (faces[a][index(d, q[0], q[1], q[2])] + faces[a][index(d, hi[0], hi[1], hi[2])])
+    })
+}
+
+/// Mirrors `curl.wgsl`: ωx, ωy, ωz and |ω| per cell.
+pub fn cpu_curl(faces: &[Vec<f32>; 3], cells: FieldDims, inv_dx: f32) -> [Vec<f32>; 4] {
+    let mut out: [Vec<f32>; 4] = std::array::from_fn(|_| vec![0.0; cells.voxel_count()]);
+    for k in 0..cells.z {
+        for j in 0..cells.y {
+            for i in 0..cells.x {
+                let c = [i as i32, j as i32, k as i32];
+                let diff = |a: usize| {
+                    let mut p = c;
+                    p[a] += 1;
+                    let mut m = c;
+                    m[a] -= 1;
+                    let (vp, vm) = (
+                        centre_velocity(faces, cells, p),
+                        centre_velocity(faces, cells, m),
+                    );
+                    [vp[0] - vm[0], vp[1] - vm[1], vp[2] - vm[2]]
+                };
+                let (ddx, ddy, ddz) = (diff(0), diff(1), diff(2));
+                let s = 0.5 * inv_dx;
+                let w = [
+                    s * (ddy[2] - ddz[1]),
+                    s * (ddz[0] - ddx[2]),
+                    s * (ddx[1] - ddy[0]),
+                ];
+                let at = index(cells, i, j, k);
+                out[0][at] = w[0];
+                out[1][at] = w[1];
+                out[2][at] = w[2];
+                out[3][at] = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+            }
+        }
+    }
+    out
+}
+
 /// `velocity_pattern` with every solid-wall face set to zero, as advection leaves it.
 pub fn walled_velocity_pattern(cells: FieldDims) -> [Vec<f32>; 3] {
     let mut faces = velocity_pattern(cells);

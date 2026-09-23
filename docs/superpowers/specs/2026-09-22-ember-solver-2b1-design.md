@@ -247,7 +247,7 @@ compare GPU output with a CPU reference, to about 1e-5.
 | Closed domain | from a warm start offset by 3, p's mean is ≈ 0 after the solve; a closed 16³ plume meets 2a's divergence-ratio rule | skip the mean removal |
 | Stored `p` | when `n` changes from 1 to 3 mid-run, the divergence ratio stays within 10% of a run at a constant 3 | store `h·p` again |
 | Split submissions | forcing K = 1 is bit-identical to one submission | drop the dispatch recorded just before each flush |
-| Vorticity | `curl` and `confine` match the CPU; ε = 0 is bit-identical to skipping the stage | flip the cross product |
+| Vorticity | `curl` and `confine` match the CPU; confinement strengthens a 16³ plume's total |ω| by at least 5% | flip the cross product |
 | `output_wanted` | with only density consumed, pool acquisitions fall by the unwanted copies | always return true |
 | Params | `cfl` 0, `max_substeps` 17, `substeps` together with `max_substeps`, a negative rate and an unknown preset are each a `DocError` | drop the `cfl` bound |
 

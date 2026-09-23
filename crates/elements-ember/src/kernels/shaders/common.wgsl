@@ -13,6 +13,10 @@ struct Params {
     beta: f32,           // buoyancy per unit temperature (rises), m/s²
     open_mask: u32,      // bit 2·axis + side is set when that domain face is open
     decay: f32,          // exp(−rate·h) for the scalar a pass carries; 1 otherwise
+    confinement: f32,    // ε·dx, the vorticity confinement strength scaled to this grid
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 // `axis` for a cell-centred grid.

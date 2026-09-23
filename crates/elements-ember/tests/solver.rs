@@ -30,7 +30,9 @@ fn rejects_out_of_range_solver_parameters() {
         serde_json::json!({ "buoyancy_temperature": 1e39 })
     ));
     assert!(rejected(serde_json::json!({ "buoyancy_density": 1e39 })));
-    assert!(rejected(serde_json::json!({ "vorticity": 1.0 })));
+    assert!(!rejected(serde_json::json!({ "vorticity": 1.0 })));
+    assert!(rejected(serde_json::json!({ "vorticity": -1.0 })));
+    assert!(rejected(serde_json::json!({ "vorticity": 1e39 })));
     assert!(!rejected(
         serde_json::json!({ "boundaries": { "-x": "open", "+z": "wall" } })
     ));

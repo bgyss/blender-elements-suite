@@ -8,6 +8,7 @@
 mod advect;
 mod forces;
 mod project;
+mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
 pub use forces::{buoyancy, emit};
@@ -15,6 +16,7 @@ pub use project::{
     CELL_SWEEPS_PER_SUBMIT, divergence, iterations_per_submit, pressure, remove_mean,
     solve_pressure, subtract_gradient,
 };
+pub use vorticity::{confine, curl};
 
 use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError};
 use wgpu::util::DeviceExt;
@@ -42,11 +44,13 @@ pub struct StepConstants {
     pub density_dissipation: f32,
     /// Exponential decay rate of temperature, 1/s.
     pub temperature_dissipation: f32,
+    /// Vorticity confinement strength ε, 1/s; 0 skips the stage (spec §4.4).
+    pub vorticity: f32,
 }
 
 impl StepConstants {
-    /// No buoyancy, no dissipation, MacCormack advection and 2a's boundaries.
-    /// Build variations with
+    /// No buoyancy, no dissipation, no vorticity confinement, MacCormack
+    /// advection and 2a's boundaries. Build variations with
     /// `StepConstants { beta: 1.0, ..StepConstants::new(cells, h, dx) }`, so
     /// fields added later get their defaults here instead of breaking callers.
     pub fn new(cells: FieldDims, h: f32, dx: f32) -> Self {
@@ -60,11 +64,12 @@ impl StepConstants {
             advection: Advection::MacCormack,
             density_dissipation: 0.0,
             temperature_dissipation: 0.0,
+            vorticity: 0.0,
         }
     }
 }
 
-/// Matches `Params` in `common.wgsl`, 48 bytes.
+/// Matches `Params` in `common.wgsl`, 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct KernelParams {
@@ -78,6 +83,8 @@ struct KernelParams {
     beta: f32,
     open_mask: u32,
     decay: f32,
+    confinement: f32,
+    _pad: [u32; 3],
 }
 
 pub(crate) fn axis_index(axis: Axis) -> u32 {
@@ -114,6 +121,8 @@ impl Uniforms {
                 beta: c.beta,
                 open_mask: c.open_mask,
                 decay,
+                confinement: c.vorticity * c.dx,
+                _pad: [0; 3],
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {

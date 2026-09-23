@@ -226,3 +226,54 @@ fn the_warm_start_survives_a_change_of_substep_length() {
     let switched = after.rms / before.rms;
     assert!(switched <= GATE_RATIO, "switched {switched}");
 }
+
+/// Spec §4.4: confinement strengthens a plume's vorticity. Twenty frames of
+/// the 16³ plume with ε = 4 end with clearly more total |ω| than with ε = 0.
+#[test]
+fn confinement_strengthens_a_plumes_vorticity() {
+    fn total_vorticity(vorticity: f32) -> f64 {
+        let gpu = gpu();
+        let mut pool = FieldPool::new();
+        let mut cache = PipelineCache::new();
+        let cells = FieldDims::new(16, 16, 16);
+        let dx = 2.0 / 16.0;
+        let density_source = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+        let temperature_source = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+        let sphere = Sphere {
+            center: [1.0, 1.0, 0.4],
+            radius: 0.3,
+            density_rate: 1.0,
+            temperature_rate: 2.0,
+        };
+        fill_sphere(
+            &gpu,
+            &mut cache,
+            &density_source,
+            &temperature_source,
+            &sphere,
+            dx,
+        )
+        .unwrap();
+        let sources = Sources {
+            density: &density_source,
+            temperature: &temperature_source,
+        };
+        let constants = StepConstants {
+            beta: 1.0,
+            vorticity,
+            ..StepConstants::new(cells, 1.0 / 24.0, dx)
+        };
+        let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+        for _ in 0..20 {
+            substep(
+                &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 160,
+            )
+            .unwrap();
+        }
+        let omega = cpu_curl(&state.read_velocity(&gpu).unwrap(), cells, 1.0 / dx);
+        omega[3].iter().map(|&v| f64::from(v)).sum()
+    }
+    let without = total_vorticity(0.0);
+    let with = total_vorticity(4.0);
+    assert!(with >= 1.05 * without, "with {with}, without {without}");
+}
