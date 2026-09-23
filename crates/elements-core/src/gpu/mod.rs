@@ -155,9 +155,10 @@ impl GpuContext {
     /// already submitted to the GPU: `Queue::submit` returns before the
     /// hardware runs the work, so faults that only manifest during execution
     /// may surface after `scoped` returns `Ok`, and may be misattributed to a
-    /// later `scoped` block. Call sites that must ensure submitted work
-    /// succeeded should wait for completion through [`GpuContext::wait`]
-    /// before trusting an `Ok`.
+    /// later `scoped` block. [`GpuContext::wait`] blocks until submitted work
+    /// has finished and reports a lost device, but it cannot report other
+    /// device-timeline faults either, so an `Ok` never proves the GPU ran the
+    /// work correctly.
     ///
     /// An error raised outside any scope does not panic: the device's
     /// uncaptured-error handler holds the most severe one, and the next

@@ -373,7 +373,7 @@ addresses.
   dispatches. At 256³–512³ with offline iteration counts that can run for
   seconds and trip GPU watchdogs, which surface as `DeviceLost`. Split
   submissions every K iterations on large grids.
-- **(g) Resolved, partly open (37c01a9 and the hardening fix pass).**
+- **(g) Resolved, partly open (37c01a9 and 02ee266).**
   `GpuContext::scoped` now pushes OutOfMemory, Internal and Validation scopes,
   so an out-of-memory error from texture creation is reported as
   `GpuError::OutOfMemory`, not panicked through wgpu's default handler. An
