@@ -57,6 +57,13 @@ pub struct Key {
     pub rotate: Option<Rotate>,
 }
 
+/// A keyframed rigid transform (spec §2.1): translation interpolates
+/// linearly between keys, and rotation by slerp.
+///
+/// Rotation between consecutive keys takes the shorter arc, so each key's
+/// orientation must be less than 180° from the previous one's. A full spin
+/// therefore needs at least three keys; two keys 360° apart are the same
+/// orientation and do not rotate at all.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transform {
@@ -189,7 +196,11 @@ impl Transform {
     /// The pose at `frame` (it may be fractional). Velocities are per second,
     /// with `seconds_per_frame` converting the key spacing. Before the first
     /// key and from the last key on, the transform holds with zero velocity.
-    /// Validate first; this assumes at least one key in increasing order.
+    /// Between keys, rotation takes the shorter arc (see [`Transform`]).
+    ///
+    /// Requires a transform that passed [`Transform::validate`]: it indexes
+    /// `keys[0]`, so it panics on an empty key list, and its `expect` on the
+    /// bracketing key segment assumes frames in strictly increasing order.
     pub fn pose(&self, frame: f64, seconds_per_frame: f64) -> Pose {
         let hold = |k: &Key| Pose {
             rotation: q_axis_angle(k.rotate),

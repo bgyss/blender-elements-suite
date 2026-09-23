@@ -15,14 +15,15 @@ The suite is being built product by product. **Core v1** is merged. **Ember**
 persistent state, a timeline with a frame cache, staggered vector fields, and
 multi-consumer graph outputs. Piece 2 is split at a speed gate. **2a** is
 complete: the `elements-ember` crate, a GPU smoke solver that passed the 128³
-gate at 34 ms a step with 160 pressure iterations. **2b** is split into three
-cycles. **2b-1**, solver correctness, is complete: CFL substeps, RK2 +
-MacCormack advection, vorticity confinement, dissipation, per-face boundaries,
-and the `preview` and `final` presets (`docs/bench/presets.md`). Preview runs
-one CFL-clamped substep at about 92 ms a 128³ frame; why that is so far above
-2a's 34 ms is open risk (j) in §6 of the piece 2 spec. **2b-2**, scene content,
-is complete: keyframed box and sphere emitters (with noise and velocity
-emission) and colliders, unions of each, and wind
+gate at 34 ms a step with 160 pressure iterations. **2b** is split into cycles:
+three for the solver and its benchmark, then flame. **2b-1**, solver
+correctness, is complete: CFL substeps, RK2 + MacCormack advection, vorticity
+confinement, dissipation, per-face boundaries, and the `preview` and `final`
+presets (`docs/bench/presets.md`). Preview runs one CFL-clamped substep at about
+92 ms a 128³ frame; why that is so far above 2a's 34 ms is open risk (j) in §6
+of the piece 2 spec. **2b-2**, scene content, is complete: keyframed box and
+sphere emitters (with noise and velocity emission) and colliders, unions of
+each, and wind
 (`docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`).
 **2b-3**, the Mantaflow benchmark, is next. Flame is its own later cycle, 2b-4.
 

@@ -46,6 +46,8 @@ Emitters and colliders share both.
   "rotate": {"axis": [x, y, z], "degrees": d}}, …]}`.
   - Keys are in strictly increasing frame order.
   - Translation interpolates linearly between keys, and rotation by slerp.
+  - Rotation between consecutive keys takes the shorter arc, so keys must be
+    less than 180° apart; a full spin needs at least three keys.
   - Before the first key and after the last, the transform holds.
   - One key makes a static object.
   - `translate` defaults to zero and `rotate` to none.
@@ -91,7 +93,11 @@ in [0, 1]:
 - It uses core's integer hash, with no transcendental functions, so it is
   deterministic across backends.
 - `seed` is a `u64`, as every stochastic node's is.
-- `amplitude` is in [0, 1], and `scale_m` must be above zero.
+- `amplitude` is in [0, 1].
+- `scale_m` is at least 1e-4 m. Smaller scales pack many noise cells into a
+  voxel, and `x / scale_m` overflows f32 at scales like 1e-40.
+- `|evolution|` is at most 1e4 per second. Beyond that, `evolution · t`
+  grows so fast that f32 cannot resolve one frame from the next.
 
 `ember.sphere_emitter` stays unchanged, so existing documents and the `plume`
 scene keep loading.
@@ -142,14 +148,21 @@ before.
 when a collider is connected. A `solidify` kernel writes a scratch cell field
 that is 1 where the SDF at the cell centre is below zero and 0 elsewhere. It
 is never stored in state; it is rebuilt from the document's time every frame,
-so scrubbing stays deterministic. It stays fixed across the frame's substeps,
-which is first-order but acceptable, because CFL limits a collider to about
-a cell per substep.
+so scrubbing stays deterministic. The mask is fixed for the whole frame: every
+substep sees the collider where it is at the frame's time, which is
+first-order. CFL does not bound how far a collider moves in that time. The
+measurement reads only the state velocity; that includes last frame's
+obstacle velocity on solid faces, but not a collider that is just starting to
+move. The `preview` preset also caps a frame at one substep, so a fast
+collider can move several cells between masks.
 
 **Where it applies.** Every place 2b-1 spec §4.2 lists:
 
-- **Face wall test.** `is_wall(axis, i)` becomes the domain-boundary wall OR
-  either adjacent cell solid.
+- **Face wall test.** `is_wall(axis, i)` is unchanged and still means the
+  domain-boundary wall. A second test, `face_solid(axis, p)` in `solid.wgsl`,
+  is true when either cell beside the face is solid. Kernels that treat a
+  face as blocked check `is_wall(…) || face_solid(…)`, but a solid face is
+  not a wall: it carries the obstacle's velocity, as the next bullet says.
 - **Solid faces carry the obstacle's velocity.**
   - Advection, the MacCormack correction and the gradient stage write the
     collider's velocity component along the face's axis at solid faces,
@@ -207,7 +220,8 @@ come later if a scene needs one.
   - keys in strictly increasing frame order, and at least one key;
   - a nonzero rotation axis;
   - every number finite;
-  - noise `amplitude` in [0, 1] and `scale_m` above zero;
+  - noise `amplitude` in [0, 1], `scale_m` at least 1e-4 m and
+    `|evolution|` at most 1e4 per second;
   - `velocity_blend` at least 0.
 - **At runtime:** a mismatched socket pair is a `NodeError`, and the pool
   rules of 2a and 2b-1 hold. The solid mask is a scratch field retired like
