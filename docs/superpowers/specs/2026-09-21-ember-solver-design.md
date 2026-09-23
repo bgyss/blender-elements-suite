@@ -466,3 +466,28 @@ part of (g), and (j).
     substeps also need MacCormack to get cheaper, for example by storing the
     backtrace point instead of recomputing it and unrolling the corner loops.
     Semi-Lagrangian at 2 substeps takes 107 ms today, over the budget.
+
+  **Root causes, 2026-09-23 (branch `pressure-kernel`).** Two separate causes
+  slow the pressure solve. The first is fixed; the second is not.
+
+  1. **Fixed in 5536e87: the axis loop in `pressure.wgsl`.** The per-iteration
+     cost was bisected commit by commit (exported trees, each rebuilt). It is
+     0.19 ms through 23e8d6e and 0.27 ms from 45a8e1f, the commit that turned
+     the six neighbour checks into a loop over axes. Timed alone at 128³, the
+     looped kernel runs at 0.279 ms per iteration, the same stencil written
+     out per side at 0.198, and 2a's kernel at 0.208, whatever the data. The
+     per-cell division and the open-face checks cost nothing measurable.
+  2. **Open: recycled textures in the MacCormack scene.** Inside a MacCormack
+     substep the same solve runs at about 0.30 ms per iteration, against 0.195
+     with semi-Lagrangian. That is roughly 17 ms of a preview frame at N = 160.
+     - **What it is not:** the values, since the scene's exact values copied
+       into fresh textures run at 0.195; subnormal or non-finite values, of
+       which there are none; or the shared submission, since flushing before
+       the solve changes nothing.
+     - **What it looks like:** it follows which pool-recycled textures hold p
+       and div. Every one of 56 pairings of freshly allocated textures is fast,
+       and rewriting a slow texture from the CPU sometimes makes it fast.
+     - **Likely source:** Metal or driver state of recycled textures, such as
+       compression or residency, rather than the kernel.
+     - **Next steps:** try dedicated, never-recycled textures for p and div;
+       take a Metal GPU capture with Instruments counters.
