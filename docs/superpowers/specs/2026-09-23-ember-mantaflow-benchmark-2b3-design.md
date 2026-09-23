@@ -143,16 +143,22 @@ The domain top is open in both solvers (Ember's default boundaries: closed
 sides and floor, open top), so density leaves the domain during frames
 61–120.
 
-- **Outflow per frame:** Σ over the z-faces one cell below the top, index
-  nz − 1 (between cells nz − 2 and nz − 1), of ρ · max(w, 0) · dA, where ρ is
-  the density of cell nz − 2 and w the face velocity. The top face itself is
-  not used, because Mantaflow's cache does not store it; the cell layer above
-  the measuring plane is one voxel thick.
+- **Measuring plane.** The z-faces at index nz − 2, between cell layers
+  nz − 3 and nz − 2. Mantaflow resets its open top layer (nz − 1) to zero
+  density every step (`resetOutflow`), so its cache never stores that layer's
+  faces; layer nz − 2 is the highest it stores. *Corrected after Task 3's
+  review: an earlier revision used index nz − 1, which Mantaflow never
+  stores.*
+- **Control volume:** cell layers 0 … nz − 3, below the plane. Its mass,
+  M_below, is reported beside the total mass.
+- **Outflow per frame:** Σ over the plane's faces of ρ_up · w · dA, the net
+  upwind flux: ρ_up is the density of the cell below the face when w > 0 and
+  of the cell above it when w < 0.
 - **Cumulative outflow:** those per-frame fluxes integrated over frame time
   with the trapezoid rule. This is an estimate at frame resolution, not
   substep resolution, and the table says so.
-- **Drift at frame n:** (M(n) + outflow(60→n)) − M(60), reported absolutely
-  and relative to M(60).
+- **Drift at frame n:** (M_below(n) + outflow(60→n)) − M_below(60), reported
+  absolutely and relative to M_below(60).
 
 Both solvers are measured by this same estimator.
 

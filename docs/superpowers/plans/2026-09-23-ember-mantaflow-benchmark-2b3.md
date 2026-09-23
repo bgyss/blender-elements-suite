@@ -746,19 +746,22 @@ pub struct FrameMetrics {
     pub measured_cells: u64,
     /// Σ ρ dV over every cell, density × m³.
     pub mass: f64,
+    /// Σ ρ dV over cell layers 0 … nz − 3, below the outflow plane (spec §4.3).
+    pub mass_below: f64,
     /// Density-weighted mean height, metres.
     pub centroid_m: Option<f64>,
     /// Height below which 95% of the above-threshold density lies, metres.
     pub top_m: Option<f64>,
-    /// Upward flux of density one cell below the domain top, density × m³ / s.
+    /// Net upwind flux of density through the z-faces at index nz − 2,
+    /// density × m³ / s; positive leaves the control volume.
     pub outflow_rate: f64,
 }
 
 pub fn cell_centred(faces: &[Vec<f32>; 3], cells: FieldDims) -> [Vec<f32>; 3];
 pub fn measure(sample: &Sample<'_>) -> FrameMetrics;
 /// Drift at every frame index from `from` (0-based into the series):
-/// (M(n) + outflow integrated from `from` to n) − M(from). Entries before
-/// `from` are 0.
+/// (M(n) + outflow integrated from `from` to n) − M(from), where M is
+/// `mass_below`. Entries before `from` are 0.
 pub fn drift(mass: &[f64], outflow_rate: &[f64], frame_seconds: f64, from: usize) -> Vec<f64>;
 ```
 
@@ -777,10 +780,13 @@ Definitions (spec §4):
 - **Plume top:** among cells with ρ ≥ 0.01 · max ρ, sort by height
   (k + 0.5) · dx, and return the smallest height at which the cumulative
   density reaches 95% of their total. `None` when max ρ ≤ 0.
-- **Outflow rate:** Σ over (i, j) of ρ(i, j, nz − 2) · max(w, 0) · dx², where
-  w is the z-face value at index nz − 1 (the face between cells nz − 2 and
-  nz − 1). Mantaflow's cache has no top face (index nz), so neither solver's
-  is used.
+- **Outflow plane and control volume (spec §4.3, corrected):** the z-faces
+  at index nz − 2, between layers nz − 3 and nz − 2. Mantaflow zeroes its
+  open top layer (nz − 1) every step, so its cache never stores faces above
+  that. `mass_below` sums layers 0 … nz − 3.
+- **Outflow rate:** Σ over (i, j) of ρ_up · w · dx², where w is the z-face
+  value at index nz − 2, and ρ_up is the density of cell (i, j, nz − 3) when
+  w > 0 and of cell (i, j, nz − 2) when w < 0 (net upwind flux).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -944,17 +950,34 @@ fn cells_below_one_percent_of_the_peak_do_not_move_the_top() {
     assert!((m.top_m.unwrap() - 2.5 * DX).abs() < 1e-9, "{m:?}");
 }
 
-/// Outflow is measured on the z-faces at index N − 1 with the density of
-/// layer N − 2, and only upward flow counts.
+/// Outflow is the net upwind flux through the z-faces at index N − 2:
+/// upward flow carries the density below the plane out, downward flow
+/// carries the density above it back in, and layer N − 1 is ignored.
 #[test]
-fn only_upward_flow_one_cell_below_the_top_counts_as_outflow() {
+fn outflow_is_the_net_upwind_flux_two_cells_below_the_top() {
     let mut d = vec![0.0; (N * N * N) as usize];
-    d[idx(2, 2, N - 2)] = 3.0; // under an upward face
-    d[idx(9, 9, N - 2)] = 3.0; // under a downward face
-    d[idx(2, 2, N - 1)] = 50.0; // the top layer is not the measuring plane
+    d[idx(2, 2, N - 3)] = 3.0; // below an upward face: leaves
+    d[idx(2, 2, N - 2)] = 7.0; // above an upward face: not upwind
+    d[idx(9, 9, N - 3)] = 5.0; // below a downward face: not upwind
+    d[idx(9, 9, N - 2)] = 2.0; // above a downward face: comes back in
+    d[idx(4, 4, N - 1)] = 50.0; // the top layer is outside the measurement
     let v = faces(|p| [0.0, 0.0, if p[0] < 1.0 { 0.4 } else { -0.4 }]);
     let m = measure(&sample(&d, &v, &[]));
-    assert!((m.outflow_rate - 3.0 * 0.4 * DX * DX).abs() < 1e-9, "{m:?}");
+    let expected = (3.0 * 0.4 - 2.0 * 0.4) * DX * DX;
+    assert!((m.outflow_rate - expected).abs() < 1e-9, "{m:?}");
+}
+
+/// `mass_below` is the mass of layers 0 … N − 3.
+#[test]
+fn mass_below_leaves_out_the_top_two_layers() {
+    let mut d = vec![0.0; (N * N * N) as usize];
+    d[idx(1, 1, N - 3)] = 1.0;
+    d[idx(1, 1, N - 2)] = 1.0;
+    d[idx(1, 1, N - 1)] = 1.0;
+    let v = faces(|_| [0.0; 3]);
+    let m = measure(&sample(&d, &v, &[]));
+    assert!((m.mass - 3.0 * DX.powi(3)).abs() < 1e-12, "{m:?}");
+    assert!((m.mass_below - DX.powi(3)).abs() < 1e-12, "{m:?}");
 }
 
 /// Mass 10, falling to 8 while 2 flows out: no drift.
@@ -1009,7 +1032,8 @@ applied alone, with the output recorded:
 7. Solids: ignore `solid` in `measured`.
 8. Slab: use `k` instead of `k + 0.5` for the plume top's height.
 9. Top threshold: drop the 1% threshold.
-10. Outflow: use the density of layer nz − 1 instead of nz − 2.
+10. Outflow: take ρ from the cell below the face whatever the sign of w.
+    The mass-below test: sum layers 0 … nz − 2.
 11. Drift, first test: leave outflow out.
 12. Drift, trapezoid: use the rectangle rule at the right end.
 13. Drift before start: return M(n) − M(from) for every n, including those
@@ -1338,7 +1362,7 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
     eprintln!("ember {name} {res}³: metrics run");
     let frames = metrics_run(&gpu, &registry, &scene)?;
     let from = (EMISSION_FRAMES[1] - 1) as usize;
-    let mass: Vec<f64> = frames.iter().map(|f| f.mass).collect();
+    let mass: Vec<f64> = frames.iter().map(|f| f.mass_below).collect();
     let outflow: Vec<f64> = frames.iter().map(|f| f.outflow_rate).collect();
     let summary = RunSummary {
         solver: "ember".into(),
@@ -1628,6 +1652,12 @@ stops being added after frame 60: read frames 60, 61 and 70 with a temporary
 `vdb_probe` (from Task 3's code) and confirm total density does not rise
 after 61 by more than advection noise. Record the check in the ledger.
 
+Also confirm the outflow plane (spec §4.3): bake `plume` at 32³ for all 120
+frames and read a frame after the smoke reaches the top. Layer nz − 1 must
+hold no density, and velocity must be stored at z-face index nz − 2 wherever
+layer nz − 2 has smoke. If either fails, stop and report: the drift metric
+depends on it.
+
 - [ ] **Step 7: `ruff format tests && ruff check tests`, `just check`, commit.**
 Subject: "Build each bench scene's Mantaflow twin from the same definition".
 
@@ -1908,7 +1938,7 @@ Write the `summary` and `Context` literals in full.
   - kinetic energy at 60 and 120;
   - vorticity at 60 and 120;
   - centroid and top at 60 and 120 (m);
-  - drift at 120, absolute and as a percentage of mass at 60.
+  - drift at 120, absolute and as a percentage of `mass_below` at 60.
 - **Footnotes:**
   - velocity metrics cover only cells whose whole 3×3×3 neighbourhood is
     smoke (density > 1e-6), for both solvers, because Mantaflow's cache
@@ -1919,8 +1949,8 @@ Write the `summary` and `Context` literals in full.
     difference;
   - the pressure solvers differ: Mantaflow uses preconditioned CG to a
     tolerance, Ember a fixed Gauss–Seidel iteration count;
-  - the outflow estimate is at frame resolution, on the faces one cell below
-    the top;
+  - the outflow estimate is at frame resolution, through the z-faces two
+    cells below the top, with drift over the layers below them (spec §4.3);
   - Ember's peak memory is the pool's allocated bytes, with the frame cache
     off;
   - Mantaflow's peak memory is resident memory minus the no-bake baseline.
