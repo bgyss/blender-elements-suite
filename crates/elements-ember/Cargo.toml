@@ -13,4 +13,5 @@ serde_json.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 vdb-rs.workspace = true

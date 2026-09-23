@@ -378,6 +378,7 @@ dependencies = [
  "elements-core",
  "serde",
  "serde_json",
+ "tempfile",
  "vdb-rs",
  "wgpu",
 ]

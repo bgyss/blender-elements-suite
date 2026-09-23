@@ -2,7 +2,10 @@ mod common;
 
 use elements_core::gpu::{FieldPool, PipelineCache};
 use elements_core::graph::{Document, Timeline};
-use elements_ember::bench::{GateRow, PresetRow, Scene, gate_verdict, preview_substeps_verdict};
+use elements_ember::bench::{
+    GateRow, PresetRow, Scene, gate_verdict, preview_substeps_verdict, report,
+};
+use elements_ember::metrics::FrameMetrics;
 
 fn row(iterations: u32, step_ms_median: f64, ratio: f64) -> GateRow {
     GateRow {
@@ -156,4 +159,55 @@ fn bench_scenes_use_the_general_emitter_with_a_window() {
         let registry = elements_ember::registry();
         doc.into_graph(&registry).unwrap();
     }
+}
+
+#[test]
+fn the_collider_mask_marks_cells_inside_the_sphere() {
+    let scene = Scene::plume_collider(32);
+    let mask = scene.solid_mask();
+    let n = 32u32;
+    assert_eq!(mask.len(), (n * n * n) as usize);
+    let at = |i: u32, j: u32, k: u32| mask[(i + n * (j + n * k)) as usize];
+    // The collider is centred at (1, 1, 0.8) m, radius 0.25; dx = 1/16 m.
+    assert!(at(15, 15, 12), "the cell at the centre is solid");
+    assert!(!at(15, 15, 20), "a cell 0.5 m above is not");
+    assert!(Scene::plume(32).solid_mask().is_empty());
+}
+
+#[test]
+fn a_summary_round_trips_through_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let frame = |n: f64| FrameMetrics {
+        divergence_max: 0.5 * n,
+        divergence_rms: 0.25 * n,
+        kinetic_energy: 1.5 * n,
+        vorticity: 2.0 * n,
+        measured_cells: 100 * n as u64,
+        mass: 0.125 * n,
+        mass_below: 0.0625 * n,
+        centroid_m: if n > 1.0 { Some(0.3 * n) } else { None },
+        top_m: Some(0.4 * n),
+        outflow_rate: 0.01 * n,
+    };
+    let s = report::RunSummary {
+        solver: "ember".into(),
+        scene: "plume".into(),
+        resolution: 64,
+        runs: 3,
+        frame_ms_median: 12.5,
+        frame_ms_min: 11.0,
+        frame_ms_max: 14.25,
+        peak_bytes: 123_456_789,
+        load_before: 1.5,
+        load_after: 2.25,
+        blender: None,
+        frames: vec![frame(1.0), frame(2.0)],
+        drift: vec![0.0, -0.001],
+    };
+    report::write_summary(dir.path(), &s).unwrap();
+    let path = report::summary_path(dir.path(), "ember", "plume", 64);
+    let back: report::RunSummary =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(back, s);
+    assert!(dir.path().join("ember-plume-64.csv").exists());
 }

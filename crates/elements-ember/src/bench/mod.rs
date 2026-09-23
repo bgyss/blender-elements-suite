@@ -1,11 +1,13 @@
 //! Benchmark scenes and the speed gate's pre-registered rule (spec §4.3, §5.3).
 
-use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION};
+use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION, NodeId};
 
 use crate::collider::{self, ColliderParams};
 use crate::shape_emitter::{self, EmitterParams};
 use crate::solver::{self, SolverParams};
 use crate::transform::{Shape, Transform};
+
+pub mod report;
 
 /// A step must take at most this long at 128³ (≥ 10 fps).
 pub const GATE_STEP_MS: f64 = 100.0;
@@ -15,6 +17,9 @@ pub const GATE_RATIO: f64 = 0.10;
 /// Frames on which every bench scene emits (2b-3 spec §3). Frames after the
 /// last measure mass drift with no sources.
 pub const EMISSION_FRAMES: [u32; 2] = [1, 60];
+
+/// The solver's node id in every `Scene::document`.
+pub const SOLVER_NODE: NodeId = NodeId(1);
 
 /// A benchmark scene, defined once (spec §5.3). It generates the `.elements`
 /// document; the matching Mantaflow scene comes from the same values
@@ -92,6 +97,45 @@ impl Scene {
     pub fn with_max_substeps(mut self, n: u32) -> Self {
         self.solver.max_substeps = n;
         self
+    }
+
+    /// True for each cell (x-fastest) whose centre lies inside the collider.
+    /// The metrics use it for both solvers, so it is computed on the CPU from
+    /// the scene rather than read from either solver. Empty when there is no
+    /// collider.
+    pub fn solid_mask(&self) -> Vec<bool> {
+        let Some(collider) = &self.collider else {
+            return Vec::new();
+        };
+        let keys = &collider.transform.keys;
+        debug_assert_eq!(keys.len(), 1, "bench colliders are static");
+        debug_assert!(keys[0].rotate.is_none(), "bench colliders are unrotated");
+        let centre = keys[0].translate.map(f64::from);
+        let [nx, ny, nz] = self.cells;
+        let dx = self.domain_size / f64::from(nx.max(ny).max(nz));
+        let mut mask = Vec::with_capacity((nx * ny * nz) as usize);
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let d = [i, j, k]
+                        .map(|n| (f64::from(n) + 0.5) * dx)
+                        .iter()
+                        .zip(centre)
+                        .map(|(p, c)| p - c)
+                        .collect::<Vec<_>>();
+                    mask.push(match collider.shape {
+                        Shape::Sphere { radius } => {
+                            d.iter().map(|v| v * v).sum::<f64>() <= f64::from(radius).powi(2)
+                        }
+                        Shape::Box { half_extents } => d
+                            .iter()
+                            .zip(half_extents)
+                            .all(|(v, h)| v.abs() <= f64::from(h)),
+                    });
+                }
+            }
+        }
+        mask
     }
 
     /// The scene as an `.elements` document: emitter → solver → output, plus
