@@ -1,9 +1,10 @@
-//! `ember.emitter_union` (and, from Task 4, `ember.collider_union`): merge two
+//! `ember.emitter_union` and `ember.collider_union`: merge two
 //! emitters or two colliders into one (2b-2 spec §2.4). Chain them for more.
 
 use elements_core::gpu::{Axis, ComputeBatch, GpuContext, GpuError, PipelineCache};
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 
+use crate::collider::ColliderFields;
 use crate::kernels::{Bind, axis_index, bind_group, uniform_buffer};
 use crate::node_util::{produce, take_inputs};
 use crate::shape_emitter::EmitterFields;
@@ -165,4 +166,145 @@ pub(crate) fn build_emitter_union(params: &serde_json::Value) -> Result<Box<dyn 
         ));
     }
     Ok(Box::new(EmitterUnion))
+}
+
+pub const COLLIDER_UNION_KIND: &str = "ember.collider_union";
+
+const COLLIDER_CELLS_WGSL: &str = include_str!("kernels/shaders/collider_union_cells.wgsl");
+const COLLIDER_FACES_WGSL: &str = concat!(
+    include_str!("kernels/shaders/weights.wgsl"),
+    include_str!("kernels/shaders/collider_union_faces.wgsl"),
+);
+
+/// `out` = the union of colliders `a` and `b`. Submits its own batch.
+pub fn union_colliders(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    a: ColliderFields<'_>,
+    b: ColliderFields<'_>,
+    out: ColliderFields<'_>,
+) -> Result<(), GpuError> {
+    a.check("union_colliders a")?;
+    b.check("union_colliders b")?;
+    out.check("union_colliders out")?;
+    let cells = out.sdf.dims();
+    if a.sdf.dims() != cells || b.sdf.dims() != cells {
+        return Err(GpuError::Validation(
+            "union_colliders: inputs differ in size".to_owned(),
+        ));
+    }
+    let dims = [cells.x, cells.y, cells.z];
+    let cell_pipe = cache.get_or_create(
+        gpu,
+        "ember.collider_union.cells",
+        COLLIDER_CELLS_WGSL,
+        "main",
+    )?;
+    let face_pipe = cache.get_or_create(
+        gpu,
+        "ember.collider_union.faces",
+        COLLIDER_FACES_WGSL,
+        "main",
+    )?;
+    let grid = uniform_buffer(
+        gpu,
+        "ember-union",
+        bytemuck::bytes_of(&GridGpu { dims, axis: 0 }),
+    )?;
+    let mut batch = ComputeBatch::new();
+    let group = bind_group(
+        gpu,
+        &cell_pipe,
+        &[
+            Bind::Tex(a.sdf),
+            Bind::Tex(b.sdf),
+            Bind::Tex(out.sdf),
+            Bind::Buf(&grid),
+        ],
+    )?;
+    batch.dispatch(&cell_pipe, &group, cells);
+    for axis in Axis::ALL {
+        let grid = uniform_buffer(
+            gpu,
+            "ember-union",
+            bytemuck::bytes_of(&GridGpu {
+                dims,
+                axis: axis_index(axis),
+            }),
+        )?;
+        let dst = out.velocity.face(axis);
+        let group = bind_group(
+            gpu,
+            &face_pipe,
+            &[
+                Bind::Tex(a.sdf),
+                Bind::Tex(b.sdf),
+                Bind::Tex(a.velocity.face(axis)),
+                Bind::Tex(b.velocity.face(axis)),
+                Bind::Tex(dst),
+                Bind::Buf(&grid),
+            ],
+        )?;
+        batch.dispatch(&face_pipe, &group, dst.dims());
+    }
+    batch.submit(gpu)
+}
+
+#[derive(Debug, Clone)]
+pub struct ColliderUnion;
+
+impl Node for ColliderUnion {
+    fn kind(&self) -> &'static str {
+        COLLIDER_UNION_KIND
+    }
+
+    fn sockets(&self) -> SocketSpec {
+        let group = [SocketType::Field, SocketType::VectorField];
+        SocketSpec {
+            inputs: [group, group].concat(),
+            outputs: group.to_vec(),
+        }
+    }
+
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let inputs = take_inputs(ctx, 4)?;
+        let result = collider_union_node(ctx, &inputs);
+        for value in inputs {
+            ctx.release(value);
+        }
+        result
+    }
+}
+
+fn collider_union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, NodeError> {
+    let a = ColliderFields {
+        sdf: inputs[0].as_field()?,
+        velocity: inputs[1].as_vector_field()?,
+    };
+    let b = ColliderFields {
+        sdf: inputs[2].as_field()?,
+        velocity: inputs[3].as_vector_field()?,
+    };
+    produce(ctx, 1, |gpu, cache, cells, velocity| {
+        union_colliders(
+            gpu,
+            cache,
+            a,
+            b,
+            ColliderFields {
+                sdf: &cells[0],
+                velocity,
+            },
+        )
+    })
+}
+
+pub(crate) fn build_collider_union(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
+    if !(params.is_null() || params.as_object().is_some_and(|o| o.is_empty())) {
+        return Err(crate::params::bad(
+            COLLIDER_UNION_KIND,
+            "takes no parameters",
+        ));
+    }
+    Ok(Box::new(ColliderUnion))
 }

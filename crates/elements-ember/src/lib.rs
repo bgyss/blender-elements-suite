@@ -8,6 +8,7 @@
 pub mod bench;
 pub mod boundaries;
 pub mod cfl;
+pub mod collider;
 pub mod emitter;
 pub mod kernels;
 pub mod metrics;
@@ -26,6 +27,8 @@ pub fn register(registry: &mut NodeRegistry) {
     registry.register(solver::KIND, solver::build);
     registry.register(shape_emitter::KIND, shape_emitter::build);
     registry.register(unions::EMITTER_UNION_KIND, unions::build_emitter_union);
+    registry.register(collider::KIND, collider::build);
+    registry.register(unions::COLLIDER_UNION_KIND, unions::build_collider_union);
 }
 
 /// Core's built-in node kinds plus Ember's.
