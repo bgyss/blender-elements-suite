@@ -54,7 +54,8 @@ pub struct GpuContext {
     queue: wgpu::Queue,
     adapter_name: String,
     lost: Arc<Mutex<Option<String>>>,
-    /// The first error raised outside any error scope, until `scoped` reports it.
+    /// The most severe error raised outside any error scope, until `scoped`
+    /// reports it.
     uncaptured: Arc<Mutex<Option<GpuError>>>,
 }
 
@@ -104,15 +105,13 @@ impl GpuContext {
 
         // Without this, an error raised outside any error scope goes to wgpu's
         // default handler, which panics, and a daemon panic is exactly what
-        // running the engine out of process exists to prevent. Keep the first
-        // one; `scoped` reports it.
+        // running the engine out of process exists to prevent. Keep the most
+        // severe one; `scoped` reports it.
         let uncaptured = Arc::new(Mutex::new(None));
         let uncaptured_sink = Arc::clone(&uncaptured);
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
             let mut slot = uncaptured_sink.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = Some(from_wgpu(error));
-            }
+            keep_most_severe(&mut slot, from_wgpu(error));
         }));
 
         Ok(Self {
@@ -157,12 +156,12 @@ impl GpuContext {
     /// hardware runs the work, so faults that only manifest during execution
     /// may surface after `scoped` returns `Ok`, and may be misattributed to a
     /// later `scoped` block. Call sites that must ensure submitted work
-    /// succeeded should wait for completion explicitly (for example via
-    /// `Queue::on_submitted_work_done`) before trusting an `Ok`.
+    /// succeeded should wait for completion through [`GpuContext::wait`]
+    /// before trusting an `Ok`.
     ///
     /// An error raised outside any scope does not panic: the device's
-    /// uncaptured-error handler holds the first one, and the next `scoped`
-    /// call reports it, once. That call may be unrelated to its cause.
+    /// uncaptured-error handler holds the most severe one, and the next
+    /// `scoped` call reports it, once. That call may be unrelated to its cause.
     pub fn scoped<T>(&self, f: impl FnOnce() -> T) -> Result<T, GpuError> {
         let out_of_memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
@@ -188,6 +187,70 @@ impl GpuContext {
             None => Ok(value),
         }
     }
+
+    /// Block until all submitted GPU work has finished.
+    ///
+    /// This is the only sanctioned way to wait on the device. `Device::poll`
+    /// returns only the errors wgpu recognises as poll errors (a timeout or a
+    /// wrong submission index). Any other failure, notably a lost device or
+    /// out-of-memory from the fence wait, goes to wgpu's `handle_error_fatal`,
+    /// which panics. On Vulkan that is the ordinary device-lost path, so here
+    /// the panic is caught and reported as `DeviceLost`.
+    ///
+    /// Catching it is sound. The panic is raised in the wgpu frontend after
+    /// wgpu-core's `device_poll` has returned and run its device-lost
+    /// closures, so no wgpu-core lock is held while it unwinds. wgpu's locks
+    /// are parking_lot, which does not poison, and the only state this closure
+    /// touches is the device handle itself. The workspace sets no
+    /// `panic = "abort"` in any profile, so the unwind is catchable. The
+    /// default panic hook still prints the message to stderr.
+    pub fn wait(&self) -> Result<(), GpuError> {
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.device.poll(wgpu::PollType::wait_indefinitely())
+        }));
+        match polled {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(GpuError::DeviceLost(e.to_string())),
+            Err(payload) => Err(GpuError::DeviceLost(poll_panic_message(
+                self.device_lost(),
+                payload.as_ref(),
+            ))),
+        }
+    }
+}
+
+/// The message for a `Device::poll` that panicked: the device-lost message if
+/// the device reported one, else the panic's own text.
+fn poll_panic_message(lost: Option<String>, payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = lost {
+        return message;
+    }
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_owned();
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "Device::poll panicked".to_owned()
+}
+
+fn severity(error: &GpuError) -> u8 {
+    match error {
+        GpuError::OutOfMemory(_) => 3,
+        GpuError::Internal(_) => 2,
+        GpuError::Validation(_) => 1,
+        _ => 0,
+    }
+}
+
+/// Store `new` unless `slot` already holds something at least as severe.
+fn keep_most_severe(slot: &mut Option<GpuError>, new: GpuError) {
+    if slot
+        .as_ref()
+        .is_none_or(|old| severity(&new) > severity(old))
+    {
+        *slot = Some(new);
+    }
 }
 
 fn from_wgpu(error: wgpu::Error) -> GpuError {
@@ -203,7 +266,9 @@ fn from_wgpu(error: wgpu::Error) -> GpuError {
 /// A lost device outranks everything, since nothing else can be retried, but
 /// its message keeps the detail of whatever else was captured. Then out of
 /// memory, which says why a step failed. Then internal errors, then
-/// validation errors, then an error raised earlier outside any scope.
+/// validation errors, then an error raised earlier outside any scope, except
+/// that a stray out-of-memory error outranks an in-scope internal or
+/// validation error: it is the one that tells the daemon to free memory.
 pub fn resolve_errors(
     lost: Option<String>,
     out_of_memory: Option<wgpu::Error>,
@@ -211,16 +276,60 @@ pub fn resolve_errors(
     validation: Option<wgpu::Error>,
     stray: Option<GpuError>,
 ) -> Option<GpuError> {
-    let captured = out_of_memory
+    let in_scope = out_of_memory
         .map(from_wgpu)
         .or_else(|| internal.map(from_wgpu))
-        .or_else(|| validation.map(from_wgpu))
-        .or(stray);
+        .or_else(|| validation.map(from_wgpu));
+    let captured = match (in_scope, stray) {
+        (Some(e @ GpuError::OutOfMemory(_)), _) => Some(e),
+        (_, Some(s @ GpuError::OutOfMemory(_))) => Some(s),
+        (Some(e), _) => Some(e),
+        (None, s) => s,
+    };
     match (lost, captured) {
         (Some(message), Some(e)) => Some(GpuError::DeviceLost(format!(
             "{message} (another error was also captured: {e})"
         ))),
         (Some(message), None) => Some(GpuError::DeviceLost(message)),
         (None, captured) => captured,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_poll_panic_reports_the_device_lost_message_first() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("Error in Device::poll: lost");
+        assert_eq!(
+            poll_panic_message(Some("gone".into()), payload.as_ref()),
+            "gone"
+        );
+    }
+
+    #[test]
+    fn a_poll_panic_without_a_lost_message_reports_its_payload() {
+        let text: Box<dyn std::any::Any + Send> = Box::new("static text");
+        assert_eq!(poll_panic_message(None, text.as_ref()), "static text");
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("owned text"));
+        assert_eq!(poll_panic_message(None, owned.as_ref()), "owned text");
+        let other: Box<dyn std::any::Any + Send> = Box::new(7_u32);
+        assert_eq!(
+            poll_panic_message(None, other.as_ref()),
+            "Device::poll panicked"
+        );
+    }
+
+    #[test]
+    fn a_stray_error_is_replaced_only_by_a_more_severe_one() {
+        let mut slot = None;
+        keep_most_severe(&mut slot, GpuError::Validation("first".into()));
+        keep_most_severe(&mut slot, GpuError::OutOfMemory("second".into()));
+        assert!(matches!(&slot, Some(GpuError::OutOfMemory(m)) if m == "second"));
+        keep_most_severe(&mut slot, GpuError::Internal("third".into()));
+        assert!(matches!(&slot, Some(GpuError::OutOfMemory(m)) if m == "second"));
+        keep_most_severe(&mut slot, GpuError::OutOfMemory("fourth".into()));
+        assert!(matches!(&slot, Some(GpuError::OutOfMemory(m)) if m == "second"));
     }
 }

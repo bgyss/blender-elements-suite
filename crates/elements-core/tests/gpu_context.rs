@@ -67,6 +67,8 @@ fn required_limits_take_only_resolution_and_buffer_size_from_the_adapter() {
     adapter.max_buffer_size = 4 << 30;
     adapter.max_texture_dimension_3d = 2048;
     adapter.max_storage_textures_per_shader_stage = 16;
+    adapter.max_compute_workgroup_storage_size = 65536;
+    adapter.max_uniform_buffer_binding_size = 1 << 30;
 
     let got = elements_core::gpu::required_limits(&adapter);
     let base = wgpu::Limits::downlevel_defaults();
@@ -75,6 +77,14 @@ fn required_limits_take_only_resolution_and_buffer_size_from_the_adapter() {
     assert_eq!(
         got.max_storage_textures_per_shader_stage,
         base.max_storage_textures_per_shader_stage
+    );
+    assert_eq!(
+        got.max_compute_workgroup_storage_size,
+        base.max_compute_workgroup_storage_size
+    );
+    assert_eq!(
+        got.max_uniform_buffer_binding_size,
+        base.max_uniform_buffer_binding_size
     );
 }
 
@@ -127,6 +137,18 @@ fn out_of_memory_is_reported_as_itself_and_outranks_validation() {
             Some(GpuError::Validation("earlier".into()))
         ),
         Some(GpuError::Validation(_))
+    ));
+    // A stray out-of-memory error is the one that tells the daemon to free
+    // memory, so an in-scope validation error must not hide it.
+    assert!(matches!(
+        resolve_errors(
+            None,
+            None,
+            None,
+            Some(validation()),
+            Some(GpuError::OutOfMemory("stray".into()))
+        ),
+        Some(GpuError::OutOfMemory(_))
     ));
     assert!(resolve_errors(None, None, None, None, None).is_none());
 }
