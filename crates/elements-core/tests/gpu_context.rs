@@ -93,6 +93,13 @@ fn validation() -> wgpu::Error {
     }
 }
 
+fn internal() -> wgpu::Error {
+    wgpu::Error::Internal {
+        source: source(),
+        description: "internal".into(),
+    }
+}
+
 /// An out-of-memory error must reach the caller as `OutOfMemory`, not be
 /// folded into `Validation`, and must win over a validation error captured
 /// alongside it: it is the one that says why.
@@ -122,6 +129,25 @@ fn out_of_memory_is_reported_as_itself_and_outranks_validation() {
         Some(GpuError::Validation(_))
     ));
     assert!(resolve_errors(None, None, None, None, None).is_none());
+}
+
+/// An internal error is reported as itself and outranks a validation error
+/// captured alongside it. A lost device keeps the detail of whatever else
+/// was captured, wrapped into its own message.
+#[test]
+fn internal_outranks_validation_and_device_lost_keeps_the_other_detail() {
+    use elements_core::gpu::resolve_errors;
+    assert!(matches!(
+        resolve_errors(None, None, Some(internal()), Some(validation()), None),
+        Some(GpuError::Internal(_))
+    ));
+    match resolve_errors(Some("gone".into()), Some(oom()), None, None, None) {
+        Some(GpuError::DeviceLost(msg)) => {
+            assert!(msg.contains("gone"), "{msg}");
+            assert!(msg.contains("Out of Memory"), "{msg}");
+        }
+        other => panic!("expected DeviceLost, got {other:?}"),
+    }
 }
 
 /// A validation error raised outside any error scope used to reach wgpu's

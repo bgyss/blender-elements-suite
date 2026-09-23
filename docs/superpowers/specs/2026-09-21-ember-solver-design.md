@@ -349,11 +349,9 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 Found by piece 2a's whole-branch review. (a), (b) and (g) should be the first
 things 2b's plan addresses.
 
-- **(a) 512³ is impossible today.** `GpuContext` takes only the adapter's
-  resolution limits, so `max_buffer_size` stays at the downlevel 256 MiB and
-  `Document::validate_for` rejects domains above about 406³. Either raise
-  `max_buffer_size` from the adapter (a limit, not a feature, so allowed), or
-  chunk read-back and snapshots.
+- **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
+  `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
+  256 MiB limit.
 - **(b) The warm start assumes a fixed `h`.** The pressure slot stores
   φ = h·p. CFL substepping changes `h`, so it must rescale the stored φ by
   h_new/h_old before each solve, or store p and multiply by `h` in the kernels.
@@ -374,14 +372,19 @@ things 2b's plan addresses.
   dispatches. At 256³–512³ with offline iteration counts that can run for
   seconds and trip GPU watchdogs, which surface as `DeviceLost`. Split
   submissions every K iterations on large grids.
-- **(g) Out-of-memory is uncaptured.** `GpuContext::scoped` pushes only a
-  Validation scope, so an out-of-memory error from texture creation reaches
-  wgpu's default handler and panics the daemon. The solver holds about 17 live
-  fields per step, plus snapshots. Add an OutOfMemory scope, and estimate the
-  working set when a document is validated.
+- **(g) Resolved, partly open (37c01a9).** `GpuContext::scoped` now also
+  pushes an OutOfMemory scope, so an out-of-memory error from texture
+  creation is reported as `GpuError::OutOfMemory`, not panicked through
+  wgpu's default handler. Still open: on unified memory the OS may swap or
+  end the process before wgpu ever reports the condition; the daemon's
+  reset-and-clear path for this error is untested; and an unrecognised
+  `Device::poll` failure still panics through wgpu's `handle_error_fatal`.
 - **(h) Unused outputs are copied every frame.** All three solver outputs are
   duplicated even when only density is consumed: free at 128³, real bandwidth
   at 512³.
-- **(i) No test checks absolute emitted mass through the solver.** Swapping
-  density and temperature would pass every test. Add a one-frame check that
-  total density and temperature match rate × volume × `h`.
+- **(i) Resolved (8d8bc64).** `crates/elements-ember/tests/solver.rs`
+  adds `one_frame_adds_each_emitted_quantity_to_its_own_output`, which drives
+  the graph through both an emitter-straight-to-output probe and a
+  through-the-solver probe and asserts each of density and temperature
+  matches rate × dt to 1e-5. Proved to fail by swapping the solver's source
+  fields in `SmokeSolver::step`.

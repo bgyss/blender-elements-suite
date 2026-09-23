@@ -69,6 +69,8 @@ def check_error_descriptions() -> None:
     status, stop = describe("out_of_memory", "Out of Memory")
     assert stop, status
     assert "resolution" in status, status
+    status, stop = describe("device_lost", "x")
+    assert stop, status
     status, stop = describe("graph", "no graph is loaded")
     assert not stop, status
     assert status == "graph: no graph is loaded", status
