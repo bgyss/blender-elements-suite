@@ -269,7 +269,6 @@ impl Pose {
 /// then four vec3 + scalar rows. 112 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[allow(dead_code)] // used from Task 2
 pub(crate) struct ShapeGpu {
     world_to_local: [[f32; 4]; 3],
     origin: [f32; 3],
@@ -285,7 +284,6 @@ pub(crate) struct ShapeGpu {
 const _: () = assert!(std::mem::size_of::<ShapeGpu>() == 112);
 
 impl ShapeGpu {
-    #[allow(dead_code)] // used from Task 2
     pub(crate) fn new(shape: &Shape, pose: &Pose) -> Self {
         let m = pose.world_to_local();
         let (kind, extents) = match *shape {

@@ -73,13 +73,16 @@ Outputs, in this order:
 
 1. density rate (Field)
 2. temperature rate (Field)
-3. occupancy (Field, in [0, 1])
+3. velocity weight (Field, occupancy × `velocity_blend`, in 1/s)
 4. emitted velocity (staggered VectorField)
 
-Occupancy is `clamp(0.5 − sdf/dx, 0, 1)`, the one-voxel smoothed edge
-`ember.sphere_emitter` already uses. The rates are the occupancy times the
-rate times the noise factor. The emitted velocity at each face is `velocity`
-plus the emitter's own motion `v(x)` there.
+Occupancy `clamp(0.5 − sdf/dx, 0, 1)` uses the one-voxel smoothed edge
+`ember.sphere_emitter` already uses. The rates are occupancy × rate × the
+noise factor, and the weight is occupancy × `velocity_blend`. The weight
+carries the blend rate rather than occupancy alone because a union of
+emitters with different blend rates cannot be expressed through occupancy.
+The emitted velocity at each face is `velocity` plus the emitter's own
+motion `v(x)` there.
 
 **Noise.** Rates are multiplied by `1 − amplitude · (1 − n)`, where `n` is
 in [0, 1]:
@@ -105,9 +108,9 @@ Params: `shape` and `transform`. Outputs, in this order:
 
 Each union has two inputs. Chain them to combine more.
 
-- **`ember.emitter_union`:** the rates add, occupancy is the maximum, and the
-  emitted velocity is `(o₁·u₁ + o₂·u₂) / max(o₁ + o₂, ε)`, taken per face
-  from the face occupancies.
+- **`ember.emitter_union`:** the rates add, the weight is the maximum, and
+  the emitted velocity is `(a·u₁ + b·u₂) / max(a + b, ε)`, where `a` and `b`
+  are each emitter's face weight: the larger weight of the face's two cells.
 - **`ember.collider_union`:** the SDF is the minimum, and each face takes the
   velocity of the collider whose SDF is smaller there.
 
@@ -122,7 +125,7 @@ so the solver never needs a second collider representation.
 |---|---|---|---|
 | 0 | density rate | Field | required (as in 2a/2b-1) |
 | 1 | temperature rate | Field | required |
-| 2 | occupancy | Field | optional; requires 3 |
+| 2 | velocity weight | Field | optional; requires 3 |
 | 3 | emitted velocity | VectorField | optional; requires 2 |
 | 4 | collider SDF | Field | optional; requires 5 |
 | 5 | collider velocity | VectorField | optional; requires 4 |
@@ -176,9 +179,10 @@ advection carries nothing in, and §5's collider scene checks exactly that.
 
 Each substep, after emit and before buoyancy:
 
-`u ← u + (u_e − u) · occ_face · (1 − exp(−velocity_blend · h))`
+`u ← u + (u_e − u) · (1 − exp(−w_face · h))`
 
-- `occ_face` is the larger occupancy of the face's two cells.
+- `w_face` is the face weight: the larger velocity weight of the face's two
+  cells.
 - The exponential form makes the blend independent of `h`.
 - A large `velocity_blend` approximates setting the velocity outright.
 - Solid faces are skipped.
