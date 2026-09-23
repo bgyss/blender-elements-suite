@@ -11,8 +11,9 @@
 //! substeps), so a rerun no longer reproduces 2a's table. `speed-gate.md`
 //! records the commit its numbers came from.
 
+mod common;
+
 use std::error::Error;
-use std::process::Command;
 use std::time::Instant;
 
 use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache};
@@ -21,6 +22,8 @@ use elements_ember::bench::{GATE_RATIO, GATE_STEP_MS, GateRow, Scene, gate_verdi
 use elements_ember::emitter::fill_sphere;
 use elements_ember::metrics::{DivergenceStats, divergence};
 use elements_ember::solver::{SolverState, Sources, Substep, substep};
+
+use common::{commit_label, median, shell};
 
 const RESOLUTION: u32 = 128;
 const ITERATIONS: [u32; 4] = [20, 40, 80, 160];
@@ -37,17 +40,6 @@ struct Timing {
     all: Vec<f64>,
     /// Every snapshot, ms.
     snapshots: Vec<f64>,
-}
-
-fn median(values: &[f64]) -> f64 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
-    if n % 2 == 1 {
-        sorted[n / 2]
-    } else {
-        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
-    }
 }
 
 fn wait(gpu: &GpuContext) -> Res<()> {
@@ -143,27 +135,6 @@ fn divergence_at(
     Ok((before, after))
 }
 
-fn shell(program: &str, args: &[&str]) -> String {
-    Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-/// Like `shell`, but distinguishes "the command failed" from "it printed
-/// nothing", so callers can tell a real empty result from a failure.
-fn shell_checked(program: &str, args: &[&str]) -> Option<String> {
-    Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-}
-
 fn main() -> Res<()> {
     let gpu = GpuContext::new_headless()?;
     let registry = elements_ember::registry();
@@ -217,15 +188,7 @@ fn main() -> Res<()> {
         Some(n) => format!("**PASS**, provisional `pressure_iterations` = {n}"),
         None => "**FAIL**: no N meets both limits".to_owned(),
     };
-    let commit = match shell_checked("git", &["rev-parse", "--short", "HEAD"]) {
-        Some(hash) => match shell_checked("git", &["status", "--porcelain"]) {
-            Some(status) if !status.is_empty() => format!("{hash}-dirty"),
-            Some(_) => hash,
-            // `git status` failed to run: don't claim a clean tree we didn't verify.
-            None => format!("{hash} (dirty status unknown)"),
-        },
-        None => "unknown".to_owned(),
-    };
+    let commit = commit_label();
     let substeps = scene_substeps;
     let (title, file, decision) = if sweep.is_some() {
         (

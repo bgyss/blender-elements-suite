@@ -2,7 +2,7 @@ mod common;
 
 use elements_core::gpu::{FieldPool, PipelineCache};
 use elements_core::graph::{Document, Timeline};
-use elements_ember::bench::{GateRow, Scene, gate_verdict};
+use elements_ember::bench::{GateRow, PresetRow, Scene, gate_verdict, preview_substeps_verdict};
 
 fn row(iterations: u32, step_ms_median: f64, ratio: f64) -> GateRow {
     GateRow {
@@ -27,6 +27,35 @@ fn the_gate_passes_with_the_largest_n_meeting_both_limits() {
 #[test]
 fn the_gate_limits_are_inclusive() {
     assert_eq!(gate_verdict(&[row(40, 100.0, 0.10)]), Some(40));
+}
+
+fn preset(max_substeps: u32, frame_ms_median: f64) -> PresetRow {
+    PresetRow {
+        max_substeps,
+        frame_ms_median,
+    }
+}
+
+/// Spec §6: preview takes the largest cap whose median full frame fits.
+#[test]
+fn the_preview_cap_is_the_largest_that_fits() {
+    let rows = [
+        preset(1, 40.0),
+        preset(2, 80.0),
+        preset(3, 120.0),
+        preset(4, 160.0),
+    ];
+    assert_eq!(preview_substeps_verdict(&rows), Some(2));
+}
+
+#[test]
+fn the_preview_frame_limit_is_inclusive() {
+    assert!(preset(3, 100.0).passes());
+}
+
+#[test]
+fn no_cap_fits_when_even_one_substep_is_too_slow() {
+    assert_eq!(preview_substeps_verdict(&[preset(1, 101.0)]), None);
 }
 
 #[test]

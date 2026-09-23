@@ -61,3 +61,8 @@ bench-gate:
 # Writes docs/bench/iteration-sweep.md and leaves the gate's record alone.
 bench-sweep iterations="160,240,320,400,480,560,640":
     SPEED_GATE_ITERATIONS={{iterations}} cargo run --release -p elements-ember --example speed_gate
+
+# The preview preset's substep cap at 128³ (2b-1 spec §6).
+# Takes minutes, needs the real GPU, and is not part of `check`.
+bench-presets:
+    cargo run --release -p elements-ember --example presets
