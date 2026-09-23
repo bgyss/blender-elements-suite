@@ -138,6 +138,58 @@ impl Scene {
         mask
     }
 
+    /// The values `tests/bench/mantaflow_scene.py` builds the Mantaflow twin
+    /// from (2b-3 spec §5). Ember's units throughout; `tests/bench/mapping.py`
+    /// converts them. Bench emitters and colliders are static spheres.
+    pub fn mantaflow_json(&self) -> serde_json::Value {
+        let sphere = |shape: &Shape, transform: &Transform, what: &str| {
+            let Shape::Sphere { radius } = *shape else {
+                panic!("the Mantaflow twin supports only a sphere {what}");
+            };
+            debug_assert_eq!(transform.keys.len(), 1, "bench {what}s are static");
+            (transform.keys[0].translate.map(decimal), decimal(radius))
+        };
+        let (center, radius) = sphere(&self.emitter.shape, &self.emitter.transform, "emitter");
+        let collider = self.collider.as_ref().map(|c| {
+            let (center, radius) = sphere(&c.shape, &c.transform, "collider");
+            serde_json::json!({ "center": center, "radius": radius })
+        });
+        // Each face as `Face` serialises it, keyed by the Rust field name.
+        let face = |f| serde_json::to_value(f).expect("a Face always serializes");
+        let b = &self.solver.boundaries;
+        let s = &self.solver;
+        serde_json::json!({
+            "name": self.name,
+            "domain_size": self.domain_size,
+            "resolution": self.cells.into_iter().max(),
+            "fps": self.fps,
+            "frames": self.frames,
+            "substeps": s.max_substeps,
+            "emitter": {
+                "center": center,
+                "radius": radius,
+                "density_rate": decimal(self.emitter.density_rate),
+                "temperature_rate": decimal(self.emitter.temperature_rate),
+                "active_frames": self.emitter.active_frames,
+            },
+            "buoyancy_density": decimal(s.buoyancy_density),
+            "buoyancy_temperature": decimal(s.buoyancy_temperature),
+            "vorticity": decimal(s.vorticity),
+            "density_dissipation": decimal(s.density_dissipation),
+            "temperature_dissipation": decimal(s.temperature_dissipation),
+            "wind": s.wind.map(decimal),
+            "collider": collider,
+            "boundaries": {
+                "neg_x": face(b.neg_x),
+                "pos_x": face(b.pos_x),
+                "neg_y": face(b.neg_y),
+                "pos_y": face(b.pos_y),
+                "neg_z": face(b.neg_z),
+                "pos_z": face(b.pos_z),
+            },
+        })
+    }
+
     /// The scene as an `.elements` document: emitter → solver → output, plus
     /// the collider when there is one.
     pub fn document(&self) -> Document {
@@ -188,6 +240,15 @@ impl Scene {
             output: 2,
         }
     }
+}
+
+/// An `f32` parameter as the decimal it was written as: 0.2, not
+/// 0.20000000298. Rust prints the shortest string that reads back as the same
+/// `f32`, so the JSON carries the scene's own numbers.
+fn decimal(x: f32) -> f64 {
+    x.to_string()
+        .parse()
+        .expect("a finite f32 prints as a valid f64")
 }
 
 /// One row of the gate's table.

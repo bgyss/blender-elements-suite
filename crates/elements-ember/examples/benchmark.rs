@@ -2,6 +2,8 @@
 //!
 //! Modes:
 //!   benchmark ember SCENE RES      time and measure Ember
+//!   benchmark scene-json SCENE RES print the scene's Mantaflow twin as JSON,
+//!                                  for tests/bench/mantaflow_scene.py
 //!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow (Task 8)
 //!   benchmark report               build docs/bench/results.md (Task 8)
 //!
@@ -169,6 +171,14 @@ fn main() -> Res<()> {
         .as_slice()
     {
         ["ember", name, res] => run_ember(name, res.parse()?),
-        _ => Err("usage: benchmark ember SCENE RES | mantaflow SCENE RES | report".into()),
+        ["scene-json", name, res] => {
+            let json = scene(name, res.parse()?)?.mantaflow_json();
+            println!("{}", serde_json::to_string_pretty(&json)?);
+            Ok(())
+        }
+        _ => Err(
+            "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES | report"
+                .into(),
+        ),
     }
 }

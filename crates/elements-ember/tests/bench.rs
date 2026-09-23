@@ -211,3 +211,25 @@ fn a_summary_round_trips_through_its_file() {
     assert_eq!(back, s);
     assert!(dir.path().join("ember-plume-64.csv").exists());
 }
+
+/// The Mantaflow twin is built from the same scene (2b-3 spec §5): every
+/// parameter the scene script needs comes from `mantaflow_json`.
+#[test]
+fn the_mantaflow_json_carries_every_matched_parameter() {
+    let s = Scene::plume_collider(64);
+    let j = s.mantaflow_json();
+    assert_eq!(j["name"], "plume_collider");
+    assert_eq!(j["resolution"], 64);
+    assert_eq!(j["frames"], 120);
+    assert_eq!(j["emitter"]["active_frames"], serde_json::json!([1, 60]));
+    assert_eq!(j["emitter"]["radius"], 0.2);
+    assert_eq!(j["emitter"]["center"], serde_json::json!([1.0, 1.0, 0.3]));
+    assert_eq!(j["collider"]["radius"], 0.25);
+    assert_eq!(j["collider"]["center"], serde_json::json!([1.0, 1.0, 0.8]));
+    assert_eq!(j["boundaries"]["pos_z"], "open");
+    assert_eq!(j["boundaries"]["neg_z"], "wall");
+    assert_eq!(j["substeps"], s.solver.max_substeps);
+    let w = Scene::plume_wind(64).mantaflow_json();
+    assert_eq!(w["wind"], serde_json::json!([0.5, 0.0, 0.0]));
+    assert!(Scene::plume(64).mantaflow_json()["collider"].is_null());
+}

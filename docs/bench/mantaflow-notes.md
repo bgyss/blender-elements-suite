@@ -157,7 +157,12 @@ So layer nz − 1 never holds smoke in the cache, face index nz − 1 is never
 stored, and no cell in layer nz − 2 is ever a *measured* cell under §4.1's
 neighbourhood rule. This was seen on two open-sided probe bakes: layer nz − 1
 had 0 smoky cells, and velocity was stored at z index nz − 2 but never at
-nz − 1. Task 6 confirms it with a 120-frame `plume` bake.
+nz − 1. **Confirmed by Task 6** on `plume` at 32³, all 120 frames of
+`tests/bench/mantaflow_scene.py`'s bake: layer 31 (nz − 1) held no cell above
+1e-6 in any frame, and no velocity was stored at z index 31. Smoke reaches
+layer 30 (nz − 2) at frame 78 (36 cells) and fills 419 cells of it by frame
+120; in every one of those 43 frames each smoky cell of layer 30 has velocity
+stored at its z-face index 30, and no other cell of that layer does.
 
 **Tiles can drop values from the other grids.** In a domain-filling test
 (32³, `fill=1 volume=1 alpha=0 beta=0.5`, frame 3), density was constant over whole 8³ blocks and was
@@ -276,9 +281,9 @@ gravity is converted to cells per unit² by `scaleAcceleration = (n / L) · 0.4�
 | Inflow, density | adds `rate · occupancy · h` each substep | with `use_absolute = False`, adds `density · emission` once per frame and clamps to [0, 1]; with `use_absolute = True` (Blender's default) it holds the value instead | `use_absolute = False`, `density = density_rate / fps` | `fluid.cc` `apply_inflow_fields` (and the reset of the inflow grids to the current grids before emission); `initplugins.cpp` `applyEmission` | yes: mass 0.97–1.03 of Ember's, below |
 | Inflow, temperature | adds `rate · occupancy · h` each substep | raises heat to `temperature` in the emitter (`ADD_IF_LOWER`), never above it, in both modes | `temperature = temperature_rate · 24 / fps`: Ember's emitter-centre value at frame 24 | `fluid.cc` `ADD_IF_LOWER`, `apply_inflow_fields` | yes: held at 1.000, below |
 | Emitter volume | a filled sphere with a one-cell soft edge | a mesh flow emits a **shell** by default (`volume_density = 0`), plus a falloff out to `surface_distance` cells outside the mesh (default 1.0) | `volume_density = 1`, `surface_distance = 0` | `fluid.cc` `sample_mesh`; a 32³ bake showed a hollow emitter; the default `surface_distance` added 33% mass | yes, below |
-| Emitter activity | `active_frames` [1, 60] | no frame-range setting | keyframe the flow's emission off after frame 60 (spec §5); Task 6 must verify the switch by a bake. The property is `flow_settings.use_inflow` ("Use Flow", "Control when to apply fluid flow", animatable, default True), found by listing `FluidFlowSettings` RNA in 5.2.2 | RNA listing | no: exists, not yet verified by a bake |
+| Emitter activity | `active_frames` [1, 60] | no frame-range setting | key `flow_settings.use_inflow` ("Use Flow") True at frame 60 and False at frame 61; cache frame 61 is then the first without emission, as in Ember | RNA listing; bake | yes: see Emission switch-off, below |
 | Substeps | `max_substeps` (preview: 1) | `timesteps_min = timesteps_max` | equal | generated script | yes (script) |
-| Boundaries | closed sides and floor, open top | all six sides **open** by default (`xXyYzZ`) | `use_collision_border_{front,back,left,right,bottom} = True`, `top = False` (probe `bench=1`) | generated script: `boundConditions` | yes (script) |
+| Boundaries | closed sides and floor, open top | all six sides **open** by default (`xXyYzZ`) | `use_collision_border_{front,back,left,right,bottom} = True`, `top = False` (probe `bench=1`); per side, left/right are −x/+x, front/back −y/+y, bottom/top −z/+z | generated script: `boundConditions` | yes (script; Task 6 opened −x, +y and −z alone and got `'xYz'`) |
 | Advection | MacCormack | `advectSemiLagrange(order=2)`, Mantaflow's MacCormack | none needed | generated script | yes (script) |
 | Pressure | 160 red-black Gauss–Seidel iterations | multigrid-preconditioned CG to a tolerance | none possible; the table must say so | generated script | — |
 
@@ -326,10 +331,54 @@ All baked with the probe. Velocities are converted with the units rule above.
   absolute mapping). The heat drives the buoyancy, so the plume-height metrics
   carry this difference, and the summary must say so.
 
+  **Temperature ramp (Task 6): rejected.** Keying the flow's `temperature`
+  on every frame to Ember's growing heat, `temperature_rate · f / fps` at
+  frame f through frame 60, brings the plume height closer to Ember's, but
+  loses mass. Same 64³ `plume`, Ember regenerated with
+  `benchmark ember plume 64`:
+
+  | Frame | Ember mass / cz | fixed heat 1.0 (kept) | ramp to f / 24 |
+  |---|---|---|---|
+  | 24 | 0.0338 / 0.371 | 0.0338 / 0.457 | 0.0326 (−3.5% of fixed) / 0.356 |
+  | 60 | 0.0855 / 0.781 | 0.0884 / 0.925 | 0.0764 (−13.6% of fixed) / 0.889 |
+
+  The ramp is closer at both frames (off by 0.015 m and 0.108 m, against
+  0.086 m and 0.144 m), but it moves mass by more than the 3% the plan allows,
+  so the scene keeps the fixed heat. The probable cause is the density clamp:
+  with a cooler emitter early on, smoke leaves the emitter more slowly, the
+  emitter centre reaches 0.998 by frame 24 (0.526 with fixed heat), and
+  additive emission into cells already near 1 is clamped away. Ember does not
+  clamp.
+
   Mantaflow computes the inflow grids once per frame and copies them into the
   domain on every solver step (`applyEmission`, absolute copy). So with more
   than one step per frame the density would not be added once per step, and
   this mapping holds only for one step per frame.
+- **Emission switch-off (Task 6).** `tests/bench/mantaflow_scene.py` keys
+  `use_inflow` on at frame 60 and off at 61. `plume` at 32³, 120 frames,
+  against two controls from the same script (emission always on; emission
+  on frames 1–30 only). Mass is total density · dV; the emitter value is the
+  mean density of the 2×2 cells about x = y = 1 m in the layer at z = 0.3 m:
+
+  | Frame | [1, 60]: mass / emitter | always on: mass / emitter |
+  |---|---|---|
+  | 59 | 0.09302 / 0.590 | 0.09302 / 0.590 |
+  | 60 | 0.09526 / 0.587 | 0.09526 / 0.587 |
+  | 61 | 0.09629 / **0.543** | 0.09776 / 0.584 |
+  | 62 | 0.09675 / 0.499 | 0.09983 / 0.582 |
+  | 65 | 0.09839 / 0.373 | 0.10630 / 0.579 |
+  | 70 | 0.10016 / 0.206 | 0.11674 / 0.582 |
+  | 80 | 0.10367 / 0.065 | 0.13861 / 0.597 |
+
+  The two runs are identical to frame 60 and part at 61: the emitter's
+  density starts to drain at 61 and keeps falling, so frame 61 is the first
+  frame without emission, as in Ember. Mass still rises after 61, by
+  0.00046 a frame against 0.0021 a frame while emitting, until the smoke
+  reaches the top at about frame 80 (0.1037 at 80, then 0.0328 at 120). That
+  rise is the advection, not emission: Ember's `plume` at 32³ rises the same
+  way (0.08585 at 60, 0.08636 at 61, 0.08700 at 63, 0.09242 at 80), and the
+  [1, 30] run *loses* mass after its cut-off (0.04439 at 30, 0.04424 at 31,
+  0.03801 at 50), with its emitter draining from 0.540 to 0.500 at frame 31.
 - **Wind strength.** A domain filled with smoke (`fill=1 volume=1 alpha=0
   beta=0`), all sides open, at 32³, with `wind = S` along +x. With
   S = 0.1042 (0.5 m/s² at 24 fps), the centre's u rose 0.0201, 0.0402 and
