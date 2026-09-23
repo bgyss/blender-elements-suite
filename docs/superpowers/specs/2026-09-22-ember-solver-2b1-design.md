@@ -1,7 +1,7 @@
 # Ember Piece 2b-1 — Solver Correctness Design
 
 **Date:** 2026-09-22
-**Status:** Approved for planning
+**Status:** Complete. Preview's substep cap was decided on 2026-09-22 (docs/bench/presets.md).
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2). Its §6 lists the risks
 this spec resolves.
 **Branch base:** `main` after the hardening merge (PR #2, 0182146). This work
@@ -245,11 +245,13 @@ compare GPU output with a CPU reference, to about 1e-5.
 | Dissipation | fluid at rest: `q · exp(−rate·h)` to 1e-6 | `1 − rate·h` |
 | Open face | inflow across an open face samples 0, not the edge value | revert to the clamp |
 | Closed domain | from a warm start offset by 3, p's mean is ≈ 0 after the solve; a closed 16³ plume meets 2a's divergence-ratio rule | skip the mean removal |
-| Stored `p` | when `n` changes from 1 to 3 mid-run, the divergence ratio stays within 10% of a run at a constant 3 | store `h·p` again |
+| Stored `p` | after 24 substeps at h = 1/24, one 20-iteration projection at h = 1/72 still leaves at most GATE_RATIO (0.10) of the divergence | store `h·p` again |
 | Split submissions | forcing K = 1 is bit-identical to one submission | drop the dispatch recorded just before each flush |
-| Vorticity | `curl` and `confine` match the CPU; confinement strengthens a 16³ plume's total |ω| by at least 5% | flip the cross product |
+| Vorticity | `curl` and `confine` match the CPU; confinement strengthens a 16³ plume's total \|ω\| by at least 5% | flip the cross product |
 | `output_wanted` | with only density consumed, pool acquisitions fall by the unwanted copies | always return true |
 | Params | `cfl` 0, `max_substeps` 17, `substeps` together with `max_substeps`, a negative rate and an unknown preset are each a `DocError` | drop the `cfl` bound |
+
+The stored-`p` row replaced the plan's relative bound, because unconverged projections leave residual divergence that doesn't scale with h (measured 0.062 when correct, 0.20 when storing h·p).
 
 All of 2a's validation scenes (still domain, divergence-free, buoyant blob,
 determinism at frame 40 in order, after scrubbing and after eviction) run again

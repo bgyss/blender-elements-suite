@@ -14,9 +14,11 @@ Early. The engine and the first milestone of its smoke solver work; most of what
 - **A node graph and a headless CLI** that bake a scene to an OpenVDB sequence without Blender.
 - **A GPU smoke solver** (`crates/elements-ember`) on a dense grid:
   - staggered (MAC) velocity;
-  - semi-Lagrangian advection with trilinear sampling done by hand;
-  - Boussinesq buoyancy;
-  - red-black Gauss–Seidel pressure projection, warm-started from the previous frame, with solid walls and an open top;
+  - MacCormack advection over an RK2 backtrace, with trilinear sampling done by hand;
+  - substeps chosen each frame from the flow speed (CFL), capped per quality preset;
+  - Boussinesq buoyancy, vorticity confinement and dissipation;
+  - red-black Gauss–Seidel pressure projection, warm-started from the previous frame, with walls or open faces chosen per side;
+  - `preview` and `final` quality presets;
   - a sphere emitter.
 
   A frame is bit-identical however you reach it: playing forward, scrubbing back, or restoring from the cache.
@@ -33,10 +35,9 @@ The full tables and conditions are in [`docs/bench/speed-gate.md`](docs/bench/sp
 
 **Not yet**
 
-- Fire, vorticity confinement, dissipation, colliders and animated emitters. The plume above is smooth and laminar because of this.
-- Substeps chosen from the flow speed (CFL), and quality presets.
+- Fire, colliders, wind and animated emitters. These are next. The plume above predates vorticity confinement, which is why it is smooth and laminar.
 - A live preview in the Blender viewport. Today you bake to VDB and load the sequence.
-- A benchmark against Blender's built-in Mantaflow solver. That is next, and it will report where Mantaflow wins.
+- A benchmark against Blender's built-in Mantaflow solver. It follows the scene content above, and it will report where Mantaflow wins.
 
 The design documents are in [`docs/superpowers/specs/`](docs/superpowers/specs/), and the risks the next milestone starts from are in §6 of [the solver spec](docs/superpowers/specs/2026-09-21-ember-solver-design.md).
 

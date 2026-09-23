@@ -44,9 +44,9 @@ impl Quality {
     /// The preset's full parameter set.
     pub fn params(self) -> SolverParams {
         let (pressure_iterations, max_substeps) = match self {
-            // `max_substeps` is provisional until the preset sweep decides it
-            // (spec §6, `docs/bench/presets.md`).
-            Self::Preview => (160, 2),
+            // One substep: the largest cap whose 128³ frame fits in 100 ms
+            // (spec §6), decided 2026-09-22 in `docs/bench/presets.md`.
+            Self::Preview => (160, 1),
             // 480 iterations: ratio 0.0076 in `docs/bench/iteration-sweep.md`.
             Self::Final => (480, 8),
         };

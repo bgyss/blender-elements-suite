@@ -4,6 +4,8 @@
 **Status:** Piece 2a (§1–4) is complete. The 128³ gate passed, and the default is
 160 pressure iterations (`docs/bench/speed-gate.md`). §5 is the benchmark design,
 whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
+Piece 2b-1 (solver correctness) is complete; see `2026-09-22-ember-solver-2b1-design.md`.
+Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e) and the open part of (g) remain.
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
 ## 1. Goal and split
@@ -400,3 +402,8 @@ addresses.
   through-the-solver probe and asserts each of density and temperature
   matches rate × dt to 1e-5. Proved to fail by swapping the solver's source
   fields in `SmokeSolver::step`.
+- **(j) Preview frame cost.** A 128³ preview frame costs about 92 ms with
+  MacCormack, RK2 and the CFL readback, against 2a's 34 ms per step at the same
+  N (`docs/bench/presets.md`). That leaves about 8 ms of headroom at one
+  substep, with CFL clamped on every frame. The increase is unexplained and
+  should be profiled before 2b-3.
