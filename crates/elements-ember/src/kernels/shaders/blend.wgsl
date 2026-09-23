@@ -6,6 +6,7 @@
 @group(0) @binding(1) var weight: texture_3d<f32>;
 @group(0) @binding(2) var goal: texture_3d<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var solid: texture_3d<f32>;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -13,10 +14,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (any(gid >= grid_dims(axis))) {
         return;
     }
-    if (is_wall(axis, gid[axis])) {
+    let p = vec3<i32>(gid);
+    // Walls, and faces touching a collider (spec §3.2), are left alone.
+    if (is_wall(axis, gid[axis]) || face_solid(axis, p)) {
         return;
     }
-    let p = vec3<i32>(gid);
     let w = face_weight(weight, axis, p, params.dims);
     if (w <= 0.0) {
         return;

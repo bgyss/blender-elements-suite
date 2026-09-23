@@ -778,3 +778,70 @@ fn a_velocity_weight_without_a_target_is_an_error() {
     );
     run(&build(true), &mut pool, &mut pipelines).unwrap();
 }
+
+/// `plume_16(solver)` plus an `ember.collider` wired to solver inputs 4 and
+/// 5: a sphere of radius 0.1 at [10, 10, 10], wholly outside the domain.
+/// With `velocity: false`, only the SDF (input 4) is wired.
+fn plume_16_with_far_collider(solver: &str, velocity: bool) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(&plume_16(solver)).unwrap();
+    doc["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": 3, "kind": "ember.collider",
+            "params": {
+                "shape": { "sphere": { "radius": 0.1 } },
+                "transform": { "keys": [{ "frame": 0, "translate": [10.0, 10.0, 10.0] }] }
+            }
+        }));
+    let edges = doc["edges"].as_array_mut().unwrap();
+    edges.push(serde_json::json!({ "from_node": 3, "from_index": 0, "to_node": 1, "to_index": 4 }));
+    if velocity {
+        edges.push(
+            serde_json::json!({ "from_node": 3, "from_index": 1, "to_node": 1, "to_index": 5 }),
+        );
+    }
+    doc.to_string()
+}
+
+/// Spec §3.1: a collider entirely outside the domain changes nothing, bit for
+/// bit, so the solid code paths are exact when nothing is solid.
+#[test]
+fn a_collider_outside_the_domain_changes_nothing() {
+    let mut plain = Session::new(&plume_16(PREVIEW));
+    let mut far = Session::new(&plume_16_with_far_collider(PREVIEW, true));
+    let (mut a, mut b) = (timeline(0), timeline(0));
+    for frame in 1..=10 {
+        assert!(
+            plain.density_bits(&mut a, frame) == far.density_bits(&mut b, frame),
+            "frame {frame}"
+        );
+    }
+}
+
+/// Spec §3.1: a collider SDF without its velocity is an error naming both inputs.
+#[test]
+fn a_collider_sdf_without_its_velocity_is_an_error() {
+    let text = plume_16_with_far_collider(PREVIEW, false);
+    let (graph, dims) = Document::from_json(&text)
+        .unwrap()
+        .into_graph(&elements_ember::registry())
+        .unwrap();
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let err = timeline(0)
+        .goto(&graph, &gpu, &mut pool, &mut pipelines, dims, 1)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NodeError::IncompletePair {
+                connected: 4,
+                missing: 5,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}

@@ -53,7 +53,17 @@ fn buoyancy_matches_the_cpu_reference_and_leaves_boundary_faces_alone() {
 
     let u = Uniforms::new(&gpu, &c).unwrap();
     let mut batch = ComputeBatch::new();
-    buoyancy(&gpu, &mut cache, &mut batch, &u, &w, &density, &temperature).unwrap();
+    buoyancy(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &u,
+        &w,
+        &density,
+        &temperature,
+        None,
+    )
+    .unwrap();
     batch.submit(&gpu).unwrap();
 
     let mut want = w_before.clone();
@@ -100,7 +110,7 @@ fn velocity_emission_approaches_the_target_exponentially() {
     for _ in 0..3 {
         let mut batch = ComputeBatch::new();
         blend_velocity(
-            &gpu, &mut cache, &mut batch, &u, &velocity, &weight, &target,
+            &gpu, &mut cache, &mut batch, &u, &velocity, &weight, &target, None,
         )
         .unwrap();
         batch.submit(&gpu).unwrap();
@@ -142,7 +152,7 @@ fn wind_accelerates_every_non_wall_face_uniformly() {
     let u = Uniforms::new(&gpu, &c).unwrap();
     for _ in 0..4 {
         let mut batch = ComputeBatch::new();
-        wind(&gpu, &mut cache, &mut batch, &u, &velocity).unwrap();
+        wind(&gpu, &mut cache, &mut batch, &u, &velocity, None).unwrap();
         batch.submit(&gpu).unwrap();
     }
     let got = read_staggered(&gpu, &velocity);

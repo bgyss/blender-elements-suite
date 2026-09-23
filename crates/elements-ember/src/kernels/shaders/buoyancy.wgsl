@@ -6,6 +6,7 @@
 @group(0) @binding(1) var density: texture_3d<f32>;
 @group(0) @binding(2) var temperature: texture_3d<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var solid: texture_3d<f32>;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -17,6 +18,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let above = vec3<i32>(gid);
+    // A face touching a collider keeps the collider's velocity (spec §3.2).
+    if (face_solid(2u, above)) {
+        return;
+    }
     let below = above - vec3<i32>(0, 0, 1);
     let rho = 0.5 * (textureLoad(density, below, 0).x + textureLoad(density, above, 0).x);
     let temp = 0.5 * (textureLoad(temperature, below, 0).x + textureLoad(temperature, above, 0).x);

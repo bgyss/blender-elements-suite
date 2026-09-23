@@ -10,6 +10,8 @@
 @group(0) @binding(3) var src: texture_3d<f32>;
 @group(0) @binding(4) var dst: texture_storage_3d<r32float, write>;
 @group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var solid: texture_3d<f32>;
+@group(0) @binding(7) var obstacle: texture_3d<f32>;
 
 fn pass_over(gid: vec3<u32>, direction: f32, decay: f32) {
     let axis = params.axis;
@@ -17,14 +19,26 @@ fn pass_over(gid: vec3<u32>, direction: f32, decay: f32) {
         return;
     }
     let p = vec3<i32>(gid);
-    // Solid walls carry no normal velocity, before projection as well as
-    // after, so the divergence the solve sees matches what projection enforces.
-    if (axis != CELL && is_wall(axis, gid[axis])) {
+    if (axis != CELL) {
+        // Walls carry no normal velocity, and faces touching a collider carry
+        // its velocity (spec §3.2), before projection as well as after, so the
+        // divergence the solve sees matches what projection enforces.
+        if (is_wall(axis, gid[axis])) {
+            textureStore(dst, p, vec4<f32>(0.0));
+            return;
+        }
+        if (face_solid(axis, p)) {
+            textureStore(dst, p, vec4<f32>(textureLoad(obstacle, p, 0).x, 0.0, 0.0, 0.0));
+            return;
+        }
+    }
+    // Scalars inside solids are zeroed every substep (spec §3.2), as Mantaflow's resetInObstacle does.
+    if (axis == CELL && cell_solid(p)) {
         textureStore(dst, p, vec4<f32>(0.0));
         return;
     }
     let x = vec3<f32>(gid) + grid_offset(axis);
-    let value = sample_grid(src, axis, backtrace(x, direction) - grid_offset(axis));
+    let value = sample_fluid(src, axis, backtrace(x, direction) - grid_offset(axis));
     textureStore(dst, p, vec4<f32>(value * decay, 0.0, 0.0, 0.0));
 }
 

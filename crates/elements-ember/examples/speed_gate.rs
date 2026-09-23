@@ -126,7 +126,7 @@ fn divergence_at(
     let before = divergence(&state.read_velocity(gpu)?, cells, dx);
 
     let mut step = Substep::new(gpu, &constants)?;
-    step.project(gpu, &mut cache, &mut pool, &mut state, n)?;
+    step.project(gpu, &mut cache, &mut pool, &mut state, n, None)?;
     step.submit(gpu, &mut pool)?;
     let after = divergence(&state.read_velocity(gpu)?, cells, dx);
     Ok((before, after))

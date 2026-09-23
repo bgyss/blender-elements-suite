@@ -166,14 +166,20 @@ a cell per substep.
     harmless. A fluid pocket sealed off by solids is left to Gauss–Seidel:
     its constant mode drifts, but only its gradient reaches the velocity, and
     a constant has no gradient.
-- **Scalar sampling (`texel()`).** A solid texel returns the clamp-to-nearest
-  fluid value along the axis being clamped. The simpler "return 0" would
-  darken smoke along walls.
+- **Scalar sampling.** At an interpolation stencil touching a solid cell,
+  each solid corner takes the mean of the fluid corners of the same eight, or
+  0 if all eight are solid. The spec first said 'clamp to the nearest fluid
+  value along the axis'; that has no single meaning for a 3D stencil, so it
+  was replaced while planning.
 - **Buoyancy and wind** skip solid faces.
 - **Curl and confinement** treat solid neighbours like the domain edge.
 
-Scalars inside solids are not zeroed. With no flow through solid faces,
-advection carries nothing in, and §5's collider scene checks exactly that.
+**Scalars inside solids are zeroed** every substep by the scalar advection
+pass, as Mantaflow's `resetInObstacle` does. *Revised during
+implementation:* without it, a solid cell next to fluid samples that fluid,
+because its stencil's solid corners take the fluid mean, and the collider's
+outer layer filled with smoke (measured 0.80 of peak). Zeroing keeps the
+fluid-corner rule's purpose: fluid cells never read a solid's contents.
 
 ### 3.3 Velocity emission
 
@@ -234,7 +240,7 @@ Grids are at most 32³ and non-cubic, except where a test says otherwise.
 | Collider union | the SDF is the minimum, and each face's velocity comes from the nearer collider | take the velocity from the farther collider |
 | Velocity blend | still fluid in a fully occupied emitter reaches `u_e·(1 − exp(−rate·t))` | linear `rate·h` |
 | Solid faces | after projection, every solid face carries exactly the obstacle's velocity component along the face's axis | skip the solid test in `is_wall` |
-| Collider scene (umbrella §6) | plume past a static sphere at 32³: density inside the sphere stays at most 1% of the plume's peak over 40 frames; 2a's divergence rule holds | let `texel()` read solid texels |
+| Collider scene (umbrella §6) | plume past a static sphere at 32³: density inside stays at most 1% of peak (zeroed by construction); density beside the sphere exceeds twice the same measure with no collider (the plume is deflected) | `solidify` always writes 0, so smoke passes straight through the sphere |
 | Moving collider | a box pushed through still air drives mean flow ahead of it in its direction of motion; the divergence rule holds | obstacle velocity zero |
 | Wind | still air under uniform wind accelerates at the wind's rate, to 1e-5 | apply wind at wall faces too |
 | Sockets | occupancy without velocity, or SDF without velocity, is an error; a 2-input document steps bit-identically to before | require all six inputs |

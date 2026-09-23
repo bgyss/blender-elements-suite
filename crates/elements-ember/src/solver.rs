@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::boundaries::Boundaries;
 use crate::cfl;
-use crate::kernels::{self, Advection, Carried, Pass, StepConstants, Uniforms};
+use crate::kernels::{self, Advection, Carried, Pass, Solids, StepConstants, Uniforms};
 use crate::node_util::{pair, take_listed};
 use crate::params;
 
@@ -307,6 +307,8 @@ pub struct Sources<'a> {
     pub temperature: &'a Field,
     /// Velocity emission, when an emitter's weight and target are connected.
     pub emission: Option<Emission<'a>>,
+    /// The frame's collider, when its SDF and velocity are connected (spec §3.2).
+    pub solids: Option<Solids<'a>>,
 }
 
 impl<'a> Sources<'a> {
@@ -315,12 +317,20 @@ impl<'a> Sources<'a> {
             density,
             temperature,
             emission: None,
+            solids: None,
         }
     }
 
     pub fn with_emission(self, emission: Emission<'a>) -> Self {
         Self {
             emission: Some(emission),
+            ..self
+        }
+    }
+
+    pub fn with_solids(self, solids: Solids<'a>) -> Self {
+        Self {
+            solids: Some(solids),
             ..self
         }
     }
@@ -391,6 +401,7 @@ impl Substep {
                 &state.velocity,
                 e.weight,
                 e.velocity,
+                sources.solids,
             )?;
         }
         kernels::buoyancy(
@@ -401,12 +412,20 @@ impl Substep {
             state.velocity.face(Axis::Z),
             &state.density,
             &state.temperature,
+            sources.solids,
         )?;
         if self.wind {
-            kernels::wind(gpu, cache, &mut self.batch, u, &state.velocity)?;
+            kernels::wind(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &state.velocity,
+                sources.solids,
+            )?;
         }
         if self.vorticity {
-            self.confine_vorticity(gpu, cache, pool, state)?;
+            self.confine_vorticity(gpu, cache, pool, state, sources.solids)?;
         }
         let cells = self.uniforms.cells();
         let mut faces = Vec::with_capacity(3);
@@ -418,6 +437,7 @@ impl Substep {
                 Carried::Face(axis),
                 &state.velocity,
                 state.velocity.face(axis),
+                sources.solids,
             ) {
                 Ok(face) => faces.push(face),
                 Err(e) => {
@@ -444,6 +464,7 @@ impl Substep {
         cache: &mut PipelineCache,
         pool: &mut FieldPool,
         state: &SolverState,
+        solids: Option<Solids<'_>>,
     ) -> Result<(), GpuError> {
         let cells = self.uniforms.cells();
         let mut omega = Vec::with_capacity(4);
@@ -458,14 +479,33 @@ impl Substep {
         }
         let refs = [&omega[0], &omega[1], &omega[2], &omega[3]];
         let u = &self.uniforms;
-        let recorded = kernels::curl(gpu, cache, &mut self.batch, u, &state.velocity, refs)
-            .and_then(|()| kernels::confine(gpu, cache, &mut self.batch, u, &state.velocity, refs));
+        let recorded = kernels::curl(
+            gpu,
+            cache,
+            &mut self.batch,
+            u,
+            &state.velocity,
+            refs,
+            solids,
+        )
+        .and_then(|()| {
+            kernels::confine(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &state.velocity,
+                refs,
+                solids,
+            )
+        });
         // The batch may reference them whether or not recording finished.
         self.retired.extend(omega);
         recorded
     }
 
-    /// Stage 4: make the velocity divergence-free, warm-starting from `state.pressure`.
+    /// Stage 4: make the velocity divergence-free, warm-starting from
+    /// `state.pressure`. Faces touching `solids` end with the collider's velocity.
     pub fn project(
         &mut self,
         gpu: &GpuContext,
@@ -473,6 +513,7 @@ impl Substep {
         pool: &mut FieldPool,
         state: &mut SolverState,
         iterations: u32,
+        solids: Option<Solids<'_>>,
     ) -> Result<(), GpuError> {
         let u = &self.uniforms;
         let div = pool.acquire(gpu, u.cells(), FieldFormat::R32Float)?;
@@ -486,6 +527,7 @@ impl Substep {
                     &state.pressure,
                     &div,
                     iterations,
+                    solids,
                 )
             })
             .and_then(|()| {
@@ -496,6 +538,7 @@ impl Substep {
                     u,
                     &state.velocity,
                     &state.pressure,
+                    solids,
                 )
             });
         // The batch may reference `div` whether or not recording finished.
@@ -503,13 +546,15 @@ impl Substep {
         recorded
     }
 
-    /// Stage 5: carry density and temperature through the projected velocity.
+    /// Stage 5: carry density and temperature through the projected velocity,
+    /// never sampling the contents of `solids`.
     pub fn advect_scalars(
         &mut self,
         gpu: &GpuContext,
         cache: &mut PipelineCache,
         pool: &mut FieldPool,
         state: &mut SolverState,
+        solids: Option<Solids<'_>>,
     ) -> Result<(), GpuError> {
         let density = self.advect_grid(
             gpu,
@@ -518,6 +563,7 @@ impl Substep {
             Carried::Density,
             &state.velocity,
             &state.density,
+            solids,
         )?;
         self.retired
             .push(std::mem::replace(&mut state.density, density));
@@ -528,6 +574,7 @@ impl Substep {
             Carried::Temperature,
             &state.velocity,
             &state.temperature,
+            solids,
         )?;
         self.retired
             .push(std::mem::replace(&mut state.temperature, temperature));
@@ -536,6 +583,7 @@ impl Substep {
 
     /// `src`, carried through `velocity` into a fresh pooled field. Scratch
     /// fields, and the new field if recording fails, are retired.
+    #[allow(clippy::too_many_arguments)]
     fn advect_grid(
         &mut self,
         gpu: &GpuContext,
@@ -544,6 +592,7 @@ impl Substep {
         carried: Carried,
         velocity: &StaggeredField,
         src: &Field,
+        solids: Option<Solids<'_>>,
     ) -> Result<Field, GpuError> {
         let dst = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
         let recorded = match self.advection {
@@ -557,9 +606,10 @@ impl Substep {
                 velocity,
                 src,
                 &dst,
+                solids,
             ),
             Advection::MacCormack => {
-                self.maccormack(gpu, cache, pool, carried, velocity, src, &dst)
+                self.maccormack(gpu, cache, pool, carried, velocity, src, &dst, solids)
             }
         };
         match recorded {
@@ -582,6 +632,7 @@ impl Substep {
         velocity: &StaggeredField,
         src: &Field,
         dst: &Field,
+        solids: Option<Solids<'_>>,
     ) -> Result<(), GpuError> {
         let fwd = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
         let bwd = match pool.acquire(gpu, src.dims(), FieldFormat::R32Float) {
@@ -602,6 +653,7 @@ impl Substep {
             velocity,
             src,
             &fwd,
+            solids,
         )
         .and_then(|()| {
             kernels::advect(
@@ -614,6 +666,7 @@ impl Substep {
                 velocity,
                 &fwd,
                 &bwd,
+                solids,
             )
         })
         .and_then(|()| {
@@ -628,6 +681,7 @@ impl Substep {
                 &fwd,
                 &bwd,
                 dst,
+                solids,
             )
         });
         // The batch may reference both whether or not recording finished.
@@ -675,8 +729,8 @@ pub fn substep(
     let mut step = Substep::new(gpu, constants)?;
     let recorded = step
         .pre_projection(gpu, cache, pool, state, sources)
-        .and_then(|()| step.project(gpu, cache, pool, state, iterations))
-        .and_then(|()| step.advect_scalars(gpu, cache, pool, state));
+        .and_then(|()| step.project(gpu, cache, pool, state, iterations, sources.solids))
+        .and_then(|()| step.advect_scalars(gpu, cache, pool, state, sources.solids));
     match recorded {
         Ok(()) => step.submit(gpu, pool),
         Err(e) => {
@@ -764,6 +818,9 @@ impl SmokeSolver {
         if pair(ctx, 2, 3)? {
             wanted.extend([2, 3]);
         }
+        if pair(ctx, 4, 5)? {
+            wanted.extend([4, 5]);
+        }
         let inputs = take_listed(ctx, &wanted)?;
         let stepped = self.step(ctx, state, &inputs);
         for (_, value) in inputs {
@@ -812,6 +869,51 @@ impl SmokeSolver {
                 velocity: vector(3)?,
             });
         }
+        // Spec §3.2: the mask is rebuilt every frame from the collider's SDF,
+        // before the CFL measurement, and never stored.
+        let collider = match (find(4), find(5)) {
+            (Some(_), Some(_)) => Some((field(4)?, vector(5)?)),
+            _ => None,
+        };
+        let cells = ctx.dims();
+        let dx = ctx.voxel_size();
+        let mask = match collider {
+            None => None,
+            Some((sdf, _)) => Some(ctx.with_gpu_pool(|gpu, cache, pool| {
+                let mask = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
+                let built = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).and_then(|u| {
+                    let mut batch = ComputeBatch::new();
+                    kernels::solidify(gpu, cache, &mut batch, &u, sdf, &mask)?;
+                    batch.submit(gpu)
+                });
+                match built {
+                    Ok(()) => Ok(mask),
+                    Err(e) => {
+                        pool.release(mask);
+                        Err(e)
+                    }
+                }
+            })?),
+        };
+        if let (Some(mask), Some((_, velocity))) = (&mask, collider) {
+            sources = sources.with_solids(Solids { mask, velocity });
+        }
+        let stepped = self.step_frame(ctx, state, sources);
+        if let Some(mask) = mask {
+            ctx.release(Value::Field(mask));
+        }
+        stepped
+    }
+
+    /// The frame after the inputs are gathered: the CFL measurement, then
+    /// every substep.
+    fn step_frame(
+        &self,
+        ctx: &mut EvalCtx<'_>,
+        state: &mut SolverState,
+        sources: Sources<'_>,
+    ) -> Result<(), NodeError> {
+        let node = ctx.node_id();
         // Spec §3: one measurement per frame, from the entering state, so
         // the count is deterministic however the frame is reached.
         let dt = ctx.time().dt;
@@ -822,9 +924,12 @@ impl SmokeSolver {
         if plan.clamped {
             ctx.count_cfl_clamped();
         }
-        let constants =
-            self.params
-                .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx);
+        let constants = StepConstants {
+            has_solids: sources.solids.is_some(),
+            ..self
+                .params
+                .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx)
+        };
         let iterations = self.params.pressure_iterations;
         ctx.with_gpu_pool(|gpu, cache, pool| {
             for _ in 0..plan.count {
@@ -845,6 +950,8 @@ impl Node for SmokeSolver {
             inputs: vec![
                 SocketType::Field,
                 SocketType::Field,
+                SocketType::Field,
+                SocketType::VectorField,
                 SocketType::Field,
                 SocketType::VectorField,
             ],

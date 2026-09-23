@@ -4,7 +4,7 @@ use elements_core::gpu::{
     Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
 };
 
-use super::{Bind, Uniforms, bind_group, expect_dims};
+use super::{Bind, Solids, Uniforms, bind_group, expect_dims, solid_views};
 
 const ADD_SCALED: &str = concat!(
     include_str!("shaders/common.wgsl"),
@@ -13,18 +13,21 @@ const ADD_SCALED: &str = concat!(
 
 const BUOYANCY: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/buoyancy.wgsl"),
 );
 
 const BLEND: &str = concat!(
     include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
     include_str!("shaders/weights.wgsl"),
     include_str!("shaders/blend.wgsl"),
 );
 
 const WIND: &str = concat!(
     include_str!("shaders/common.wgsl"),
-    include_str!("shaders/wind.wgsl")
+    include_str!("shaders/solid.wgsl"),
+    include_str!("shaders/wind.wgsl"),
 );
 
 /// `dst += src * h`.
@@ -48,7 +51,8 @@ pub fn emit(
     Ok(())
 }
 
-/// Add buoyancy to the z faces of the velocity.
+/// Add buoyancy to the z faces of the velocity, except faces touching `solids`.
+#[allow(clippy::too_many_arguments)]
 pub fn buoyancy(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -57,6 +61,7 @@ pub fn buoyancy(
     velocity_z: &Field,
     density: &Field,
     temperature: &Field,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     let cells = u.cells();
     expect_dims(
@@ -66,6 +71,7 @@ pub fn buoyancy(
     )?;
     expect_dims("buoyancy density", density, cells)?;
     expect_dims("buoyancy temperature", temperature, cells)?;
+    let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.buoyancy", BUOYANCY, "main")?;
     let group = bind_group(
         gpu,
@@ -75,14 +81,16 @@ pub fn buoyancy(
             Bind::Tex(density),
             Bind::Tex(temperature),
             Bind::Buf(u.any()),
+            Bind::View(solid),
         ],
     )?;
     batch.dispatch(&pipeline, &group, velocity_z.dims());
     Ok(())
 }
 
-/// Pull every non-wall face toward `target` by 1 − exp(−w·h), where w is the
-/// face's velocity weight (spec §3.3).
+/// Pull every face that is neither a wall nor touching `solids` toward
+/// `target` by 1 − exp(−w·h), where w is the face's velocity weight (spec §3.3).
+#[allow(clippy::too_many_arguments)]
 pub fn blend_velocity(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -91,6 +99,7 @@ pub fn blend_velocity(
     velocity: &StaggeredField,
     weight: &Field,
     target: &StaggeredField,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     let cells = u.cells();
     expect_dims("blend weight", weight, cells)?;
@@ -101,6 +110,7 @@ pub fn blend_velocity(
             target.cells()
         )));
     }
+    let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.blend", BLEND, "main")?;
     for axis in Axis::ALL {
         let face = velocity.face(axis);
@@ -112,6 +122,7 @@ pub fn blend_velocity(
                 Bind::Tex(weight),
                 Bind::Tex(target.face(axis)),
                 Bind::Buf(u.axis(axis)),
+                Bind::View(solid),
             ],
         )?;
         batch.dispatch(&pipeline, &group, face.dims());
@@ -119,13 +130,15 @@ pub fn blend_velocity(
     Ok(())
 }
 
-/// Add h·wind at every non-wall face, on each axis whose wind is nonzero (spec §3.4).
+/// Add h·wind at every face that is neither a wall nor touching `solids`, on
+/// each axis whose wind is nonzero (spec §3.4).
 pub fn wind(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
     batch: &mut ComputeBatch,
     u: &Uniforms,
     velocity: &StaggeredField,
+    solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     if velocity.cells() != u.cells() {
         return Err(GpuError::Validation(format!(
@@ -134,13 +147,18 @@ pub fn wind(
             u.cells()
         )));
     }
+    let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.wind", WIND, "main")?;
     for (axis, a) in Axis::ALL.into_iter().zip(u.wind()) {
         if a == 0.0 {
             continue;
         }
         let face = velocity.face(axis);
-        let group = bind_group(gpu, &pipeline, &[Bind::Tex(face), Bind::Buf(u.axis(axis))])?;
+        let group = bind_group(
+            gpu,
+            &pipeline,
+            &[Bind::Tex(face), Bind::Buf(u.axis(axis)), Bind::View(solid)],
+        )?;
         batch.dispatch(&pipeline, &group, face.dims());
     }
     Ok(())

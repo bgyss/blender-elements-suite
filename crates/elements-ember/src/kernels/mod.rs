@@ -8,6 +8,7 @@
 mod advect;
 mod forces;
 mod project;
+mod solid;
 mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
@@ -16,9 +17,10 @@ pub use project::{
     CELL_SWEEPS_PER_SUBMIT, divergence, iterations_per_submit, pressure, remove_mean,
     solve_pressure, subtract_gradient,
 };
+pub use solid::solidify;
 pub use vorticity::{confine, curl};
 
-use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError};
+use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError, StaggeredField};
 use wgpu::util::DeviceExt;
 
 use crate::boundaries::DEFAULT_OPEN_MASK;
@@ -48,6 +50,8 @@ pub struct StepConstants {
     pub vorticity: f32,
     /// Wind, a uniform acceleration, m/s² (spec §3.4).
     pub wind: [f32; 3],
+    /// Whether this substep's kernels read a solid mask (spec §3.2).
+    pub has_solids: bool,
 }
 
 impl StepConstants {
@@ -68,6 +72,7 @@ impl StepConstants {
             temperature_dissipation: 0.0,
             vorticity: 0.0,
             wind: [0.0; 3],
+            has_solids: false,
         }
     }
 }
@@ -88,7 +93,8 @@ struct KernelParams {
     decay: f32,
     confinement: f32,
     face_accel: f32,
-    _pad: [u32; 2],
+    has_solids: u32,
+    _pad: u32,
 }
 
 // `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
@@ -115,6 +121,11 @@ pub struct Uniforms {
     cells: FieldDims,
     open_mask: u32,
     wind: [f32; 3],
+    has_solids: bool,
+    /// Bound as `solid` and `obstacle` when there are no solids. Kept so it
+    /// outlives its view.
+    _placeholder: wgpu::Texture,
+    placeholder_view: wgpu::TextureView,
 }
 
 impl Uniforms {
@@ -133,7 +144,8 @@ impl Uniforms {
                 decay,
                 confinement: c.vorticity * c.dx,
                 face_accel: if axis < 3 { c.wind[axis as usize] } else { 0.0 },
-                _pad: [0; 2],
+                has_solids: u32::from(c.has_solids),
+                _pad: 0,
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -150,6 +162,23 @@ impl Uniforms {
                 make(CELL, (-c.temperature_dissipation * c.h).exp()),
             )
         })?;
+        let placeholder = gpu.scoped(|| {
+            gpu.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("ember-no-solids"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        })?;
+        let placeholder_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
         Ok(Self {
             faces,
             density,
@@ -157,6 +186,9 @@ impl Uniforms {
             cells: c.cells,
             open_mask: c.open_mask,
             wind: c.wind,
+            has_solids: c.has_solids,
+            _placeholder: placeholder,
+            placeholder_view,
         })
     }
 
@@ -173,6 +205,16 @@ impl Uniforms {
     /// Wind, as in `StepConstants::wind`.
     pub(crate) fn wind(&self) -> [f32; 3] {
         self.wind
+    }
+
+    /// Whether kernels read a solid mask, as in `StepConstants::has_solids`.
+    pub(crate) fn has_solids(&self) -> bool {
+        self.has_solids
+    }
+
+    /// A 1×1×1 texture bound where a kernel has no mask or no obstacle to read.
+    pub(crate) fn placeholder(&self) -> &wgpu::TextureView {
+        &self.placeholder_view
     }
 
     pub(crate) fn axis(&self, axis: Axis) -> &wgpu::Buffer {
@@ -193,10 +235,51 @@ impl Uniforms {
     }
 }
 
+/// The frame's collider: the solid mask (1 inside) and the collider's
+/// velocity at every face (spec §3.2).
+#[derive(Clone, Copy)]
+pub struct Solids<'a> {
+    pub mask: &'a Field,
+    pub velocity: &'a StaggeredField,
+}
+
+/// The `solid` and `obstacle` views a kernel binds: the mask and the
+/// collider's velocity on `axis`'s faces, or the placeholder where a kernel
+/// has no axis or there are no solids. The uniform's `has_solids` must agree
+/// with `solids`, or kernels would read the placeholder as a mask.
+pub(crate) fn solid_views<'a>(
+    u: &'a Uniforms,
+    solids: Option<Solids<'a>>,
+    axis: Option<Axis>,
+) -> Result<(&'a wgpu::TextureView, &'a wgpu::TextureView), GpuError> {
+    if solids.is_some() != u.has_solids() {
+        return Err(GpuError::Validation(
+            "solids must be given exactly when StepConstants::has_solids is set".to_owned(),
+        ));
+    }
+    let Some(s) = solids else {
+        return Ok((u.placeholder(), u.placeholder()));
+    };
+    expect_dims("solid mask", s.mask, u.cells())?;
+    if s.velocity.cells() != u.cells() {
+        return Err(GpuError::Validation(format!(
+            "collider velocity {:?}, domain {:?}",
+            s.velocity.cells(),
+            u.cells()
+        )));
+    }
+    let obstacle = match axis {
+        Some(a) => s.velocity.face(a).view(),
+        None => u.placeholder(),
+    };
+    Ok((s.mask.view(), obstacle))
+}
+
 /// One bind group entry. Entries are bound at 0, 1, 2… in order.
 pub(crate) enum Bind<'a> {
     Tex(&'a Field),
     Buf(&'a wgpu::Buffer),
+    View(&'a wgpu::TextureView),
 }
 
 pub(crate) fn bind_group(
@@ -212,6 +295,7 @@ pub(crate) fn bind_group(
             resource: match entry {
                 Bind::Tex(field) => wgpu::BindingResource::TextureView(field.view()),
                 Bind::Buf(buffer) => buffer.as_entire_binding(),
+                Bind::View(view) => wgpu::BindingResource::TextureView(view),
             },
         })
         .collect();
