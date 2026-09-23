@@ -41,6 +41,12 @@ impl StateStore {
         }
     }
 
+    /// The value in `node`'s `slot`, if any. Read-only: benchmarks and
+    /// tests read state between frames through this.
+    pub fn get(&self, node: NodeId, slot: &'static str) -> Option<&Value> {
+        self.slots.get(&(node, slot))
+    }
+
     pub(crate) fn take(&mut self, node: NodeId, slot: &'static str) -> Option<Value> {
         self.slots.remove(&(node, slot))
     }

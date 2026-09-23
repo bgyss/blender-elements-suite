@@ -19,8 +19,10 @@ use crate::params;
 
 pub const KIND: &str = "ember.smoke_solver";
 
-const VELOCITY: &str = "velocity";
-const DENSITY: &str = "density";
+/// Names the solver's velocity state slot (a staggered field).
+pub const VELOCITY: &str = "velocity";
+/// Names the solver's density state slot (a cell-centred field).
+pub const DENSITY: &str = "density";
 const TEMPERATURE: &str = "temperature";
 /// Holds p. The warm start stays valid when h changes (spec §4.3).
 const PRESSURE: &str = "pressure";
