@@ -8,7 +8,7 @@ use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, Socke
 use serde::Deserialize;
 
 use crate::kernels::{Bind, axis_index, bind_group, expect_dims, uniform_buffer};
-use crate::node_util::acquire_cells;
+use crate::node_util::produce;
 use crate::params;
 use crate::transform::{Pose, Shape, ShapeGpu, Transform};
 
@@ -209,18 +209,8 @@ impl Node for Emitter {
         let time = ctx.time();
         let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
         let dx = ctx.voxel_size();
-        let cells = acquire_cells(ctx, 3)?;
-        let velocity = match ctx.acquire_vector_uninit() {
-            Ok(v) => v,
-            Err(e) => {
-                for field in cells {
-                    ctx.release(Value::Field(field));
-                }
-                return Err(e);
-            }
-        };
         let params = &self.params;
-        let filled = ctx.with_gpu(|gpu, cache| {
+        produce(ctx, 3, |gpu, cache, cells, velocity| {
             fill_emitter(
                 gpu,
                 cache,
@@ -232,19 +222,10 @@ impl Node for Emitter {
                     density: &cells[0],
                     temperature: &cells[1],
                     weight: &cells[2],
-                    velocity: &velocity,
+                    velocity,
                 },
             )
-        });
-        let mut values: Vec<Value> = cells.into_iter().map(Value::Field).collect();
-        values.push(Value::VectorField(velocity));
-        if let Err(e) = filled {
-            for value in values {
-                ctx.release(value);
-            }
-            return Err(e);
-        }
-        Ok(values)
+        })
     }
 }
 

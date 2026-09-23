@@ -5,7 +5,7 @@ use elements_core::gpu::{Axis, ComputeBatch, GpuContext, GpuError, PipelineCache
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 
 use crate::kernels::{Bind, axis_index, bind_group, uniform_buffer};
-use crate::node_util::{acquire_cells, take_inputs};
+use crate::node_util::{produce, take_inputs};
 use crate::shape_emitter::EmitterFields;
 
 pub const EMITTER_UNION_KIND: &str = "ember.emitter_union";
@@ -141,17 +141,7 @@ impl Node for EmitterUnion {
 
 fn union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, NodeError> {
     let (a, b) = (emitter_fields(inputs, 0)?, emitter_fields(inputs, 4)?);
-    let cells = acquire_cells(ctx, 3)?;
-    let velocity = match ctx.acquire_vector_uninit() {
-        Ok(v) => v,
-        Err(e) => {
-            for field in cells {
-                ctx.release(Value::Field(field));
-            }
-            return Err(e);
-        }
-    };
-    let merged = ctx.with_gpu(|gpu, cache| {
+    produce(ctx, 3, |gpu, cache, cells, velocity| {
         union_emitters(
             gpu,
             cache,
@@ -161,19 +151,10 @@ fn union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, Nod
                 density: &cells[0],
                 temperature: &cells[1],
                 weight: &cells[2],
-                velocity: &velocity,
+                velocity,
             },
         )
-    });
-    let mut values: Vec<Value> = cells.into_iter().map(Value::Field).collect();
-    values.push(Value::VectorField(velocity));
-    if let Err(e) = merged {
-        for value in values {
-            ctx.release(value);
-        }
-        return Err(e);
-    }
-    Ok(values)
+    })
 }
 
 pub(crate) fn build_emitter_union(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {

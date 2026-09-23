@@ -1955,7 +1955,7 @@ Spec §2.3 and §2.4.
 - Test: `crates/elements-ember/tests/collider.rs` (create)
 
 **Interfaces:**
-- Consumes: `Shape`, `Transform`, `Pose`, `ShapeGpu`, `shape.wgsl` (Task 1); `uniform_buffer`, `take_inputs`, `acquire_cells` and `GridGpu` (Task 2).
+- Consumes: `Shape`, `Transform`, `Pose`, `ShapeGpu`, `shape.wgsl` (Task 1); `uniform_buffer`, `take_inputs`, `GridGpu` and `node_util::produce(ctx, cells, fill) -> Result<Vec<Value>, NodeError>`, which acquires `cells` R32Float fields and one staggered field, runs `fill`, and releases everything on any failure (Task 2).
 - Produces:
   - `collider::KIND = "ember.collider"`
   - `ColliderParams { shape: Shape, transform: Transform }`, deriving `Serialize` and `Deserialize`. Task 7 serialises it into benchmark documents.
@@ -2314,6 +2314,7 @@ use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, Socke
 use serde::{Deserialize, Serialize};
 
 use crate::kernels::{Bind, axis_index, bind_group, uniform_buffer};
+use crate::node_util::produce;
 use crate::params;
 use crate::transform::{Pose, Shape, ShapeGpu, Transform};
 
@@ -2422,26 +2423,10 @@ impl Node for Collider {
         let time = ctx.time();
         let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
         let dx = ctx.voxel_size();
-        let sdf = ctx.acquire_uninit(elements_core::gpu::FieldFormat::R32Float)?;
-        let velocity = match ctx.acquire_vector_uninit() {
-            Ok(v) => v,
-            Err(e) => {
-                ctx.release(Value::Field(sdf));
-                return Err(e);
-            }
-        };
         let params = &self.params;
-        let filled = ctx.with_gpu(|gpu, cache| {
-            fill_collider(gpu, cache, params, &pose, dx, ColliderFields { sdf: &sdf, velocity: &velocity })
-        });
-        let values = vec![Value::Field(sdf), Value::VectorField(velocity)];
-        if let Err(e) = filled {
-            for value in values {
-                ctx.release(value);
-            }
-            return Err(e);
-        }
-        Ok(values)
+        produce(ctx, 1, |gpu, cache, cells, velocity| {
+            fill_collider(gpu, cache, params, &pose, dx, ColliderFields { sdf: &cells[0], velocity })
+        })
     }
 }
 
@@ -2539,25 +2524,9 @@ impl Node for ColliderUnion {
 fn collider_union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, NodeError> {
     let a = ColliderFields { sdf: inputs[0].as_field()?, velocity: inputs[1].as_vector_field()? };
     let b = ColliderFields { sdf: inputs[2].as_field()?, velocity: inputs[3].as_vector_field()? };
-    let sdf = ctx.acquire_uninit(elements_core::gpu::FieldFormat::R32Float)?;
-    let velocity = match ctx.acquire_vector_uninit() {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.release(Value::Field(sdf));
-            return Err(e);
-        }
-    };
-    let merged = ctx.with_gpu(|gpu, cache| {
-        union_colliders(gpu, cache, a, b, ColliderFields { sdf: &sdf, velocity: &velocity })
-    });
-    let values = vec![Value::Field(sdf), Value::VectorField(velocity)];
-    if let Err(e) = merged {
-        for value in values {
-            ctx.release(value);
-        }
-        return Err(e);
-    }
-    Ok(values)
+    produce(ctx, 1, |gpu, cache, cells, velocity| {
+        union_colliders(gpu, cache, a, b, ColliderFields { sdf: &cells[0], velocity })
+    })
 }
 
 pub(crate) fn build_collider_union(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
