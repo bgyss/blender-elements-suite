@@ -466,3 +466,33 @@ part of (g), and (j).
     substeps also need MacCormack to get cheaper, for example by storing the
     backtrace point instead of recomputing it and unrolling the corner loops.
     Semi-Lagrangian at 2 substeps takes 107 ms today, over the budget.
+
+  **Root causes, 2026-09-23 (branch `pressure-kernel`).** Two separate causes
+  slow the pressure solve. The first is fixed; the second is not.
+
+  1. **Fixed in 5536e87: the axis loop in `pressure.wgsl`.** The per-iteration
+     cost was bisected commit by commit (exported trees, each rebuilt). It is
+     0.19 ms through 23e8d6e and 0.27 ms from 45a8e1f, the commit that turned
+     the six neighbour checks into a loop over axes. Timed alone at 128³, the
+     looped kernel runs at 0.279 ms per iteration, the same stencil written
+     out per side at 0.198, and 2a's kernel at 0.208, whatever the data. The
+     per-cell division and the open-face checks cost nothing measurable.
+  2. **Open, and probably not in the code: variable in-scene slowdowns.**
+     Inside MacCormack substeps the solve sometimes runs at about 0.30 ms per
+     iteration instead of 0.195, which is up to about 17 ms of a preview frame
+     at N = 160.
+     - **What it is not:** the values, subnormal or non-finite values, the
+       shared submission, the placement of fresh textures (all 56 pairings are
+       fast), or pool recycling. A dedicated, never-recycled divergence texture
+       is just as slow.
+     - **The key evidence:** the same program gave 46–52 ms for a projection in
+       one run and 33–37 ms a minute later. After 5 s of GPU idle, both the
+       pooled and the dedicated version take 32 ms. The slowdown shows up after
+       sustained heavy GPU work, such as seconds of combined MacCormack
+       substeps, and it varies with time. An earlier impression that it
+       followed particular textures was confounded by that timing.
+     - **Likely source:** GPU clock, thermal or contention state on a machine
+       that stayed heavily loaded (load averages 10–100), not our code.
+     - **Next steps:** measure on an idle machine, over a sustained run, with a
+       Metal GPU capture or Instruments' GPU counters. Treat presets.md's
+       timings as upper bounds until then.
