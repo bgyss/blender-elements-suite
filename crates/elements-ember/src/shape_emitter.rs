@@ -26,6 +26,20 @@ const FACES_WGSL: &str = concat!(
     include_str!("kernels/shaders/emitter_faces.wgsl"),
 );
 
+/// Noise that modulates an emitter's rates (spec §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Noise {
+    pub seed: u64,
+    /// Size of one noise cell, metres.
+    pub scale_m: f32,
+    /// 0 turns the noise off; 1 lets it cut emission to zero.
+    pub amplitude: f32,
+    /// How fast the pattern changes, per second; 0 is a still pattern.
+    #[serde(default)]
+    pub evolution: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmitterParams {
@@ -44,6 +58,9 @@ pub struct EmitterParams {
     /// velocity emission off (spec §3.3).
     #[serde(default)]
     pub velocity_blend: f32,
+    /// Optional noise that multiplies the rates.
+    #[serde(default)]
+    pub noise: Option<Noise>,
 }
 
 impl EmitterParams {
@@ -56,6 +73,7 @@ impl EmitterParams {
             temperature_rate: 0.0,
             velocity: [0.0; 3],
             velocity_blend: 0.0,
+            noise: None,
         }
     }
 }
@@ -108,7 +126,13 @@ struct EmitterGpu {
 const _: () = assert!(std::mem::size_of::<EmitterGpu>() == 80);
 
 impl EmitterGpu {
-    fn new(p: &EmitterParams, cells: [u32; 3], dx: f32, _seconds: f64) -> Self {
+    fn new(p: &EmitterParams, cells: [u32; 3], dx: f32, seconds: f64) -> Self {
+        let noise = p.noise.unwrap_or(Noise {
+            seed: 0,
+            scale_m: 1.0,
+            amplitude: 0.0,
+            evolution: 0.0,
+        });
         Self {
             dims: cells,
             dx,
@@ -117,12 +141,14 @@ impl EmitterGpu {
             density_rate: p.density_rate,
             temperature_rate: p.temperature_rate,
             velocity_blend: p.velocity_blend,
-            noise_on: 0,
-            noise_scale: 1.0,
-            noise_amplitude: 0.0,
-            noise_w: 0.0,
-            seed_lo: 0,
-            seed_hi: 0,
+            noise_on: u32::from(p.noise.is_some()),
+            noise_scale: noise.scale_m,
+            noise_amplitude: noise.amplitude,
+            // Time enters only through this coordinate, so a frame's pattern
+            // depends on the document's time alone.
+            noise_w: (f64::from(noise.evolution) * seconds) as f32,
+            seed_lo: noise.seed as u32,
+            seed_hi: (noise.seed >> 32) as u32,
             _pad: [0; 3],
         }
     }
@@ -247,6 +273,15 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
     )?;
     if p.velocity_blend < 0.0 {
         return Err(params::bad(KIND, "velocity_blend must be at least 0"));
+    }
+    if let Some(n) = p.noise {
+        params::finite(KIND, "noise", &[n.scale_m, n.amplitude, n.evolution])?;
+        if n.scale_m <= 0.0 {
+            return Err(params::bad(KIND, "noise scale_m must be positive"));
+        }
+        if !(0.0..=1.0).contains(&n.amplitude) {
+            return Err(params::bad(KIND, "noise amplitude must be in [0, 1]"));
+        }
     }
     Ok(Box::new(Emitter { params: p }))
 }
