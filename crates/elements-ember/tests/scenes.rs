@@ -3,6 +3,7 @@ mod common;
 use common::*;
 use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, PipelineCache};
 use elements_ember::bench::GATE_RATIO;
+use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::emitter::{Sphere, fill_sphere};
 use elements_ember::kernels::StepConstants;
 use elements_ember::metrics::{centroid_z, divergence};
@@ -32,10 +33,9 @@ fn the_centroid_is_in_cell_units_at_cell_centres() {
     assert_eq!(centroid_z(&vec![0.0; cells.voxel_count()], cells), None);
 }
 
-/// Umbrella §6, spec §4.2: projection cuts RMS divergence to at most 10% of
-/// its value before projection, at the default iteration count the gate chose.
-#[test]
-fn projection_leaves_at_most_a_tenth_of_the_divergence() {
+/// RMS divergence after projection over before it, after 20 frames of the
+/// 16³ plume with the given open faces.
+fn projection_ratio(open_mask: u32) -> f64 {
     const ITERATIONS: u32 = 160;
     let gpu = gpu();
     let mut pool = FieldPool::new();
@@ -65,6 +65,7 @@ fn projection_leaves_at_most_a_tenth_of_the_divergence() {
     };
     let constants = StepConstants {
         beta: 1.0,
+        open_mask,
         ..StepConstants::new(cells, 1.0 / 24.0, dx)
     };
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
@@ -88,13 +89,22 @@ fn projection_leaves_at_most_a_tenth_of_the_divergence() {
     let after = divergence(&state.read_velocity(&gpu).unwrap(), cells, dx);
 
     assert!(before.rms > 0.0, "the plume must be moving");
-    assert!(
-        after.rms <= 0.1 * before.rms,
-        "RMS divergence {} -> {} (ratio {})",
-        before.rms,
-        after.rms,
-        after.rms / before.rms
-    );
+    after.rms / before.rms
+}
+
+/// Umbrella §6, spec §4.2: projection cuts RMS divergence to at most 10% of
+/// its value before projection, at the default iteration count the gate chose.
+#[test]
+fn projection_leaves_at_most_a_tenth_of_the_divergence() {
+    let ratio = projection_ratio(DEFAULT_OPEN_MASK);
+    assert!(ratio <= 0.1, "ratio {ratio}");
+}
+
+/// Spec §4.2: with every face a wall, the same rule holds.
+#[test]
+fn a_closed_box_meets_the_same_divergence_rule() {
+    let ratio = projection_ratio(0);
+    assert!(ratio <= 0.1, "ratio {ratio}");
 }
 
 /// Umbrella §6: a hot blob rises, and its density centroid climbs strictly

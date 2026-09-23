@@ -116,13 +116,18 @@ becomes `face_is_wall || solid(cell)`.
   resolves risk (d). Inflow through an open face stays allowed.
 - **Buoyancy** skips boundary faces through `is_wall` and the open mask. It no
   longer hard-codes `z = 0` and `z = n`.
-- **Fully closed domain** (`open_mask == 0`): the Neumann system is singular.
-  Before the solve, a sum-reduction's mean is subtracted from the divergence, so
-  the system is consistent. After the solve, the mean of `p` is subtracted, so
-  the warm start cannot drift. Both stay on the GPU: the reduction writes a
-  one-element buffer that the next dispatch reads, with no readback. This matches
-  what Mantaflow's `zeroPressureFixing` achieves, but without pinning a cell,
-  which Gauss–Seidel would converge poorly around.
+- **Fully closed domain** (`open_mask == 0`): the Neumann system is singular,
+  and p is defined only up to a constant. After the solve, p's mean is
+  removed with a GPU sum reduction and a subtract pass, with no readback, so
+  the warm start cannot drift. This matches what Mantaflow's
+  `zeroPressureFixing` achieves, but without pinning a cell, which
+  Gauss–Seidel would converge poorly around. *Revised while writing the plan:*
+  removing the divergence's mean before the solve was dropped. Gauss–Seidel
+  converges in every non-constant component even on an inconsistent system,
+  and the only effect of inconsistency is a drift in the constant, which
+  removing p's mean takes out. A closed box's divergence also sums to zero up
+  to rounding, since it telescopes to wall faces. No test could observe the
+  step.
 
 ### 4.3 Pressure
 
@@ -239,7 +244,7 @@ compare GPU output with a CPU reference, to about 1e-5.
 | MacCormack | matches the CPU reference; a smooth bump keeps a higher peak than semi-Lagrangian after k steps; a step input never leaves the source min/max | remove the clamp |
 | Dissipation | fluid at rest: `q · exp(−rate·h)` to 1e-6 | `1 − rate·h` |
 | Open face | inflow across an open face samples 0, not the edge value | revert to the clamp |
-| Closed domain | 2a's divergence-ratio rule holds; mean `p` stays ≈ 0 over 20 frames | skip removing the mean divergence |
+| Closed domain | from a warm start offset by 3, p's mean is ≈ 0 after the solve; a closed 16³ plume meets 2a's divergence-ratio rule | skip the mean removal |
 | Stored `p` | when `n` changes from 1 to 3 mid-run, the divergence ratio stays within 10% of a run at a constant 3 | store `h·p` again |
 | Split submissions | forcing K = 1 is bit-identical to one submission | drop the dispatch recorded just before each flush |
 | Vorticity | `curl` and `confine` match the CPU; ε = 0 is bit-identical to skipping the stage | flip the cross product |

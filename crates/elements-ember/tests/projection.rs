@@ -3,7 +3,9 @@ mod common;
 use common::*;
 use elements_core::gpu::{ComputeBatch, FieldDims, FieldFormat, FieldPool, PipelineCache};
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
-use elements_ember::kernels::{StepConstants, Uniforms, divergence, pressure, subtract_gradient};
+use elements_ember::kernels::{
+    StepConstants, Uniforms, divergence, pressure, solve_pressure, subtract_gradient,
+};
 
 const CELLS: FieldDims = FieldDims { x: 8, y: 6, z: 5 };
 
@@ -165,6 +167,35 @@ fn subtracting_the_gradient_zeroes_solid_walls_and_matches_the_cpu() {
             }
         }
     }
+}
+
+/// Spec §4.2: in a closed domain p is defined only up to a constant, so the
+/// solve removes p's mean, and a warm start cannot drift. Here the warm
+/// start is offset by 3; afterwards the mean is gone.
+#[test]
+fn a_closed_domain_solve_leaves_p_with_zero_mean() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let c = StepConstants {
+        open_mask: 0,
+        ..constants(1.0)
+    };
+    let div = upload(&gpu, &mut pool, CELLS, &pattern(CELLS, 8));
+    let p0: Vec<f32> = pattern(CELLS, 9).iter().map(|v| v + 3.0).collect();
+    let p = upload(&gpu, &mut pool, CELLS, &p0);
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let mut batch = ComputeBatch::new();
+    solve_pressure(&gpu, &mut cache, &mut batch, &u, &p, &div, 40).unwrap();
+    batch.submit(&gpu).unwrap();
+
+    let got = p.read_back(&gpu).unwrap();
+    let mean = got.iter().map(|&v| f64::from(v)).sum::<f64>() / got.len() as f64;
+    let max = got.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        mean.abs() <= 1e-3 * f64::from(max),
+        "mean {mean}, max {max}"
+    );
 }
 
 /// Divergence, a converged solve, then the gradient: the result is

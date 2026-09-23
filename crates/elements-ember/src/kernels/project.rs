@@ -1,7 +1,8 @@
 //! Pressure projection (stage 4).
 
 use elements_core::gpu::{
-    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
+    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, ReduceOp, ReduceTarget,
+    StaggeredField, reduce,
 };
 
 use super::{Bind, Uniforms, bind_group, expect_dims};
@@ -19,6 +20,11 @@ const PRESSURE: &str = concat!(
 const GRADIENT: &str = concat!(
     include_str!("shaders/common.wgsl"),
     include_str!("shaders/gradient.wgsl"),
+);
+
+const SUBTRACT_MEAN: &str = concat!(
+    include_str!("shaders/common.wgsl"),
+    include_str!("shaders/subtract_mean.wgsl"),
 );
 
 fn expect_velocity(what: &str, velocity: &StaggeredField, u: &Uniforms) -> Result<(), GpuError> {
@@ -83,6 +89,54 @@ pub fn pressure(
     for _ in 0..iterations {
         batch.dispatch(&red, &red_group, u.cells());
         batch.dispatch(&black, &black_group, u.cells());
+    }
+    Ok(())
+}
+
+/// Remove `field`'s mean on the GPU, with no readback: a sum reduction into
+/// `sum` (one slot), then a pass subtracting sum / cells. The bind groups
+/// keep `sum` alive until the batch has run.
+pub fn remove_mean(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    field: &Field,
+    sum: &ReduceTarget,
+) -> Result<(), GpuError> {
+    expect_dims("remove_mean field", field, u.cells())?;
+    reduce(gpu, cache, batch, field, ReduceOp::Sum, sum, 0)?;
+    let pipeline = cache.get_or_create(gpu, "ember.subtract_mean", SUBTRACT_MEAN, "main")?;
+    let group = bind_group(
+        gpu,
+        &pipeline,
+        &[
+            Bind::Tex(field),
+            Bind::Buf(sum.buffer()),
+            Bind::Buf(u.any()),
+        ],
+    )?;
+    batch.dispatch(&pipeline, &group, u.cells());
+    Ok(())
+}
+
+/// The whole pressure solve: `iterations` red-black sweeps on `p`, starting
+/// from whatever `p` holds (the warm start). In a closed domain (every face
+/// a wall) the Neumann system defines p only up to a constant, so p's mean
+/// is removed afterwards and the warm start cannot drift (spec §4.2).
+pub fn solve_pressure(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    u: &Uniforms,
+    p: &Field,
+    div: &Field,
+    iterations: u32,
+) -> Result<(), GpuError> {
+    pressure(gpu, cache, batch, u, p, div, iterations)?;
+    if u.open_mask() == 0 {
+        let sum = ReduceTarget::new(gpu, 1)?;
+        remove_mean(gpu, cache, batch, u, p, &sum)?;
     }
     Ok(())
 }

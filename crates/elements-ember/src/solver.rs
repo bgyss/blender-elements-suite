@@ -218,7 +218,7 @@ impl Substep {
         let div = pool.acquire(gpu, u.cells(), FieldFormat::R32Float)?;
         let recorded = kernels::divergence(gpu, cache, &mut self.batch, u, &state.velocity, &div)
             .and_then(|()| {
-                kernels::pressure(
+                kernels::solve_pressure(
                     gpu,
                     cache,
                     &mut self.batch,
