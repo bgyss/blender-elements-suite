@@ -9,7 +9,7 @@ outside Blender.
 
 import math
 
-# Ember's inflow is matched to Mantaflow's at this frame (the brief's choice).
+# Ember's temperature at the emitter is matched to Mantaflow's at this frame.
 MATCH_FRAME = 24
 
 
@@ -32,18 +32,27 @@ def buoyancy(
 def inflow(density_rate: float, temperature_rate: float, fps: float) -> tuple[float, float]:
     """Return the flow object's (density, temperature) for Ember's rates.
 
-    Ember adds rate * h each substep, so at the emitter centre it holds
-    rate * MATCH_FRAME / fps at frame MATCH_FRAME (0.99 measured at 64³ for
-    rate 1 at 24 fps). Mantaflow's INFLOW holds its flow's values in the
-    emitter from the first frame. Its density is clamped to [0, 1].
+    The flow must be additive (`use_absolute = False`), with
+    `surface_distance = 0` and `volume_density = 1`, and the domain must take
+    one solver step per frame.
+
+    Density is added each step, so it gets Ember's rate times the step:
+    density_rate / fps. Temperature cannot be added up: Mantaflow raises the
+    emitter's heat to the flow's temperature and never above it. It is set to
+    Ember's emitter-centre value at MATCH_FRAME, temperature_rate *
+    MATCH_FRAME / fps.
     """
-    # fluid.cc apply_inflow_fields: density_in is clamped to [0, 1], and heat is
-    # raised to the flow's temperature. Confirmed by the 64³ plume experiment.
-    seconds = MATCH_FRAME / fps
-    density, temperature = density_rate * seconds, temperature_rate * seconds
+    # fluid.cc: before each frame's emission the inflow grids are reset to the
+    # current grids, then apply_inflow_fields adds density * emission (clamped
+    # to [0, 1]) when use_absolute is off, and sets heat with ADD_IF_LOWER,
+    # which stops at the flow's temperature. sample_mesh gives emission 1 inside
+    # the mesh (volume_density) and a falloff to surface_distance cells
+    # outside, so surface_distance = 0 emits Ember's sphere volume. Confirmed at
+    # 64³: mass 0.97-1.03 of Ember's over frames 12-60.
+    density = density_rate / fps
     if not 0.0 <= density <= 1.0:
         raise ValueError(f"Mantaflow clamps flow density to [0, 1], got {density}")
-    return density, temperature
+    return density, temperature_rate * MATCH_FRAME / fps
 
 
 def vorticity(ember_confinement: float, fps: float) -> float:

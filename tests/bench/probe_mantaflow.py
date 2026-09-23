@@ -14,6 +14,8 @@ Options, all optional, for the experiments in docs/bench/mantaflow-notes.md:
   init_vel=X,Y,Z    give the flow an initial velocity (m/s)
   density=D         the flow's density (default Blender's, 1)
   temperature=T     the flow's temperature difference (default Blender's, 1)
+  absolute=0|1      the flow's use_absolute (default Blender's, 1: hold the value)
+  surface=S         the flow's surface_distance, in cells (default Blender's, 1.5)
   alpha=A beta=B    the domain's buoyancy coefficients
   vorticity=V       the domain's vorticity
   wind=S            add a WIND force field of strength S blowing along +x
@@ -94,6 +96,10 @@ def main() -> None:
             f.density = float(opts["density"])
         if "temperature" in opts:
             f.temperature = float(opts["temperature"])
+        if "surface" in opts:
+            f.surface_distance = float(opts["surface"])
+        if "absolute" in opts:
+            f.use_absolute = opts["absolute"] == "1"
         if "init_vel" in opts:
             f.use_initial_velocity = True
             f.velocity_factor = 0.0
@@ -132,6 +138,8 @@ def main() -> None:
     settings["gravity"] = list(settings["gravity"])
     settings["scene_gravity"] = list(scene.gravity)
     settings["use_scene_gravity"] = scene.use_gravity
+    if opts.get("flow", "1") == "1":
+        settings["use_absolute"] = f.use_absolute
     settings["borders"] = {
         side: getattr(s, f"use_collision_border_{side}")
         for side in ("front", "back", "right", "left", "top", "bottom")

@@ -207,7 +207,9 @@ frameLength`, so there is one solver step per frame.
 def buoyancy(ember_density: float, ember_temperature: float, domain_size: float, gravity: float) -> tuple[float, float]
     # (alpha, beta); domain_size = the longest side in m, gravity = |g| in m/s² (Blender default 9.81)
 def inflow(density_rate: float, temperature_rate: float, fps: float) -> tuple[float, float]
-    # the flow's (density, temperature); raises ValueError if density leaves [0, 1]
+    # the flow's (density, temperature) = (density_rate / fps, temperature_rate * 24 / fps);
+    # needs use_absolute = False, surface_distance = 0, volume_density = 1;
+    # raises ValueError if density leaves [0, 1]
 def vorticity(ember_confinement: float, fps: float) -> float
 def wind(ember_accel: tuple[float, float, float], fps: float) -> tuple[float, tuple[float, float, float]]
     # (strength, unit direction); (0.0, (0, 0, 1)) for no wind
@@ -234,8 +236,9 @@ gravity is converted to cells per unit² by `scaleAcceleration = (n / L) · 0.4�
 | Wind | uniform acceleration a, m/s², every cell | `WIND` field, strength S | `S = |a| / (0.2 · fps)`: 0.5 m/s² at 24 fps gives 0.1042 | `fluid.cc` `update_effectors_task_cb` (× 0.2, clamp ±1); `effect.cc` `do_physical_effector` (÷ fps, `vel_to_sec`); then `scaleSpeedFrames` and `addForceField` | yes, below |
 | Wind falloff | none | `falloff_type = "SPHERE"`, `falloff_power = 0`, `use_min_distance = use_max_distance = False`, `z_direction = "BOTH"`, `flow = 0` | power 0 makes the falloff 1 everywhere; `flow` (default 1 for WIND) would add drag towards the smoke's own velocity | `effect.cc` `effector_falloff`, `falloff_func` | yes (used in the check) |
 | Wind direction | the acceleration vector | the field object's local +z | object rotation `rotation_to(direction)` (quaternion) | `effect.cc`, `PFIELD_WIND` uses `efd->nor` | yes for +x |
-| Inflow | adds `rate · occupancy · h` each substep | `INFLOW` holds `min(density, 1)` and raises heat to `temperature` in the emitter every step | `density = rate · 24 / fps`, `temperature = rate · 24 / fps`: Ember's emitter-centre value at frame 24 | `fluid.cc` `apply_inflow_fields`; `initplugins.cpp` `applyEmission`; Ember measured below | yes, below |
-| Emitter volume | a filled sphere | a mesh flow emits a **shell** by default (`volume_density = 0`) | set `volume_density = 1` | `fluid.cc` `sample_mesh`; a 32³ bake showed a hollow emitter | observed |
+| Inflow, density | adds `rate · occupancy · h` each substep | with `use_absolute = False`, adds `density · emission` once per frame and clamps to [0, 1]; with `use_absolute = True` (Blender's default) it holds the value instead | `use_absolute = False`, `density = density_rate / fps` | `fluid.cc` `apply_inflow_fields` (and the reset of the inflow grids to the current grids before emission); `initplugins.cpp` `applyEmission` | yes: mass 0.97–1.03 of Ember's, below |
+| Inflow, temperature | adds `rate · occupancy · h` each substep | raises heat to `temperature` in the emitter (`ADD_IF_LOWER`), never above it, in both modes | `temperature = temperature_rate · 24 / fps`: Ember's emitter-centre value at frame 24 | `fluid.cc` `ADD_IF_LOWER`, `apply_inflow_fields` | yes: held at 1.000, below |
+| Emitter volume | a filled sphere with a one-cell soft edge | a mesh flow emits a **shell** by default (`volume_density = 0`), plus a falloff out to `surface_distance` cells outside the mesh (default 1.0) | `volume_density = 1`, `surface_distance = 0` | `fluid.cc` `sample_mesh`; a 32³ bake showed a hollow emitter; the default `surface_distance` added 33% mass | yes, below |
 | Emitter activity | `active_frames` [1, 60] | no equivalent setting | keyframe the flow's emission off after frame 60 (spec §5) | — | not tested here |
 | Substeps | `max_substeps` (preview: 1) | `timesteps_min = timesteps_max` | equal | generated script | yes (script) |
 | Boundaries | closed sides and floor, open top | all six sides **open** by default (`xXyYzZ`) | `use_collision_border_{front,back,left,right,bottom} = True`, `top = False` (probe `bench=1`) | generated script: `boundConditions` | yes (script) |
@@ -260,38 +263,63 @@ All baked with the probe. Velocities are converted with the units rule above.
 - **Inflow.** Ember's bench `plume` at 64³ (`Scene::plume`, read back): the
   density at the emitter centre (mean of the 2×2 cells about x = y = 1 m in the
   layer at z = 0.3 m) is 0.25, 0.50 and **0.99** at frames 6, 12 and **24**,
-  so rate · t while the plume is still. Mantaflow with `inflow(1, 1, 24)`
-  = (1, 1) (`bench=1 volume=1 density=1 temperature=1 alpha=0
-  beta=0.2039`) holds density **1.000** and temperature **1.000** at the same
-  cells in every checked frame (12–60). The two differ by design before frame
-  24: Mantaflow's emitter is full from frame 1 and Ember's fills over a second.
-  As a result, Mantaflow's plume holds more mass (0.174 against Ember's
-  0.0855 density·m³ at frame 60) and rises a little faster (centroid height
-  0.87 m against 0.78 m at frame 60). The comparison is on shape-level
-  metrics, and the summary must say that the emitters are not equivalent.
+  so rate · t while the plume is still. Three Mantaflow modes, all 64³ with
+  `bench=1 volume=1 alpha=0 beta=0.2039 temperature=1`, against Ember. Mass is
+  total density · dV and cz is the density centroid's height:
+
+  | Frame | Ember mass / cz | absolute, density 1 | additive, density 1/24, `surface_distance` 1.0 | **additive, density 1/24, `surface_distance` 0** |
+  |---|---|---|---|---|
+  | 12 | 0.0169 / 0.310 | 0.0527 (×3.12) / 0.333 | 0.0225 (×1.33) / 0.342 | **0.0163 (×0.97) / 0.333** |
+  | 24 | 0.0338 / 0.371 | 0.0808 (×2.39) / 0.422 | 0.0452 (×1.34) / 0.476 | **0.0338 (×1.00) / 0.457** |
+  | 36 | 0.0510 / 0.512 | 0.1172 (×2.30) / 0.558 | 0.0668 (×1.31) / 0.639 | **0.0503 (×0.99) / 0.604** |
+  | 48 | 0.0672 / 0.658 | 0.1426 (×2.12) / 0.714 | 0.0891 (×1.33) / 0.781 | **0.0678 (×1.01) / 0.742** |
+  | 60 | 0.0855 / 0.781 | 0.1740 (×2.04) / 0.872 | 0.1161 (×1.36) / 0.955 | **0.0884 (×1.03) / 0.925** |
+
+  (A `surface_distance` of 0.5 gave ×1.12 to ×1.17.) **The mapping is the
+  additive mode with `surface_distance = 0`.** Mass matches Ember's within 3%
+  from frame 12 to 60. The emitter-centre density rises as Ember's does:
+  0.500 at frame 12 in both.
+
+  Temperature cannot be matched the same way. Mantaflow raises the emitter's
+  heat to the flow's temperature and never above it (1.000 in every checked
+  frame), while Ember's grows as rate · t. The heat is set to Ember's frame-24
+  value, so Mantaflow's emitter is hotter than Ember's before frame 24 and
+  cooler after it. That is why Mantaflow's plume still rises faster: its
+  centroid is 0.925 m against 0.781 m at frame 60 (0.872 m with the old
+  absolute mapping). The heat drives the buoyancy, so the plume-height metrics
+  carry this difference, and the summary must say so.
+
+  Mantaflow computes the inflow grids once per frame and copies them into the
+  domain on every solver step (`applyEmission`, absolute copy). So with more
+  than one step per frame the density would not be added once per step, and
+  this mapping holds only for one step per frame.
 - **Wind strength.** A domain filled with smoke (`fill=1 volume=1 alpha=0
   beta=0`), all sides open, at 32³, with `wind = S` along +x. With
   S = 0.1042 (0.5 m/s² at 24 fps), the centre's u rose 0.0201, 0.0402 and
   0.0599 m/s by frames 2, 3 and 4, against 0.0208 per frame (96.5%, the
   same boundary shortfall as buoyancy). The first frame gets no force, because
   the effectors are sampled before that frame's emission, when the domain
-  holds no smoke yet. The brief's first guess, S = a / (0.2 · fps²), missed
-  the ÷ fps in `do_physical_effector` and was 24× too weak.
+  holds no smoke yet. My first reading of the source, S = a / (0.2 · fps²),
+  missed the ÷ fps in `do_physical_effector` and was 24× too weak.
 - **Wind check with an emitter** (replaces the brief's no-emitter check).
-  The bench `plume_wind` at 64³ in both solvers (Mantaflow `bench=1 volume=1
-  density=1 temperature=1 alpha=0 beta=0.2039 wind=0.1042`). The horizontal
-  drift is the density centroid's x minus the no-wind plume's:
+  The bench `plume_wind` at 64³ in both solvers. Mantaflow ran with the
+  additive inflow mapping (`bench=1 volume=1 surface=0 absolute=0
+  density=0.04167 temperature=1 alpha=0 beta=0.2039 wind=0.1042`), and a
+  first run with the old absolute mapping is kept for comparison. The
+  horizontal drift is the density centroid's x minus the no-wind plume's:
 
-  | Frame | Ember drift (m) | Mantaflow drift (m) |
-  |---|---|---|
-  | 12 | +0.005 | +0.015 |
-  | 24 | +0.022 | +0.068 |
-  | 36 | +0.061 | +0.155 |
-  | 48 | +0.165 | +0.259 |
-  | 60 | +0.368 | +0.377 |
+  | Frame | Ember drift (m) | Mantaflow, additive (m) | Mantaflow, absolute (m) |
+  |---|---|---|---|
+  | 12 | +0.005 | +0.017 | +0.015 |
+  | 24 | +0.022 | +0.088 | +0.068 |
+  | 36 | +0.061 | +0.189 | +0.155 |
+  | 48 | +0.165 | +0.293 | +0.259 |
+  | 60 | +0.368 | +0.413 | +0.377 |
 
-  The sign is right (+x) and the size agrees by frame 60. Mantaflow drifts
-  earlier because its emitter is full from frame 1 (see Inflow).
+  The sign is right (+x) and the size is close by frame 60 (+0.413 m against
+  +0.368 m). Mantaflow drifts earlier, probably because its hotter early
+  emitter lifts smoke sooner into the region where the wind has acted longest
+  (see Inflow).
 
 ### Force fields act only on smoke
 
@@ -353,8 +381,11 @@ files, keeps growing. The estimate is under the 90-minute stop line.
 6. **Blender's defaults differ from the bench's.** All borders are open, and a
    mesh flow emits a shell. The scene script must set both, and must also run
    Blender with `--python-exit-code 1`.
-7. **The inflow mapping is not an equivalence.** Mantaflow's emitter holds its
-   value from frame 1, and Ember's fills over the first second. See Inflow.
+7. **Inflow matches in mass, not in heat.** With `use_absolute = False`,
+   `surface_distance = 0` and density = rate / fps, Mantaflow's mass is within
+   3% of Ember's. Mantaflow's emitter heat is held at a fixed value, while
+   Ember's grows, so the plume heights differ (0.925 m against 0.781 m at
+   frame 60). See Inflow.
 8. **Tiled density can drop other grids' values** (see Clipping). The reader
    must report it rather than use zeros.
 9. **The brief's `vdb_probe.rs`** formats `VdbLevel` with `{:?}`, which does
