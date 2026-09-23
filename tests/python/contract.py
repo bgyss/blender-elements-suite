@@ -23,6 +23,7 @@ from blender_elements.client import (  # noqa: E402
     ElementsError,
     FrameReader,
 )
+from blender_elements.errors import describe  # noqa: E402
 
 
 def check_truncated_channel_file_rejected() -> None:
@@ -63,6 +64,16 @@ def check_bake_command() -> None:
     assert path == os.path.join("out", "density.0000.vdb"), path
 
 
+def check_error_descriptions() -> None:
+    """Errors that will recur on the next frame must stop Live mode."""
+    status, stop = describe("out_of_memory", "Out of Memory")
+    assert stop, status
+    assert "resolution" in status, status
+    status, stop = describe("graph", "no graph is loaded")
+    assert not stop, status
+    assert status == "graph: no graph is loaded", status
+
+
 def check_python_version() -> None:
     """The Core v1 DoD commits to py311; assert it and print it so a run's
     log is self-evidencing about which interpreter actually exercised this
@@ -78,6 +89,7 @@ def main(endpoint: str, channel: str, graph: str, stateful_graph: str) -> None:
     check_python_version()
     check_truncated_channel_file_rejected()
     check_bake_command()
+    check_error_descriptions()
 
     with ControlClient(endpoint) as client:
         ack = client.hello()

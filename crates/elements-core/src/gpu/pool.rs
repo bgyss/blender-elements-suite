@@ -141,6 +141,14 @@ impl FieldPool {
             .push(field);
     }
 
+    /// Drop every pooled texture, giving its GPU memory back.
+    ///
+    /// The daemon calls this after running out of GPU memory: a pool that
+    /// kept its free textures would hold on to the memory a retry needs.
+    pub fn clear(&mut self) {
+        self.free.clear();
+    }
+
     /// How many fields are currently held for reuse.
     pub fn pooled_count(&self) -> usize {
         self.free.values().map(Vec::len).sum()

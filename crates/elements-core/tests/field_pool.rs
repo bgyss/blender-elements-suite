@@ -92,3 +92,21 @@ fn acquire_zeroed_clears_a_dirty_recycled_field() {
     let values = field.read_back(&ctx).unwrap();
     assert!(values.iter().all(|&v| v == 0.0), "got {values:?}");
 }
+
+#[test]
+fn clearing_the_pool_drops_every_free_texture() {
+    let gpu = GpuContext::new_headless().expect("no GPU adapter available");
+    let mut pool = FieldPool::new();
+    let dims = FieldDims::new(4, 4, 4);
+    let a = pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap();
+    let b = pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap();
+    pool.release(a);
+    pool.release(b);
+    assert_eq!(pool.pooled_count(), 2);
+    pool.clear();
+    assert_eq!(pool.pooled_count(), 0);
+    // The next acquire is a fresh allocation, not a reused texture.
+    let before = pool.allocation_count();
+    let _c = pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap();
+    assert_eq!(pool.allocation_count(), before + 1);
+}

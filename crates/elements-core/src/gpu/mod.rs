@@ -27,6 +27,10 @@ pub enum GpuError {
     Validation(String),
     #[error("GPU device was lost: {0}")]
     DeviceLost(String),
+    #[error("the GPU ran out of memory: {0}")]
+    OutOfMemory(String),
+    #[error("internal GPU error: {0}")]
+    Internal(String),
 }
 
 /// The limits Elements asks a device for, given what its adapter supports.
@@ -50,6 +54,8 @@ pub struct GpuContext {
     queue: wgpu::Queue,
     adapter_name: String,
     lost: Arc<Mutex<Option<String>>>,
+    /// The first error raised outside any error scope, until `scoped` reports it.
+    uncaptured: Arc<Mutex<Option<GpuError>>>,
 }
 
 impl GpuContext {
@@ -96,11 +102,25 @@ impl GpuContext {
             *lost_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
         });
 
+        // Without this, an error raised outside any error scope goes to wgpu's
+        // default handler, which panics, and a daemon panic is exactly what
+        // running the engine out of process exists to prevent. Keep the first
+        // one; `scoped` reports it.
+        let uncaptured = Arc::new(Mutex::new(None));
+        let uncaptured_sink = Arc::clone(&uncaptured);
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            let mut slot = uncaptured_sink.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(from_wgpu(error));
+            }
+        }));
+
         Ok(Self {
             device,
             queue,
             adapter_name,
             lost,
+            uncaptured,
         })
     }
 
@@ -121,38 +141,86 @@ impl GpuContext {
         self.lost.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Run `f` inside a validation error scope, converting any captured error.
+    /// Run `f` inside out-of-memory, internal and validation error scopes,
+    /// converting any captured error.
     ///
     /// This is the only sanctioned way to submit GPU work in Elements: it turns
     /// `wgpu`'s asynchronous, panicking-by-default error reporting into a
-    /// `Result` the daemon can surface to the addon.
+    /// `Result` the daemon can surface to the addon. See `resolve_errors` for
+    /// which error wins when several are captured.
     ///
     /// # Limitations
     ///
-    /// This scope only catches encoding-time and descriptor validation errors
-    /// during the execution of `f`. It does NOT catch device-timeline faults
-    /// from work already submitted to the GPU: `Queue::submit` returns before
-    /// the hardware runs the work, so faults that only manifest during execution
+    /// These scopes only catch encoding-time and descriptor errors during the
+    /// execution of `f`. They do NOT catch device-timeline faults from work
+    /// already submitted to the GPU: `Queue::submit` returns before the
+    /// hardware runs the work, so faults that only manifest during execution
     /// may surface after `scoped` returns `Ok`, and may be misattributed to a
-    /// later `scoped` block. Call sites that must ensure submitted work succeeded
-    /// should wait for completion explicitly (for example via
+    /// later `scoped` block. Call sites that must ensure submitted work
+    /// succeeded should wait for completion explicitly (for example via
     /// `Queue::on_submitted_work_done`) before trusting an `Ok`.
+    ///
+    /// An error raised outside any scope does not panic: the device's
+    /// uncaptured-error handler holds the first one, and the next `scoped`
+    /// call reports it, once. That call may be unrelated to its cause.
     pub fn scoped<T>(&self, f: impl FnOnce() -> T) -> Result<T, GpuError> {
-        let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let out_of_memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let value = f();
-        let error = pollster::block_on(guard.pop());
-
-        if let Some(message) = self.device_lost() {
-            if let Some(e) = error {
-                return Err(GpuError::DeviceLost(format!(
-                    "{message} (a validation error was also captured: {e})"
-                )));
-            }
-            return Err(GpuError::DeviceLost(message));
-        }
-        match error {
-            Some(e) => Err(GpuError::Validation(e.to_string())),
+        // Pop in reverse push order.
+        let validation = pollster::block_on(validation.pop());
+        let internal = pollster::block_on(internal.pop());
+        let out_of_memory = pollster::block_on(out_of_memory.pop());
+        let stray = self
+            .uncaptured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        match resolve_errors(
+            self.device_lost(),
+            out_of_memory,
+            internal,
+            validation,
+            stray,
+        ) {
+            Some(e) => Err(e),
             None => Ok(value),
         }
+    }
+}
+
+fn from_wgpu(error: wgpu::Error) -> GpuError {
+    match error {
+        wgpu::Error::OutOfMemory { .. } => GpuError::OutOfMemory(error.to_string()),
+        wgpu::Error::Internal { .. } => GpuError::Internal(error.to_string()),
+        wgpu::Error::Validation { .. } => GpuError::Validation(error.to_string()),
+    }
+}
+
+/// What one `scoped` call reports when several things went wrong.
+///
+/// A lost device outranks everything, since nothing else can be retried, but
+/// its message keeps the detail of whatever else was captured. Then out of
+/// memory, which says why a step failed. Then internal errors, then
+/// validation errors, then an error raised earlier outside any scope.
+pub fn resolve_errors(
+    lost: Option<String>,
+    out_of_memory: Option<wgpu::Error>,
+    internal: Option<wgpu::Error>,
+    validation: Option<wgpu::Error>,
+    stray: Option<GpuError>,
+) -> Option<GpuError> {
+    let captured = out_of_memory
+        .map(from_wgpu)
+        .or_else(|| internal.map(from_wgpu))
+        .or_else(|| validation.map(from_wgpu))
+        .or(stray);
+    match (lost, captured) {
+        (Some(message), Some(e)) => Some(GpuError::DeviceLost(format!(
+            "{message} (another error was also captured: {e})"
+        ))),
+        (Some(message), None) => Some(GpuError::DeviceLost(message)),
+        (None, captured) => captured,
     }
 }

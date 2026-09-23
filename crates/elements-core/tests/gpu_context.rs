@@ -77,3 +77,79 @@ fn required_limits_take_only_resolution_and_buffer_size_from_the_adapter() {
         base.max_storage_textures_per_shader_stage
     );
 }
+
+fn source() -> wgpu::ErrorSource {
+    Box::new(std::io::Error::other("test"))
+}
+
+fn oom() -> wgpu::Error {
+    wgpu::Error::OutOfMemory { source: source() }
+}
+
+fn validation() -> wgpu::Error {
+    wgpu::Error::Validation {
+        source: source(),
+        description: "bad".into(),
+    }
+}
+
+/// An out-of-memory error must reach the caller as `OutOfMemory`, not be
+/// folded into `Validation`, and must win over a validation error captured
+/// alongside it: it is the one that says why.
+#[test]
+fn out_of_memory_is_reported_as_itself_and_outranks_validation() {
+    use elements_core::gpu::resolve_errors;
+    assert!(matches!(
+        resolve_errors(None, Some(oom()), None, None, None),
+        Some(GpuError::OutOfMemory(_))
+    ));
+    assert!(matches!(
+        resolve_errors(None, Some(oom()), None, Some(validation()), None),
+        Some(GpuError::OutOfMemory(_))
+    ));
+    assert!(matches!(
+        resolve_errors(Some("gone".into()), Some(oom()), None, None, None),
+        Some(GpuError::DeviceLost(_))
+    ));
+    assert!(matches!(
+        resolve_errors(
+            None,
+            None,
+            None,
+            None,
+            Some(GpuError::Validation("earlier".into()))
+        ),
+        Some(GpuError::Validation(_))
+    ));
+    assert!(resolve_errors(None, None, None, None, None).is_none());
+}
+
+/// A validation error raised outside any error scope used to reach wgpu's
+/// default handler, which panics. It must instead be reported by the next
+/// `scoped` call, and only once.
+#[test]
+fn an_error_outside_any_scope_is_reported_later_not_panicked() {
+    let ctx = GpuContext::new_headless().expect("no GPU adapter available");
+    let _ = ctx.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("deliberately-invalid-outside-a-scope"),
+        size: wgpu::Extent3d {
+            width: 0,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    match ctx.scoped(|| ()) {
+        Err(GpuError::Validation(msg)) => assert!(!msg.is_empty()),
+        other => panic!("expected the stray validation error, got {other:?}"),
+    }
+    assert!(
+        ctx.scoped(|| ()).is_ok(),
+        "a stray error is reported once, not forever"
+    );
+}
