@@ -332,6 +332,48 @@ fn the_plate_mask_leaves_only_the_slit_open() {
     );
 }
 
+/// Both boxes reach the solver, merged: each feeds one side of the union,
+/// and the union, not either box, feeds the solver's inputs 4 and 5.
+#[test]
+fn the_plate_document_merges_both_boxes_into_the_solver() {
+    let doc = Scene::plume_plate(16).document();
+    let ids = |kind: &str| -> Vec<u32> {
+        doc.nodes
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.id)
+            .collect()
+    };
+    let boxes = ids(elements_ember::collider::KIND);
+    let unions = ids(elements_ember::unions::COLLIDER_UNION_KIND);
+    assert_eq!((boxes.len(), unions.len()), (2, 1));
+    let union = unions[0];
+    let into = |node: u32, index: u32| {
+        let found: Vec<(u32, u32)> = doc
+            .edges
+            .iter()
+            .filter(|e| e.to_node == node && e.to_index == index)
+            .map(|e| (e.from_node, e.from_index))
+            .collect();
+        found
+    };
+    assert_eq!(into(union, 0), [(boxes[0], 0)]);
+    assert_eq!(into(union, 1), [(boxes[0], 1)]);
+    assert_eq!(into(union, 2), [(boxes[1], 0)]);
+    assert_eq!(into(union, 3), [(boxes[1], 1)]);
+    let solver = SOLVER_NODE.0;
+    assert_eq!(
+        into(solver, 4),
+        [(union, 0)],
+        "the union's SDF feeds the solver"
+    );
+    assert_eq!(
+        into(solver, 5),
+        [(union, 1)],
+        "the union's velocity feeds the solver"
+    );
+}
+
 #[test]
 fn the_plume_plate_scene_loads_and_steps() {
     loads_and_steps(&Scene::plume_plate(16));

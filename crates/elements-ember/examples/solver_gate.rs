@@ -13,9 +13,13 @@
 //! final candidates are timed against Gauss–Seidel, interleaved in this one
 //! process so drifting machine load hits every solver alike.
 //!
-//! Timing is per frame (`eval_frame` plus a blocking wait), not per solve:
-//! runs of one scene differ only in the pressure solver, so comparing frame
-//! times is the same comparison without instrumenting the solver.
+//! Timing is per solve, as spec §4 specifies: through the same kernel-API
+//! path the plate uses, from an idle GPU to a blocking wait after the
+//! projection (see `kernel_path`). Frame time is kept as a secondary column.
+//!
+//! `SOLVER_GATE_TIMING_ONLY=<mgpcg count>` reruns only the timing phase and
+//! splices it into the existing record, leaving the divergence, plate and
+//! stability results as they stand.
 //!
 //! `SOLVER_GATE_SMOKE=1` runs a short plumbing pass at 32³ and 64³ with small
 //! caps and writes to `$SOLVER_GATE_OUT` (default: the system temp dir)
@@ -141,7 +145,8 @@ impl Plan {
                 // thin plate (the user's amendment).
                 multigrid_cap: 8,
                 mgpcg_cap: 24,
-                runs: 3,
+                // Five runs per configuration for the per-solve medians.
+                runs: 5,
                 out: PathBuf::from(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../docs/bench/solver-gate.md"
@@ -149,6 +154,11 @@ impl Plan {
                 smoke: false,
             }
         }
+    }
+
+    /// The smoke pass checks plumbing, so it never waits for load.
+    fn load_wait_s(&self) -> u64 {
+        if self.smoke { 0 } else { LOAD_WAIT_S }
     }
 
     fn cap(&self, method: Method) -> u32 {
@@ -280,36 +290,6 @@ fn velocity_faces(
     ])
 }
 
-/// One timed run through `eval_frame`: frames 1–48, each `eval` plus a
-/// blocking wait; the median of frames 25–48, ms.
-fn timed_run(gpu: &GpuContext, registry: &NodeRegistry, scene: &Scene) -> Res<f64> {
-    let doc = scene.document();
-    let config = doc.timeline_config();
-    let (graph, dims) = doc.into_graph(registry)?;
-    let mut pool = FieldPool::new();
-    let mut pipelines = PipelineCache::new();
-    let mut state = StateStore::new();
-    let mut times = Vec::new();
-    let first = config.start_frame;
-    let result = (|| -> Res<()> {
-        for frame in first..first + TIMED_FRAMES {
-            let time = Time::at(frame, first, config.fps);
-            let start = Instant::now();
-            let evaluated =
-                graph.eval_frame(gpu, &mut pool, &mut pipelines, &mut state, time, dims)?;
-            gpu.wait()?;
-            let ms = start.elapsed().as_secs_f64() * 1e3;
-            evaluated.value.release_to(&mut pool);
-            if frame >= TIMED_FROM {
-                times.push(ms);
-            }
-        }
-        Ok(())
-    })();
-    state.clear(&mut pool);
-    result.map(|()| median(&times))
-}
-
 /// Divergence before and after one frame's projection.
 type Around = (DivergenceStats, DivergenceStats);
 
@@ -320,6 +300,15 @@ type Around = (DivergenceStats, DivergenceStats);
 /// measure, then advect the scalars. Returns those measurements and the
 /// velocity after `last`.
 ///
+/// With `timing`, the first substep of every frame is split instead, and
+/// each frame pushes [solve ms, frame ms]. The solve is timed from an idle
+/// GPU (stages 1–3 submitted and waited for, the substep's uniforms already
+/// built) to a blocking wait after `Substep::project`: recording and running
+/// the divergence, the hierarchy build (multigrid and MGPCG), the solve and
+/// the gradient subtraction. The frame is timed from before the emitter fill
+/// to a blocking wait after the last substep, so it includes the split's
+/// extra waits.
+///
 /// The collider mask is built from the colliders' union by `solidify`, as
 /// the solver builds it, and checked against `Scene::solid_mask`.
 fn kernel_path(
@@ -328,6 +317,7 @@ fn kernel_path(
     solve: PressureSolve,
     last: u32,
     instrument: &[u32],
+    mut timing: Option<&mut Vec<[f64; 2]>>,
 ) -> Res<(Vec<Around>, [Vec<f32>; 3])> {
     let [x, y, z] = scene.cells;
     let cells = FieldDims::new(x, y, z);
@@ -420,6 +410,7 @@ fn kernel_path(
     let params = &scene.solver;
     let mut measured = Vec::new();
     for frame in 1..=last {
+        let frame_start = Instant::now();
         let time = Time::at(frame, 1, scene.fps);
         let mut sources = if scene.emitter.is_active(frame) {
             let pose = scene.emitter.transform.pose(f64::from(frame), time.dt);
@@ -451,7 +442,24 @@ fn kernel_path(
             has_solids: solids.is_some(),
             ..params.step_constants(cells, (time.dt / f64::from(plan.count)) as f32, dx)
         };
+        let mut solve_ms = f64::NAN;
         for n in 0..plan.count {
+            if n == 0 && timing.is_some() {
+                let mut step = Substep::new(gpu, &constants)?;
+                step.pre_projection(gpu, &mut cache, &mut pool, &mut state, sources)?;
+                step.submit(gpu, &mut pool)?;
+                let mut step = Substep::new(gpu, &constants)?;
+                gpu.wait()?;
+                let start = Instant::now();
+                step.project(gpu, &mut cache, &mut pool, &mut state, solve, solids)?;
+                step.submit(gpu, &mut pool)?;
+                gpu.wait()?;
+                solve_ms = start.elapsed().as_secs_f64() * 1e3;
+                let mut step = Substep::new(gpu, &constants)?;
+                step.advect_scalars(gpu, &mut cache, &mut pool, &mut state, solids)?;
+                step.submit(gpu, &mut pool)?;
+                continue;
+            }
             if n > 0 || !instrument.contains(&frame) {
                 substep(
                     gpu, &mut cache, &mut pool, &mut state, sources, &constants, solve,
@@ -471,6 +479,10 @@ fn kernel_path(
             step.submit(gpu, &mut pool)?;
             measured.push((before, after));
         }
+        if let Some(times) = timing.as_deref_mut() {
+            gpu.wait()?;
+            times.push([solve_ms, frame_start.elapsed().as_secs_f64() * 1e3]);
+        }
     }
     let velocity = state.read_velocity(gpu)?;
     Ok((measured, velocity))
@@ -479,13 +491,15 @@ fn kernel_path(
 /// `plume_plate`'s ratios, after over before, at the `MEASURED` frames.
 fn plate_ratios(gpu: &GpuContext, res: u32, solve: PressureSolve) -> Res<[f64; 2]> {
     let scene = configure(scene("plume_plate", res), solve);
-    let (measured, _) = kernel_path(gpu, &scene, solve, MEASURED[1], &MEASURED)?;
+    let (measured, _) = kernel_path(gpu, &scene, solve, MEASURED[1], &MEASURED, None)?;
     Ok([0, 1].map(|i| measured[i].1.rms / measured[i].0.rms))
 }
 
 /// The kernel path against `eval_frame` for `plume_plate`, through an
-/// instrumented frame: the largest face-velocity difference after `last`.
-/// 0 means `kernel_path` reproduces the solver's frames bit for bit.
+/// instrumented frame: the largest face-velocity difference after `last`
+/// and how many faces differ. An error unless no face differs: the plate's
+/// ratios mean something only if `kernel_path` reproduces the solver's
+/// frames bit for bit.
 fn kernel_path_check(
     gpu: &GpuContext,
     registry: &NodeRegistry,
@@ -494,7 +508,7 @@ fn kernel_path_check(
     last: u32,
 ) -> Res<(f32, usize)> {
     let scene = configure(scene("plume_plate", res), solve);
-    let (_, kernel) = kernel_path(gpu, &scene, solve, last, &[MEASURED[0]])?;
+    let (_, kernel) = kernel_path(gpu, &scene, solve, last, &[MEASURED[0]], None)?;
     let doc = scene.document();
     let config = doc.timeline_config();
     let (graph, dims) = doc.into_graph(registry)?;
@@ -522,7 +536,25 @@ fn kernel_path_check(
             }
         }
     }
+    if differ != 0 {
+        return Err(format!(
+            "the kernel path differs from eval_frame in {differ} faces (max |Δ| {max:e}) \
+             after frame {last} of plume_plate {res}³ with {}",
+            label(solve)
+        )
+        .into());
+    }
     Ok((max, differ))
+}
+
+/// One per-solve timing run through the kernel path: frames 1–48; the
+/// medians over frames 25–48 of [solve ms, frame ms].
+fn solve_timed_run(gpu: &GpuContext, scene: &Scene) -> Res<[f64; 2]> {
+    let solve = scene.solver.pressure();
+    let mut times = Vec::new();
+    kernel_path(gpu, scene, solve, TIMED_FRAMES, &[], Some(&mut times))?;
+    let timed = &times[TIMED_FROM as usize - 1..];
+    Ok([0, 1].map(|i| median(&timed.iter().map(|t| t[i]).collect::<Vec<_>>())))
 }
 
 /// One count's divergence at one resolution.
@@ -634,8 +666,410 @@ fn fmt_div(d: &Option<Result<[f64; 2], String>>) -> String {
     }
 }
 
+/// MGPCG counts timed for information only, never part of the rule: the
+/// user may want them for the preview and final presets.
+const INFO_MGPCG: [u32; 2] = [4, 20];
+/// How long to wait for the 1-minute load average to drop to `LOAD_FLAG`
+/// before timing anyway, and how often to look.
+const LOAD_WAIT_S: u64 = 600;
+const LOAD_POLL_S: u64 = 30;
+
+/// Load before the timing phase, after any wait, and after it.
+struct PhaseLoad {
+    initial: String,
+    start: String,
+    waited_s: u64,
+    after: String,
+}
+
+fn flag(text: &str) -> String {
+    if load_1m(text) > LOAD_FLAG {
+        format!("{text} — **above {LOAD_FLAG}: the machine was loaded**")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Wait up to `max_s` for the 1-minute load to fall to `LOAD_FLAG`.
+fn wait_for_load(clock: &Clock, max_s: u64) -> (String, String, u64) {
+    let initial = load();
+    let mut waited = 0;
+    while load_1m(&load()) > LOAD_FLAG && waited < max_s {
+        std::thread::sleep(std::time::Duration::from_secs(LOAD_POLL_S));
+        waited += LOAD_POLL_S;
+        clock.log(format!("waiting for load: {} after {waited} s", load()));
+    }
+    (initial, load(), waited)
+}
+
+/// The per-solve timing phase's results.
+struct Timings {
+    /// Gauss–Seidel first, then the rule's candidates, then information only.
+    configs: Vec<PressureSolve>,
+    /// `configs[1..rule]` are the rule's candidates.
+    rule: usize,
+    runs: usize,
+    /// (config, stage, scene) → each run's [solve, frame] medians, in run
+    /// order.
+    data: BTreeMap<(usize, usize, usize), Vec<[f64; 2]>>,
+}
+
+impl Timings {
+    fn runs_of(&self, ci: usize, stage: usize, si: usize, what: usize) -> Vec<f64> {
+        self.data[&(ci, stage, si)]
+            .iter()
+            .map(|r| r[what])
+            .collect()
+    }
+
+    /// The median of the runs' medians: 0 solve, 1 frame.
+    fn median(&self, ci: usize, stage: usize, si: usize, what: usize) -> f64 {
+        median(&self.runs_of(ci, stage, si, what))
+    }
+
+    /// Spec §4's timing clause for config `ci`: its solve at most
+    /// Gauss–Seidel's in every scene at both resolutions.
+    fn solve_passes(&self, ci: usize, stage: usize, si: usize) -> bool {
+        self.median(ci, stage, si, 0) <= self.median(0, stage, si, 0)
+    }
+
+    fn passes(&self, ci: usize) -> bool {
+        (0..2).all(|stage| (0..SCENES.len()).all(|si| self.solve_passes(ci, stage, si)))
+    }
+}
+
+/// Run `r` runs the configs rotated by `r`: a Latin square, so over the runs
+/// every config takes every position in the order, and neither position nor
+/// drifting load favours one.
+fn run_order(n: usize, run: usize) -> Vec<usize> {
+    (0..n).map(|k| (k + run) % n).collect()
+}
+
+fn time_solves(
+    gpu: &GpuContext,
+    clock: &Clock,
+    res: [u32; 2],
+    configs: Vec<PressureSolve>,
+    rule: usize,
+    runs: usize,
+) -> Res<Timings> {
+    let mut data: BTreeMap<(usize, usize, usize), Vec<[f64; 2]>> = BTreeMap::new();
+    for (stage, &r) in res.iter().enumerate() {
+        for (si, name) in SCENES.iter().enumerate() {
+            for run in 0..runs {
+                for ci in run_order(configs.len(), run) {
+                    let solve = configs[ci];
+                    let s = configure(scene(name, r), solve);
+                    let t = solve_timed_run(gpu, &s)?;
+                    clock.log(format!(
+                        "time {r}³ {name} run {} {}: solve {:.2} ms, frame {:.2} ms",
+                        run + 1,
+                        label(solve),
+                        t[0],
+                        t[1]
+                    ));
+                    data.entry((ci, stage, si)).or_default().push(t);
+                }
+            }
+        }
+    }
+    Ok(Timings {
+        configs,
+        rule,
+        runs,
+        data,
+    })
+}
+
+fn rule_timing_clause() -> String {
+    format!(
+        "its pressure-solve time per substep (the median over frames {TIMED_FROM}–{TIMED_FRAMES} \
+         of the time from before the solve to a blocking wait after it; the median of the runs' \
+         medians) is at most Gauss–Seidel ×{GS_ITERATIONS}'s in the same process"
+    )
+}
+
+fn procedure_timing(runs: usize) -> String {
+    format!(
+        "Then each candidate and Gauss–Seidel ×{GS_ITERATIONS} are timed per solve, with MGPCG \
+         ×{} and ×{} for information only: {runs} runs of frames 1–{TIMED_FRAMES} each, through \
+         the kernel API path the plate uses (checked bit-identical to `eval_frame`), each run's \
+         median over frames {TIMED_FROM}–{TIMED_FRAMES}. The runs rotate the order of the \
+         configurations (run r starts with the r-th), so every configuration takes every position. \
+         The timed interval starts from an idle GPU, with stages 1–3 submitted and waited for and \
+         the substep's uniforms built, and ends at a blocking wait after the projection. It \
+         covers recording and running the divergence, the multigrid hierarchy build (multigrid \
+         and MGPCG), the solve and the gradient subtraction, for the frame's first (here only) \
+         substep. Frame time, from before the emitter fill to a blocking wait after the last \
+         substep, is kept as a secondary column. It includes the split's extra waits, so it is \
+         a little above `eval_frame`'s.",
+        INFO_MGPCG[0], INFO_MGPCG[1]
+    )
+}
+
+fn cell(t: &Timings, ci: usize, stage: usize, si: usize, what: usize) -> String {
+    let runs = t.runs_of(ci, stage, si, what);
+    let lo = runs.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = runs.iter().copied().fold(0.0, f64::max);
+    format!("{:.2} ({lo:.2}–{hi:.2})", t.median(ci, stage, si, what))
+}
+
+/// `## Timing` up to, not including, the stability section.
+fn timing_section(res: [u32; 2], t: &Timings, load: &PhaseLoad) -> String {
+    let n = t.configs.len();
+    let head = |what: &str| {
+        t.configs
+            .iter()
+            .enumerate()
+            .map(|(ci, &s)| {
+                let info = if ci >= t.rule { " (info)" } else { "" };
+                format!("`{}`{info} {what}", label(s))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let rule_line = "|---".repeat(n + 2) + "|\n";
+    let mut solve = format!("| res | scene | {} |\n{rule_line}", head("solve ms"));
+    let mut frame = format!("| res | scene | {} |\n{rule_line}", head("frame ms"));
+    let mut runs = String::from(
+        "| res | scene | configuration | solve ms, each run's median (run 1 … run n) |\n\
+         |---|---|---|---|\n",
+    );
+    for (stage, &r) in res.iter().enumerate() {
+        for (si, name) in SCENES.iter().enumerate() {
+            let solves: Vec<String> = (0..n)
+                .map(|ci| {
+                    let mark = match ci {
+                        0 => "",
+                        c if c >= t.rule => "",
+                        c if t.solve_passes(c, stage, si) => " ✓",
+                        _ => " ✗",
+                    };
+                    format!("{}{mark}", cell(t, ci, stage, si, 0))
+                })
+                .collect();
+            let _ = writeln!(solve, "| {r}³ | {name} | {} |", solves.join(" | "));
+            let frames: Vec<String> = (0..n).map(|ci| cell(t, ci, stage, si, 1)).collect();
+            let _ = writeln!(frame, "| {r}³ | {name} | {} |", frames.join(" | "));
+            for (ci, &s) in t.configs.iter().enumerate() {
+                let list: Vec<String> = t
+                    .runs_of(ci, stage, si, 0)
+                    .iter()
+                    .map(|x| format!("{x:.2}"))
+                    .collect();
+                let _ = writeln!(
+                    runs,
+                    "| {r}³ | {name} | `{}` | {} |",
+                    label(s),
+                    list.join(", ")
+                );
+            }
+        }
+    }
+    format!(
+        "## Timing\n\n\
+         Timing phase load average: {initial} at the start; {start} when timing began \
+         (after waiting {waited} s); {after} after.\n\n\
+         Per-solve time, ms: the median of the {runs_n} runs' medians (min–max of the run \
+         medians). ✓ / ✗: at most / above Gauss–Seidel's, the rule's timing clause. \"(info)\" \
+         columns are not part of the rule.\n\n\
+         {solve}\n\
+         Every run's per-solve median, in run order:\n\n\
+         {runs}\n\
+         Frame time, ms (secondary, not the rule), the same statistic:\n\n\
+         {frame}\n",
+        initial = flag(&load.initial),
+        start = flag(&load.start),
+        waited = load.waited_s,
+        after = flag(&load.after),
+        runs_n = t.runs,
+    )
+}
+
+/// `## Rule applied` up to, not including, the decision line.
+fn rule_section(
+    res: [u32; 2],
+    t: &Timings,
+    stable: &BTreeMap<Method, bool>,
+    wind_f120_empty: bool,
+) -> String {
+    let mut lines = String::new();
+    let mut winner = None;
+    for ci in 1..t.rule {
+        let solve = t.configs[ci];
+        let method = match solve {
+            PressureSolve::Multigrid(_) => Method::Multigrid,
+            _ => Method::Mgpcg,
+        };
+        let fast = t.passes(ci);
+        let is_stable = stable.get(&method).copied().unwrap_or(false);
+        let failing: Vec<String> = (0..2)
+            .flat_map(|stage| (0..SCENES.len()).map(move |si| (stage, si)))
+            .filter(|&(stage, si)| !t.solve_passes(ci, stage, si))
+            .map(|(stage, si)| format!("`{}` at {}³", SCENES[si], res[stage]))
+            .collect();
+        let _ = writeln!(
+            lines,
+            "- `{}`: divergence and thin plate pass; per-solve time {}; past-floor {}{}",
+            label(solve),
+            if fast {
+                "at most Gauss–Seidel's in every scene at both resolutions".to_owned()
+            } else {
+                format!("ABOVE Gauss–Seidel's in {}", failing.join(", "))
+            },
+            if is_stable { "stable" } else { "NOT stable" },
+            if method == Method::Multigrid {
+                " (cannot be the default)"
+            } else {
+                ""
+            },
+        );
+        if method == Method::Mgpcg && fast && is_stable && winner.is_none() {
+            winner = Some(solve);
+        }
+    }
+    let wind = if wind_f120_empty {
+        " `plume_wind` constrained only frame 60: at frame 120 its smoke mask had no measured \
+         cells, so its RMS of 0 passed vacuously."
+    } else {
+        ""
+    };
+    let verdict = match winner {
+        Some(s) => format!("**fastest passing: `{}`**.", label(s)),
+        None if t.rule == 1 => {
+            "**none passes**: no configuration passed the divergence rules.".to_owned()
+        }
+        None => "**none passes**: no candidate meets the per-solve timing clause (and the other \
+                 clauses) in every scene at both resolutions."
+            .to_owned(),
+    };
+    format!("## Rule applied\n\n{lines}\nRule applied: {verdict}{wind}\n\n")
+}
+
+fn kernel_check_line(low: u32, solve: PressureSolve, check: (f32, usize)) -> String {
+    format!(
+        "- Kernel path check: `plume_plate` {low}³ with `{}` through frame {} (frame {} \
+         instrumented), against `eval_frame`: {} faces differ, max |Δ| {:e}.",
+        label(solve),
+        MEASURED[0] + 5,
+        MEASURED[0],
+        check.1,
+        check.0
+    )
+}
+
+/// The timing configurations: Gauss–Seidel, the candidates, then the
+/// information-only MGPCG counts that are not candidates.
+fn timing_configs(candidates: &[PressureSolve]) -> (Vec<PressureSolve>, usize) {
+    let mut configs = vec![PressureSolve::GaussSeidel(GS_ITERATIONS)];
+    configs.extend_from_slice(candidates);
+    let rule = configs.len();
+    for c in INFO_MGPCG {
+        let s = PressureSolve::Mgpcg(c);
+        if !configs.contains(&s) {
+            configs.push(s);
+        }
+    }
+    (configs, rule)
+}
+
+/// Replace `[start, end)` of `text`, where `start` and `end` are markers
+/// (the end marker is kept).
+fn splice(text: &str, start: &str, end: &str, with: &str) -> Res<String> {
+    let a = text
+        .find(start)
+        .ok_or_else(|| format!("the record has no {start:?}"))?;
+    let b = a + text[a..]
+        .find(end)
+        .ok_or_else(|| format!("the record has no {end:?} after {start:?}"))?;
+    Ok(format!("{}{with}{}", &text[..a], &text[b..]))
+}
+
+/// `SOLVER_GATE_TIMING_ONLY=<mgpcg count>`: rerun only the timing phase
+/// with that MGPCG candidate, and splice its results into the existing
+/// record. The divergence, plate and stability results stand.
+fn timing_only(plan: &Plan, count: u32) -> Res<()> {
+    let clock = Clock(Instant::now());
+    let gpu = GpuContext::new_headless()?;
+    let registry = elements_ember::registry();
+    let [low, _] = plan.res;
+    let record = std::fs::read_to_string(&plan.out)?;
+    let candidate = PressureSolve::Mgpcg(count);
+
+    let check = kernel_path_check(&gpu, &registry, low, candidate, MEASURED[0] + 5)?;
+    clock.log(kernel_check_line(low, candidate, check));
+
+    let stable_line = record
+        .lines()
+        .find(|l| l.starts_with("- `mgpcg`: ×"))
+        .ok_or("the record has no mgpcg stability line")?;
+    let stable = BTreeMap::from([(Method::Mgpcg, stable_line.ends_with("— stable"))]);
+    let wind_f120_empty = record.contains("plume_wind frame 120");
+
+    let (initial, start, waited_s) = wait_for_load(&clock, plan.load_wait_s());
+    clock.log(format!(
+        "load {initial}; timing at {start} after {waited_s} s"
+    ));
+    let (configs, rule) = timing_configs(&[candidate]);
+    let t = time_solves(&gpu, &clock, plan.res, configs, rule, plan.runs)?;
+    let phase = PhaseLoad {
+        initial,
+        start,
+        waited_s,
+        after: load(),
+    };
+    clock.log(format!("load after: {}", phase.after));
+
+    let commit = commit_label();
+    let date = shell("date", &["-u", "+%Y-%m-%d %H:%M UTC"]);
+    let mut out = splice(
+        &record,
+        "- Kernel path check:",
+        "\n",
+        &format!(
+            "{}\n- Timing phase rerun per solve (spec §4): commit {commit}, {date}",
+            kernel_check_line(low, candidate, check)
+        ),
+    )?;
+    out = out.replace(
+        &format!(
+            "its median frame time over frames {TIMED_FROM}–{TIMED_FRAMES} is at most the \
+             Gauss–Seidel ×{GS_ITERATIONS} median in the same process"
+        ),
+        &rule_timing_clause(),
+    );
+    out = splice(
+        &out,
+        "Then each candidate and Gauss–Seidel",
+        "\n\n## Divergence sweep",
+        &procedure_timing(plan.runs),
+    )?;
+    out = splice(
+        &out,
+        "## Timing\n",
+        "## Past-floor stability",
+        &timing_section(plan.res, &t, &phase),
+    )?;
+    out = splice(
+        &out,
+        "## Rule applied\n",
+        "Decision (recorded by the user)",
+        &rule_section(plan.res, &t, &stable, wind_f120_empty),
+    )?;
+    if !out.contains(&rule_timing_clause()) {
+        return Err("the rule's timing clause was not rewritten".into());
+    }
+    std::fs::write(&plan.out, &out)?;
+    clock.log(format!("wrote {}", plan.out.display()));
+    println!("{out}");
+    Ok(())
+}
+
 fn main() -> Res<()> {
     let plan = Plan::from_env();
+    if let Ok(count) = std::env::var("SOLVER_GATE_TIMING_ONLY") {
+        return timing_only(&plan, count.trim().parse()?);
+    }
     let clock = Clock(Instant::now());
     let load_before = load();
     let commit = commit_label();
@@ -644,17 +1078,6 @@ fn main() -> Res<()> {
     let gpu = GpuContext::new_headless()?;
     let registry = elements_ember::registry();
     let [low, high] = plan.res;
-
-    // Plumbing: the kernel path must reproduce the solver's frames.
-    let check_solve = PressureSolve::Mgpcg(4);
-    let check = kernel_path_check(&gpu, &registry, low, check_solve, MEASURED[0] + 5)?;
-    clock.log(format!(
-        "kernel path vs eval_frame, plume_plate {low}³ {}, frame {}: {} faces differ, max |Δ| {:e}",
-        label(check_solve),
-        MEASURED[0] + 5,
-        check.1,
-        check.0
-    ));
 
     let mut gate = Gate {
         gpu: &gpu,
@@ -674,6 +1097,18 @@ fn main() -> Res<()> {
         candidates.push((method, c));
     }
 
+    // Plumbing: the kernel path must reproduce the solver's frames, at the
+    // MGPCG candidate's count (4 when there is none).
+    let check_solve = PressureSolve::Mgpcg(
+        candidates
+            .iter()
+            .find(|(m, _)| *m == Method::Mgpcg)
+            .and_then(|(_, c)| *c)
+            .unwrap_or(4),
+    );
+    let check = kernel_path_check(&gpu, &registry, low, check_solve, MEASURED[0] + 5)?;
+    gate.clock.log(kernel_check_line(low, check_solve, check));
+
     // Past-floor stability, for each candidate.
     let mut stability: BTreeMap<Method, Result<[f64; 2], String>> = BTreeMap::new();
     for &(method, count) in &candidates {
@@ -692,76 +1127,36 @@ fn main() -> Res<()> {
         ));
         stability.insert(method, result);
     }
-
-    // Step 4: timing, interleaved.
-    let mut configs = vec![PressureSolve::GaussSeidel(GS_ITERATIONS)];
-    configs.extend(
-        candidates
-            .iter()
-            .filter_map(|&(m, c)| c.map(|c| m.solve(c))),
-    );
-    // (config index, stage, scene index) → run medians.
-    let mut times: BTreeMap<(usize, usize, usize), Vec<f64>> = BTreeMap::new();
-    for (stage, &res) in plan.res.iter().enumerate() {
-        for (si, name) in SCENES.iter().enumerate() {
-            for run in 0..plan.runs {
-                for (ci, &solve) in configs.iter().enumerate() {
-                    let s = configure(scene(name, res), solve);
-                    let ms = timed_run(&gpu, &registry, &s)?;
-                    gate.clock.log(format!(
-                        "time {res}³ {name} run {} {}: {ms:.2} ms",
-                        run + 1,
-                        label(solve)
-                    ));
-                    times.entry((ci, stage, si)).or_default().push(ms);
-                }
-            }
-        }
-    }
-    let frame_ms = |ci: usize, stage: usize, si: usize| median(&times[&(ci, stage, si)]);
-    let faster = |ci: usize| {
-        (0..2).all(|stage| {
-            (0..SCENES.len()).all(|si| frame_ms(ci, stage, si) <= frame_ms(0, stage, si))
-        })
-    };
-
-    let load_after = load();
-    gate.clock.log(format!("load after: {load_after}"));
-
-    // The rule.
-    let mut verdicts = Vec::new();
-    for (ci, &solve) in configs.iter().enumerate().skip(1) {
-        let method = if matches!(solve, PressureSolve::Multigrid(_)) {
-            Method::Multigrid
-        } else {
-            Method::Mgpcg
-        };
-        let stable = matches!(
-            stability.get(&method),
-            Some(Ok(r)) if r.iter().all(|&x| x <= STABILITY_FACTOR)
-        );
-        verdicts.push((method, solve, faster(ci), stable));
-    }
-    let winner = verdicts
+    let stable: BTreeMap<Method, bool> = stability
         .iter()
-        .filter(|(m, _, fast, stable)| *m == Method::Mgpcg && *fast && *stable)
-        .map(|(_, s, _, _)| *s)
-        .next();
-    let multigrid_note = verdicts
-        .iter()
-        .find(|(m, _, fast, stable)| *m == Method::Multigrid && *fast && *stable)
-        .map(|(_, s, _, _)| {
-            format!(
-                " {} also passes the divergence, thin-plate, timing and stability checks, but \
-                 plain V-cycles cannot be the default (spec §4).",
-                label(*s)
+        .map(|(m, r)| {
+            (
+                *m,
+                matches!(r, Ok(x) if x.iter().all(|&v| v <= STABILITY_FACTOR)),
             )
         })
-        .unwrap_or_default();
-    let verdict = match winner {
-        Some(s) => format!("**fastest passing: `{}`**.{multigrid_note}", label(s)),
-        None => format!("**none passes**.{multigrid_note}"),
+        .collect();
+
+    // Step 4: per-solve timing.
+    let passing: Vec<PressureSolve> = candidates
+        .iter()
+        .filter_map(|&(m, c)| c.map(|c| m.solve(c)))
+        .collect();
+    let (initial, start, waited_s) = wait_for_load(&gate.clock, plan.load_wait_s());
+    let (configs, rule) = timing_configs(&passing);
+    let t = time_solves(&gpu, &gate.clock, plan.res, configs, rule, plan.runs)?;
+    let load_after = load();
+    let phase = PhaseLoad {
+        initial,
+        start,
+        waited_s,
+        after: load_after.clone(),
     };
+    gate.clock.log(format!("load after: {load_after}"));
+    let wind_f120_empty = gate
+        .empty
+        .iter()
+        .any(|e| e.ends_with("plume_wind frame 120"));
 
     // The record.
     let mut sweep = String::new();
@@ -782,33 +1177,6 @@ fn main() -> Res<()> {
             if row.passes(stage) { "yes" } else { "no" },
         );
     }
-    let mut timing = String::new();
-    for (stage, &res) in plan.res.iter().enumerate() {
-        for (si, name) in SCENES.iter().enumerate() {
-            let cells: Vec<String> = (0..configs.len())
-                .map(|ci| {
-                    let t = &times[&(ci, stage, si)];
-                    let lo = t.iter().copied().fold(f64::INFINITY, f64::min);
-                    let hi = t.iter().copied().fold(0.0, f64::max);
-                    let mark = if ci == 0 {
-                        String::new()
-                    } else if frame_ms(ci, stage, si) <= frame_ms(0, stage, si) {
-                        " ✓".to_owned()
-                    } else {
-                        " ✗".to_owned()
-                    };
-                    format!("{:.1} ({lo:.1}–{hi:.1}){mark}", frame_ms(ci, stage, si))
-                })
-                .collect();
-            let _ = writeln!(timing, "| {res}³ | {name} | {} |", cells.join(" | "));
-        }
-    }
-    let timing_head = configs
-        .iter()
-        .map(|&s| format!("`{}` ms", label(s)))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let timing_rule = "|---".repeat(configs.len() + 2);
     let mut candidate_lines = String::new();
     for &(method, count) in &candidates {
         let _ = writeln!(
@@ -846,29 +1214,6 @@ fn main() -> Res<()> {
     if stability_lines.is_empty() {
         stability_lines.push_str("- no candidate to check\n");
     }
-    let mut verdict_lines = String::new();
-    for (method, solve, fast, stable) in &verdicts {
-        let _ = writeln!(
-            verdict_lines,
-            "- `{}`: divergence and thin plate pass; frame time {} Gauss–Seidel's in every \
-             scene at both resolutions; past-floor {}{}",
-            label(*solve),
-            if *fast { "at most" } else { "NOT at most" },
-            if *stable { "stable" } else { "NOT stable" },
-            if *method == Method::Multigrid {
-                " (cannot be the default)"
-            } else {
-                ""
-            },
-        );
-    }
-    let flag = |text: &str| {
-        if load_1m(text) > LOAD_FLAG {
-            format!("{text} — **above {LOAD_FLAG}: the machine was loaded**")
-        } else {
-            text.to_owned()
-        }
-    };
     let title = if plan.smoke {
         "Ember solver gate — SMOKE PASS (plumbing only, not the gate)"
     } else {
@@ -890,12 +1235,10 @@ fn main() -> Res<()> {
          - Date: {date}\n\
          - Load average (1, 5, 15 min) before: {lb}\n\
          - Load average after: {la}\n\
-         - Kernel path check: `plume_plate` {low}³ with `{check_label}` through frame {check_frame} \
-         (frame {m0} instrumented), against `eval_frame`: {check_n} faces differ, max |Δ| {check_max:e}.\n\n\
+         {check_line}\n\n\
          ## The rule (spec §4, fixed before any numbers)\n\n\
          A configuration passes when, at {low}³ and {high}³ and in `plume`, `plume_collider` and \
-         `plume_wind`, its median frame time over frames {TIMED_FROM}–{TIMED_FRAMES} is at most the \
-         Gauss–Seidel ×{GS_ITERATIONS} median in the same process, and its masked divergence RMS at \
+         `plume_wind`, {timing_clause}, and its masked divergence RMS at \
          frames 60 and 120 is at most Mantaflow's for that scene and resolution \
          (`docs/bench/results.md`, the 7fe5d9d run; `plume_wind` uses `plume`'s until the rerun). \
          It must also pass `plume_plate` at {low}³: RMS divergence after projection over before it, \
@@ -913,12 +1256,7 @@ fn main() -> Res<()> {
          {pcg_cap}) until the three scenes and `plume_plate` all pass; that count is checked at \
          {high}³ and stepped up until it passes there too (and still at {low}³). A {high}³ count \
          stops at its first failing scene (— below). Divergence runs read back only at frames 60 \
-         and 120. Then each candidate and Gauss–Seidel ×{GS_ITERATIONS} are timed: {runs} runs of \
-         frames 1–{TIMED_FRAMES}, each run's median over frames {TIMED_FROM}–{TIMED_FRAMES}, \
-         interleaved (Gauss–Seidel, multigrid, mgpcg, Gauss–Seidel, …) so drifting load hits all \
-         of them. Timing is per frame (`eval_frame` plus a blocking wait), not per solve: runs of \
-         one scene differ only in the solver, so it is the same comparison without instrumenting \
-         inside the solver.\n\n\
+         and 120. {procedure_timing}\n\n\
          ## Divergence sweep\n\n\
          Masked divergence RMS, 1/s, frames 60 / 120. `plume_plate`: after/before ratio, frames 60 / 120.\n\n\
          | method | count | res | plume | plume_collider | plume_wind | plume_plate ratio | pass |\n\
@@ -926,29 +1264,22 @@ fn main() -> Res<()> {
          {sweep}\n\
          {empty_note}\
          Candidates:\n\n{candidate_lines}\n\
-         ## Timing\n\n\
-         Median frame ms over the {runs} runs' medians (min–max of the run medians). ✓: at most \
-         Gauss–Seidel's.\n\n\
-         | res | scene | {timing_head} |\n\
-         {timing_rule}|\n\
-         {timing}\n\
+         {timing_section}\
          ## Past-floor stability (`plume_collider`, {low}³)\n\n{stability_lines}\n\
-         ## Rule applied\n\n{verdict_lines}\n\
-         Rule applied: {verdict}\n\n\
+         {rule_section}\
          Decision (recorded by the user): _pending_\n",
         cpu = shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
         adapter = gpu.adapter_name(),
         os = shell("sw_vers", &["-productVersion"]),
         lb = flag(&load_before),
         la = flag(&load_after),
-        check_label = label(check_solve),
-        check_frame = MEASURED[0] + 5,
-        m0 = MEASURED[0],
-        check_n = check.1,
-        check_max = check.0,
+        check_line = kernel_check_line(low, check_solve, check),
+        timing_clause = rule_timing_clause(),
+        procedure_timing = procedure_timing(plan.runs),
         mg_cap = plan.multigrid_cap,
         pcg_cap = plan.mgpcg_cap,
-        runs = plan.runs,
+        timing_section = timing_section(plan.res, &t, &phase),
+        rule_section = rule_section(plan.res, &t, &stable, wind_f120_empty),
         empty_note = if gate.empty.is_empty() {
             String::new()
         } else {
