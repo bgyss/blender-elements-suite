@@ -25,7 +25,12 @@ of the piece 2 spec. **2b-2**, scene content, is complete: keyframed box and
 sphere emitters (with noise and velocity emission) and colliders, unions of
 each, and wind
 (`docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`).
-**2b-3**, the Mantaflow benchmark, is next. Flame is its own later cycle, 2b-4.
+**2b-3**, the Mantaflow benchmark, is complete (`docs/bench/results.md`).
+Ember is 3–8× faster than Mantaflow and uses about half its memory or less,
+but leaves far more divergence at high resolution, and its domain-wide wind
+fails at 128³ and above: open risk (l). All timings were measured under
+load. **2b-3b**, the side-by-side render and the latency measurement, is
+next. Flame is its own later cycle, 2b-4.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -38,6 +43,9 @@ each, and wind
 - Ember piece 2b-1 plan: `docs/superpowers/plans/2026-09-22-ember-solver-2b1.md`
 - Ember piece 2b-2 spec: `docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`
 - Ember piece 2b-2 plan: `docs/superpowers/plans/2026-09-23-ember-scene-content-2b2.md`
+- Ember piece 2b-3 spec: `docs/superpowers/specs/2026-09-23-ember-mantaflow-benchmark-2b3-design.md`
+- Ember piece 2b-3 plan: `docs/superpowers/plans/2026-09-23-ember-mantaflow-benchmark-2b3.md`
+- Mantaflow benchmark results and cache notes: `docs/bench/results.md`, `docs/bench/mantaflow-notes.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
@@ -127,6 +135,10 @@ Separately: **no Rust crate can write OpenVDB.** `vdb-rs` is read-only and
 unmaintained; the `openvdb` crate is an empty placeholder. `elements-io` contains
 a hand-written minimal `FloatGrid` writer built from the byte layout in `vdb-rs`'s
 parser, with `vdb-rs` used as the read-back oracle in tests.
+`vdb-rs` 0.6.0 also misreads vector grids: it parses a `Vec3s` grid's root
+values at 4 bytes and returns an empty tree. The workspace therefore vendors a
+patched copy in `vendor/vdb-rs/` through `[patch.crates-io]` (see
+`PATCHED.md`). It is a dev-dependency only, so the daemon never links it.
 
 ## Constraints that bite
 

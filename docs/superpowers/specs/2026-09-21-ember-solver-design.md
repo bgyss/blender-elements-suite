@@ -508,3 +508,25 @@ part of (g), (j), and (k), which 2b-2 added.
   `just bench-presets` on an idle machine before 2b-3's benchmark, and
   reopen the preview preset in `docs/bench/presets.md` if the frame no longer
   fits.
+
+  **Still open, 2026-09-24.** The machine was never idle during 2b-3 (load
+  average 6–70), so this rerun has not been done. By the user's decision, the
+  benchmark ran anyway, with every timing flagged as measured under load
+  (`docs/bench/results.md`). The rerun is still owed, on an idle machine.
+- **(l) Domain-wide wind in a closed-sided domain.** 2b-3's `plume_wind`
+  (`docs/bench/results.md`) fails in Ember. At frame 60 its RMS divergence is
+  0.14 at 64³, 1.4 at 128³ and 2.4 at 256³, against 0.003–0.25 for `plume`. At
+  128³ all of the smoke leaves through the top by frame 84.
+  - **Cause 1, measured at 128³:** the fixed-iteration pressure solve cannot
+    converge the domain-wide pressure gradient that a uniform push against
+    closed side walls needs. Divergence at frame 60 falls from 1.40 with 160
+    iterations to 0.17 with 1,000, and to 0.12 with 4 substeps.
+  - **Cause 2:** the scene itself. Every configuration still loses its smoke by
+    frame 80–90. With wind accelerating all of the air, closed sides and an
+    open top at zero pressure, the flow is driven up and out through the
+    top. Mantaflow's wind acts only on smoky cells, so it never sets up that
+    flow.
+  - **Options:** a multigrid pressure solve, which piece 2's stretch goal
+    already names; wind applied only where there is smoke, or relative to the
+    air; open side boundaries for wind scenes; or a wind force field with
+    falloff instead of a uniform acceleration. None is chosen yet.
