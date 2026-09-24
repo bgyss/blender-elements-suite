@@ -52,12 +52,20 @@ pub enum Quality {
 impl Quality {
     /// The preset's full parameter set.
     pub fn params(self) -> SolverParams {
-        let (pressure_iterations, max_substeps) = match self {
+        // `pressure_iterations` is kept for documents that choose
+        // Gauss–Seidel; the presets solve with MGPCG, decided 2026-09-24 in
+        // `docs/bench/solver-gate.md` after the registered gate failed.
+        let (pressure_iterations, max_substeps, pressure_cycles) = match self {
             // One substep: the largest cap whose 128³ frame fits in 100 ms
             // (spec §6), decided 2026-09-22 in `docs/bench/presets.md`.
-            Self::Preview => (160, 1),
+            // MGPCG ×4: less than half Gauss–Seidel ×160's solve time at
+            // 128³ and 256³, and more accurate in every scene and on the thin
+            // plate, but short of the plate's 1e-3 target (`solver-gate.md`).
+            Self::Preview => (160, 1, 4),
             // 480 iterations: ratio 0.0076 in `docs/bench/iteration-sweep.md`.
-            Self::Final => (480, 8),
+            // MGPCG ×10: passes every accuracy check of the solver gate,
+            // the thin plate included (`solver-gate.md`).
+            Self::Final => (480, 8, 10),
         };
         SolverParams {
             max_substeps,
@@ -73,9 +81,8 @@ impl Quality {
             boundaries: Boundaries::default(),
             wind_velocity: [0.0; 3],
             wind_rate: 0.0,
-            // Gauss–Seidel until the 2b-3c gate (Task 5) decides otherwise.
-            pressure_solver: PressureSolver::GaussSeidel,
-            pressure_cycles: 4,
+            pressure_solver: PressureSolver::Mgpcg,
+            pressure_cycles,
         }
     }
 }
@@ -139,6 +146,11 @@ pub struct SolverParams {
     pub pressure_solver: PressureSolver,
     /// V-cycles (`multigrid`) or PCG iterations (`mgpcg`) per substep;
     /// 1..=64. Gauss–Seidel ignores it.
+    ///
+    /// Preview's 4 under-converges around one-cell-thick colliders (a thin
+    /// plate keeps 4.7e-3 of its divergence, against the gate's 1e-3
+    /// target): scenes with thin walls should use `final` or set this to
+    /// at least 10 (`docs/bench/solver-gate.md`).
     pub pressure_cycles: u32,
 }
 

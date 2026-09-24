@@ -13,8 +13,7 @@ use elements_ember::kernels::Advection;
 use elements_ember::kernels::{Solids, StepConstants};
 use elements_ember::metrics::{Sample, measure};
 use elements_ember::solver::{
-    KIND, PressureSolve, PressureSolver, SolverParams, SolverState, Sources, resolve_params,
-    substep,
+    KIND, PressureSolve, SolverParams, SolverState, Sources, resolve_params, substep,
 };
 use std::sync::{Arc, Mutex};
 
@@ -121,11 +120,10 @@ fn a_preset_fills_only_what_the_document_leaves_unset() {
     assert_eq!(p.max_substeps, 8, "final's cap");
     let alias = resolve_params(&serde_json::json!({ "substeps": 3 })).unwrap();
     assert_eq!(alias.max_substeps, 3, "the 2a alias");
-    // Until the 2b-3c gate decides otherwise, both presets keep Gauss–Seidel.
-    for quality in ["preview", "final"] {
+    // The user's decision after the 2b-3c gate (`docs/bench/solver-gate.md`).
+    for (quality, cycles) in [("preview", 4), ("final", 10)] {
         let p = resolve_params(&serde_json::json!({ "quality": quality })).unwrap();
-        assert_eq!(p.pressure_solver, PressureSolver::GaussSeidel, "{quality}");
-        assert_eq!(p.pressure_cycles, 4, "{quality}");
+        assert_eq!(p.pressure(), PressureSolve::Mgpcg(cycles), "{quality}");
     }
     let chosen =
         resolve_params(&serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 9 }))
@@ -928,10 +926,18 @@ fn plume_16_with_far_collider(solver: &str, velocity: bool) -> String {
 
 /// Spec §3.1: a collider entirely outside the domain changes nothing, bit for
 /// bit, so the solid code paths are exact when nothing is solid.
+///
+/// That holds for Gauss–Seidel, which this pins. The multigrid hierarchy's
+/// solid path (fluid fractions, weighted prolongation) rounds differently
+/// even when every cell is fluid: with MGPCG ×4 the first density bit
+/// differs at frame 4, and by frame 40 the largest difference is 5.7e-7
+/// against a peak density of 1.2 (2b-3c Task 5).
 #[test]
 fn a_collider_outside_the_domain_changes_nothing() {
-    let mut plain = Session::new(&plume_16(PREVIEW));
-    let mut far = Session::new(&plume_16_with_far_collider(PREVIEW, true));
+    let solver = r#"{ "pressure_solver": "gauss_seidel", "pressure_iterations": 40,
+                      "buoyancy_temperature": 1.0 }"#;
+    let mut plain = Session::new(&plume_16(solver));
+    let mut far = Session::new(&plume_16_with_far_collider(solver, true));
     let (mut a, mut b) = (timeline(0), timeline(0));
     for frame in 1..=10 {
         assert!(

@@ -17,7 +17,7 @@ Early. The engine, its smoke solver and the solver's scene content work; fire, a
   - MacCormack advection over an RK2 backtrace, with trilinear sampling done by hand;
   - substeps chosen each frame from the flow speed (CFL), capped per quality preset;
   - Boussinesq buoyancy, vorticity confinement and dissipation;
-  - pressure projection warm-started from the previous frame, with walls or open faces chosen per side, by red-black Gauss–Seidel (the presets' default) or, per document (`pressure_solver`, `pressure_cycles`), multigrid V-cycles or MGPCG;
+  - pressure projection warm-started from the previous frame, with walls or open faces chosen per side, by MGPCG (the presets' default: 4 iterations in preview, 10 in final; see `docs/bench/solver-gate.md`) or, per document (`pressure_solver`, `pressure_cycles`, `pressure_iterations`), multigrid V-cycles or red-black Gauss–Seidel;
   - `preview` and `final` quality presets;
   - keyframed sphere and box emitters that add density and temperature, modulated by seeded noise measured in metres, and can pull the fluid toward a target velocity;
   - keyframed sphere and box colliders, moving or still, whose surfaces carry their own velocity;

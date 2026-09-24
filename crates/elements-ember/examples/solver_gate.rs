@@ -1065,10 +1065,66 @@ fn timing_only(plan: &Plan, count: u32) -> Res<()> {
     Ok(())
 }
 
+/// `SOLVER_GATE_COMPARE=1`: Gauss–Seidel ×160 against MGPCG ×4 on the
+/// gate's accuracy measures (the three scenes' masked divergence at both
+/// resolutions, `plume_plate`'s ratio at the low one), as a Markdown table
+/// on stdout. Informs the preset decision after the registered rule failed;
+/// it is not part of the rule and writes no record.
+fn compare(plan: &Plan) -> Res<()> {
+    let clock = Clock(Instant::now());
+    let gpu = GpuContext::new_headless()?;
+    let registry = elements_ember::registry();
+    let solves = [
+        PressureSolve::GaussSeidel(GS_ITERATIONS),
+        PressureSolve::Mgpcg(INFO_MGPCG[0]),
+    ];
+    let mut table = String::from(
+        "| measure | res | frames 60 / 120: `gauss_seidel ×160` | `mgpcg ×4` |\n|---|---|---|---|\n",
+    );
+    let fmt = |d: [f64; 2]| format!("{:.2e} / {:.2e}", d[0], d[1]);
+    for (stage, &res) in plan.res.iter().enumerate() {
+        for name in SCENES {
+            let mut cells = Vec::new();
+            for solve in solves {
+                let (d, n) =
+                    masked_divergence(&gpu, &registry, &configure(scene(name, res), solve))?;
+                clock.log(format!(
+                    "{res}³ {name} {}: {d:?} ({n:?} cells)",
+                    label(solve)
+                ));
+                cells.push(fmt(d));
+            }
+            let _ = writeln!(
+                table,
+                "| `{name}` masked RMS | {res}³ | {} |",
+                cells.join(" | ")
+            );
+        }
+        if stage == 0 {
+            let mut cells = Vec::new();
+            for solve in solves {
+                let r = plate_ratios(&gpu, res, solve)?;
+                clock.log(format!("{res}³ plume_plate {}: {r:?}", label(solve)));
+                cells.push(fmt(r));
+            }
+            let _ = writeln!(
+                table,
+                "| `plume_plate` ratio | {res}³ | {} |",
+                cells.join(" | ")
+            );
+        }
+    }
+    println!("{table}");
+    Ok(())
+}
+
 fn main() -> Res<()> {
     let plan = Plan::from_env();
     if let Ok(count) = std::env::var("SOLVER_GATE_TIMING_ONLY") {
         return timing_only(&plan, count.trim().parse()?);
+    }
+    if std::env::var_os("SOLVER_GATE_COMPARE").is_some() {
+        return compare(&plan);
     }
     let clock = Clock(Instant::now());
     let load_before = load();

@@ -117,4 +117,32 @@ Frame time, ms (secondary, not the rule), the same statistic:
 
 Rule applied: **none passes**: no candidate meets the per-solve timing clause (and the other clauses) in every scene at both resolutions. `plume_wind` constrained only frame 60: at frame 120 its smoke mask had no measured cells, so its RMS of 0 passed vacuously.
 
-Decision (recorded by the user): _pending_
+## After the rule: Gauss–Seidel ×160 against MGPCG ×4
+
+Measured 2026-09-24 at commit 2b9acab-dirty (`SOLVER_GATE_COMPARE=1`), by the gate's own accuracy measures,
+to decide the presets after the registered rule failed. It is not part of the rule.
+
+| measure | res | frames 60 / 120: `gauss_seidel ×160` | `mgpcg ×4` |
+|---|---|---|---|
+| `plume` masked RMS | 128³ | 3.00e-2 / 7.56e-3 | 3.63e-5 / 2.17e-5 |
+| `plume_collider` masked RMS | 128³ | 7.84e-3 / 3.63e-3 | 4.39e-5 / 2.52e-5 |
+| `plume_wind` masked RMS | 128³ | 3.25e-4 / 0.00e0 | 1.92e-6 / 0.00e0 |
+| `plume_plate` ratio | 128³ | 8.70e-3 / 6.45e-3 | 4.72e-3 / 1.23e-3 |
+| `plume` masked RMS | 256³ | 2.51e-1 / 2.82e-2 | 6.66e-5 / 6.19e-5 |
+| `plume_collider` masked RMS | 256³ | 7.12e-2 / 1.78e-2 | 1.09e-4 / 7.68e-5 |
+| `plume_wind` masked RMS | 256³ | 2.22e-3 / 0.00e0 | 5.42e-6 / 0.00e0 |
+
+MGPCG ×4 is at least as accurate as Gauss–Seidel ×160 on every row: on the thin plate by 1.8× (frame
+60) and 5.3× (frame 120), and in the three scenes by two to four orders of magnitude. Gauss–Seidel ×160,
+today's preview, misses Mantaflow's reference in every scene with smoke to measure. MGPCG ×4 meets it at
+128³. At 256³ it misses by up to 1.5×: `plume` at frame 120 (6.19e-5 against 4.51e-5), and
+`plume_collider` at frames 60 and 120 (1.09e-4 against 9.12e-5, 7.68e-5 against 5.25e-5). `plume_wind`'s
+frame 120 has no measured cells for either solver.
+
+Decision (recorded by the user, 2026-09-24): the registered rule failed. MGPCG ×10's solve is 1–42% slower
+than Gauss–Seidel's at 128³ (12% in `plume`, 42% in `plume_collider`, 1% in `plume_wind`). Preview uses
+MGPCG ×4. Its solve takes 42–59% of Gauss–Seidel ×160's at 128³ and 34–41% at 256³. It meets Mantaflow's
+divergence in all three scenes at 128³ and misses it by at most 1.5× at 256³, where Gauss–Seidel misses by
+up to 3400×. It is more accurate than Gauss–Seidel on the thin plate (4.72e-3 / 1.23e-3 against
+8.70e-3 / 6.45e-3), but misses the plate's 1e-3 target. Final uses MGPCG ×10, which passes every accuracy
+check, the thin plate included.

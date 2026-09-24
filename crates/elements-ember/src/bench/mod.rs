@@ -141,7 +141,9 @@ impl Scene {
         scene
     }
 
+    /// Gauss–Seidel with `n` sweeps, as the speed gate measures it.
     pub fn with_iterations(mut self, n: u32) -> Self {
+        self.solver.pressure_solver = solver::PressureSolver::GaussSeidel;
         self.solver.pressure_iterations = n;
         self
     }
