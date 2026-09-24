@@ -2028,7 +2028,7 @@ benchmark must measure the final one. If the load does not fall under 2
 within 10 minutes, stop and report too; the user must free the machine
 (Backblaze's `bztransmit` and `mediaanalysisd` held it at 6–19 last time).
 
-Then check the load again (`sysctl -n vm.loadavg`), under 2 as above. Then run `just bench scenes=plume resolutions=64` as a smoke
+Then check the load again (`sysctl -n vm.loadavg`), under 2 as above. Then run `just bench plume 64` (just parameters are positional) as a smoke
 test. `report` fails with the missing list, which is expected. Check the two
 `plume-64` summaries by eye:
 - both solvers' mass rises to frame 60 and then flattens or falls;
