@@ -2,10 +2,10 @@
 //! temperature and velocity (2b-2 spec §2.2).
 
 use elements_core::gpu::{
-    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField,
+    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField, fill_constant,
 };
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::kernels::{Bind, axis_index, bind_group, expect_dims, uniform_buffer};
 use crate::node_util::produce;
@@ -33,7 +33,7 @@ pub const MIN_NOISE_SCALE_M: f32 = 1e-4;
 pub const MAX_NOISE_EVOLUTION: f32 = 1e4;
 
 /// Noise that modulates an emitter's rates (spec §2.2).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Noise {
     pub seed: u64,
@@ -47,7 +47,7 @@ pub struct Noise {
     pub evolution: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmitterParams {
     pub shape: Shape,
@@ -68,6 +68,10 @@ pub struct EmitterParams {
     /// Optional noise that multiplies the rates.
     #[serde(default)]
     pub noise: Option<Noise>,
+    /// Frames on which the emitter emits, inclusive. `None` is always on.
+    /// Outside the range every output is zero (2b-3 spec §3).
+    #[serde(default)]
+    pub active_frames: Option<[u32; 2]>,
 }
 
 impl EmitterParams {
@@ -81,7 +85,14 @@ impl EmitterParams {
             velocity: [0.0; 3],
             velocity_blend: 0.0,
             noise: None,
+            active_frames: None,
         }
+    }
+
+    /// Whether the emitter emits on `frame`.
+    pub fn is_active(&self, frame: u32) -> bool {
+        self.active_frames
+            .is_none_or(|[first, last]| (first..=last).contains(&frame))
     }
 }
 
@@ -240,6 +251,17 @@ impl Node for Emitter {
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
         let time = ctx.time();
+        if !self.params.is_active(time.frame) {
+            return produce(ctx, 3, |gpu, cache, cells, velocity| {
+                for field in cells {
+                    fill_constant(gpu, cache, field, 0.0)?;
+                }
+                for axis in Axis::ALL {
+                    fill_constant(gpu, cache, velocity.face(axis), 0.0)?;
+                }
+                Ok(())
+            });
+        }
         let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
         let dx = ctx.voxel_size();
         let params = &self.params;
@@ -280,6 +302,14 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
     )?;
     if p.velocity_blend < 0.0 {
         return Err(params::bad(KIND, "velocity_blend must be at least 0"));
+    }
+    if let Some([first, last]) = p.active_frames
+        && first > last
+    {
+        return Err(params::bad(
+            KIND,
+            "active_frames must not end before it starts",
+        ));
     }
     if let Some(n) = p.noise {
         params::finite(KIND, "noise", &[n.scale_m, n.amplitude, n.evolution])?;

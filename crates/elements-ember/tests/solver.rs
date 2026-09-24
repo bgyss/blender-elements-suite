@@ -303,6 +303,18 @@ fn frame_40_is_bit_identical_with_animated_emitter_and_collider() {
     assert_doc_frame_40_is_bit_identical(ANIMATED);
 }
 
+/// Spec §3: the frame after the emitter switches off reproduces bit for bit
+/// in order, after scrubbing across the cut-off, and after eviction.
+#[test]
+fn frame_40_is_bit_identical_after_the_emitter_switches_off() {
+    let doc = ANIMATED.replace(
+        r#""density_rate": 1.0,"#,
+        r#""active_frames": [1, 39], "density_rate": 1.0,"#,
+    );
+    assert_ne!(doc, ANIMATED, "the window must be inserted");
+    assert_doc_frame_40_is_bit_identical(&doc);
+}
+
 /// Everything 2b-1 added, switched on: a CFL count that varies from frame to
 /// frame, confinement, and dissipation. `cfl` is small enough that the count
 /// changes within the first 40 frames (`substep_counts` shows it does).

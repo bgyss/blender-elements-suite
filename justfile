@@ -14,13 +14,18 @@ lint:
     cargo clippy --workspace --all-targets -- -D warnings
     ruff check addon scripts tests
 
-# Run the Rust test suite on this machine's native GPU backend.
-test:
+# Run the Rust test suite on this machine's native GPU backend, and the
+# Python checks that need no Blender.
+test: py-test
     cargo nextest run --workspace
 
 # Run the Rust test suite the way CI does, on software Vulkan.
-ci-test:
+ci-test: py-test
     WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 cargo nextest run --workspace
+
+# The benchmark's Ember -> Mantaflow parameter mappings; no Blender needed.
+py-test:
+    python tests/bench/test_mapping.py
 
 # Everything a commit must pass.
 check: lint test
@@ -66,3 +71,19 @@ bench-sweep iterations="160,240,320,400,480,560,640":
 # Takes minutes, needs the real GPU, and is not part of `check`.
 bench-presets:
     cargo run --release -p elements-ember --example presets
+
+# The Mantaflow benchmark (2b-3 spec). Takes about an hour or more, needs the
+# real GPU and Blender, and is not part of `check`. Writes
+# docs/bench/results/ per run, then docs/bench/results.md from a complete set.
+bench scenes="plume plume_collider plume_wind" resolutions="64 128 256":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p elements-ember --example benchmark
+    B=target/release/examples/benchmark
+    for res in {{resolutions}}; do
+      for scene in {{scenes}}; do
+        "$B" ember "$scene" "$res"
+        "$B" mantaflow "$scene" "$res"
+      done
+    done
+    "$B" report

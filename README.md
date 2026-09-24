@@ -1,6 +1,6 @@
 # Elements Suite
 
-An open-source, Rust-based suite of real-time VFX authoring tools for Blender. The core engine (`crates/`) is dual-licensed Apache-2.0 OR MIT; the Blender add-on (`addon/`) is GPL-3.0-or-later.
+An open-source, Rust-based suite of real-time VFX authoring tools for Blender. The core engine (`crates/`) is dual-licensed Apache-2.0 OR MIT; the Blender add-on (`addon/`) and the Blender-side benchmark scripts (`tests/bench/`) are GPL-3.0-or-later. `vendor/vdb-rs/` is a patched copy of Traverse Research BV's MIT-licensed `vdb-rs` (see its `PATCHED.md`).
 
 ![A buoyant smoke plume rising from a sphere at frames 24, 48, 72 and 96, simulated at 256³ and rendered in Cycles](docs/media/plume-frames.jpg)
 

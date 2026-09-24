@@ -25,7 +25,14 @@ of the piece 2 spec. **2b-2**, scene content, is complete: keyframed box and
 sphere emitters (with noise and velocity emission) and colliders, unions of
 each, and wind
 (`docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`).
-**2b-3**, the Mantaflow benchmark, is next. Flame is its own later cycle, 2b-4.
+**2b-3**, the Mantaflow benchmark, is complete (`docs/bench/results.md`).
+Ember is 3–8× faster than Mantaflow and uses about half its memory or less,
+but leaves far more divergence at high resolution. Its domain-wide wind
+fails at every resolution: smoke is lost inside the domain at 128³ and 256³
+before any reaches the outflow plane, by a mechanism not yet known, and at
+64³ and 128³ the rest leaves quickly through the top: open risk (l). All
+timings were measured under load. **2b-3b**, the side-by-side render and the
+latency measurement, is next. Flame is its own later cycle, 2b-4.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -38,6 +45,9 @@ each, and wind
 - Ember piece 2b-1 plan: `docs/superpowers/plans/2026-09-22-ember-solver-2b1.md`
 - Ember piece 2b-2 spec: `docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`
 - Ember piece 2b-2 plan: `docs/superpowers/plans/2026-09-23-ember-scene-content-2b2.md`
+- Ember piece 2b-3 spec: `docs/superpowers/specs/2026-09-23-ember-mantaflow-benchmark-2b3-design.md`
+- Ember piece 2b-3 plan: `docs/superpowers/plans/2026-09-23-ember-mantaflow-benchmark-2b3.md`
+- Mantaflow benchmark results and cache notes: `docs/bench/results.md`, `docs/bench/mantaflow-notes.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
@@ -52,7 +62,7 @@ Tasks listed complete there are done — do not redo them.
 
 ```bash
 just check        # lint + test; must pass before any commit
-just test         # cargo nextest run --workspace, native GPU backend
+just test         # cargo nextest on the native GPU backend, plus tests/bench/test_mapping.py
 just lint         # cargo fmt --check, clippy -D warnings, ruff check
 just addon        # build + verify the Blender extension ZIP
 just blender-test # Blender integration test; finds the macOS app bundle
@@ -60,6 +70,8 @@ just golden       # regenerate golden files (review the PNG by eye first)
 just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
 just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
 just bench-presets # the preview preset's substep cap; minutes, real GPU, not in check
+just bench        # the Mantaflow benchmark; an hour or more, real GPU and Blender, not in check
+                  # (positional: `just bench plume 64` for one scene and resolution)
 ```
 
 Single test: `cargo nextest run -p elements-core --test noise` (a test *file*),
@@ -127,6 +139,10 @@ Separately: **no Rust crate can write OpenVDB.** `vdb-rs` is read-only and
 unmaintained; the `openvdb` crate is an empty placeholder. `elements-io` contains
 a hand-written minimal `FloatGrid` writer built from the byte layout in `vdb-rs`'s
 parser, with `vdb-rs` used as the read-back oracle in tests.
+`vdb-rs` 0.6.0 also misreads vector grids: it parses a `Vec3s` grid's root
+values at 4 bytes and returns an empty tree. The workspace therefore vendors a
+patched copy in `vendor/vdb-rs/` through `[patch.crates-io]` (see
+`PATCHED.md`). It is a dev-dependency only, so the daemon never links it.
 
 ## Constraints that bite
 

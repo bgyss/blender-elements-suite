@@ -1,7 +1,7 @@
 use elements_core::gpu::{FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{
-    Document, EvalCtx, Graph, Node, NodeError, NodeRegistry, SocketSpec, SocketType, StateStore,
-    Time, Value,
+    Document, EvalCtx, Graph, Node, NodeError, NodeId, NodeRegistry, SocketSpec, SocketType,
+    StateStore, Time, Value,
 };
 
 /// constant 0.5 -> accumulate -> output, on a 4³ domain.
@@ -267,4 +267,22 @@ fn a_snapshot_counts_every_stored_texel() {
     h.frame(&graph, &mut state, 1, dims);
     let one = state.snapshot(&h.gpu, &mut h.pool).unwrap();
     assert_eq!(one.bytes(), 4 * 4 * 4 * 4, "one 4³ R32Float field");
+}
+
+/// State can be read between frames without taking it out of the store.
+#[test]
+fn get_reads_a_slot_without_removing_it() {
+    let mut h = Harness::new();
+    let (graph, dims) = accumulate_graph();
+    let mut state = StateStore::new();
+    h.frame(&graph, &mut state, 1, dims);
+    let sum = state
+        .get(NodeId(1), "sum")
+        .expect("accumulate keeps its sum in the \"sum\" slot");
+    assert_all_near(
+        &sum.as_field().unwrap().read_back(&h.gpu).unwrap(),
+        expected(1),
+    );
+    assert!(state.get(NodeId(1), "no such slot").is_none());
+    assert_eq!(state.len(), 1, "get leaves the slot in place");
 }

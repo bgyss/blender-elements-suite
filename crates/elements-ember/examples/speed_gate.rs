@@ -19,8 +19,8 @@ use std::time::Instant;
 use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::{GATE_RATIO, GATE_STEP_MS, GateRow, Scene, gate_verdict};
-use elements_ember::emitter::fill_sphere;
 use elements_ember::metrics::{DivergenceStats, divergence};
+use elements_ember::shape_emitter::{EmitterFields, fill_emitter};
 use elements_ember::solver::{SolverState, Sources, Substep, substep};
 
 use common::{commit_label, median, shell};
@@ -104,13 +104,22 @@ fn divergence_at(
     let mut cache = PipelineCache::new();
     let density_source = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
     let temperature_source = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
-    fill_sphere(
+    let weight = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
+    let target = pool.acquire_staggered_uninit(gpu, cells)?;
+    let pose = scene.emitter.transform.pose(1.0, 1.0 / scene.fps);
+    fill_emitter(
         gpu,
         &mut cache,
-        &density_source,
-        &temperature_source,
         &scene.emitter,
+        &pose,
+        0.0,
         dx,
+        EmitterFields {
+            density: &density_source,
+            temperature: &temperature_source,
+            weight: &weight,
+            velocity: &target,
+        },
     )?;
     let sources = Sources::new(&density_source, &temperature_source);
     let mut state = SolverState::zeroed(gpu, &mut cache, &mut pool, cells)?;

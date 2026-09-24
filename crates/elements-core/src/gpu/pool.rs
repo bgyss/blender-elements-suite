@@ -16,6 +16,8 @@ pub struct FieldPool {
     next_generation: u64,
     /// Counts successful `acquire` calls, whether reused or freshly allocated.
     acquisitions: u64,
+    /// Bytes of every texture this pool has created.
+    allocated_bytes: u64,
 }
 
 impl FieldPool {
@@ -27,6 +29,14 @@ impl FieldPool {
     /// decreases, so a stable count across frames proves reuse.
     pub fn allocation_count(&self) -> u64 {
         self.next_generation
+    }
+
+    /// Bytes of every texture this pool has ever created. `clear` frees the
+    /// idle textures but does not reset this count, so it is the pool's peak
+    /// only until the first clear; after that it also counts textures
+    /// already freed.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
     }
 
     /// Take a field of this shape from the pool, allocating only if none is free.
@@ -73,6 +83,7 @@ impl FieldPool {
                 generation,
             }
         })?;
+        self.allocated_bytes += dims.voxel_count() as u64 * u64::from(format.bytes_per_voxel());
         self.acquisitions += 1;
         Ok(field)
     }

@@ -110,3 +110,25 @@ fn clearing_the_pool_drops_every_free_texture() {
     let _c = pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap();
     assert_eq!(pool.allocation_count(), before + 1);
 }
+
+/// Reuse allocates nothing; a new shape adds its bytes.
+#[test]
+fn allocated_bytes_counts_only_fresh_textures() {
+    let gpu = GpuContext::new_headless().unwrap();
+    let mut pool = FieldPool::new();
+    assert_eq!(pool.allocated_bytes(), 0);
+    let a = pool
+        .acquire(&gpu, FieldDims::new(4, 4, 4), FieldFormat::R32Float)
+        .unwrap();
+    assert_eq!(pool.allocated_bytes(), 4 * 4 * 4 * 4);
+    pool.release(a);
+    let b = pool
+        .acquire(&gpu, FieldDims::new(4, 4, 4), FieldFormat::R32Float)
+        .unwrap();
+    assert_eq!(pool.allocated_bytes(), 4 * 4 * 4 * 4, "reuse is free");
+    let _c = pool
+        .acquire(&gpu, FieldDims::new(8, 4, 4), FieldFormat::R32Float)
+        .unwrap();
+    assert_eq!(pool.allocated_bytes(), 4 * 4 * 4 * 4 + 8 * 4 * 4 * 4);
+    pool.release(b);
+}
