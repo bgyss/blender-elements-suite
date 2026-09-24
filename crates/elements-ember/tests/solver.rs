@@ -1,15 +1,21 @@
 mod common;
 
 use common::*;
-use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache};
+use elements_core::gpu::{
+    Axis, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache,
+};
 use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
     StateStore, Time, Timeline, TimelineConfig, Value,
 };
 use elements_ember::cfl;
 use elements_ember::kernels::Advection;
-use elements_ember::kernels::StepConstants;
-use elements_ember::solver::{KIND, SolverParams, SolverState, Sources, resolve_params, substep};
+use elements_ember::kernels::{Solids, StepConstants};
+use elements_ember::metrics::{Sample, measure};
+use elements_ember::solver::{
+    KIND, PressureSolve, PressureSolver, SolverParams, SolverState, Sources, resolve_params,
+    substep,
+};
 use std::sync::{Arc, Mutex};
 
 fn rejected(params: serde_json::Value) -> bool {
@@ -68,6 +74,18 @@ fn rejects_out_of_range_solver_parameters() {
         serde_json::json!({ "temperature_dissipation": 1e39 })
     ));
     assert!(rejected(serde_json::json!({ "wind": [1e39, 0.0, 0.0] })));
+    assert!(!rejected(
+        serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 64 })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "pressure_solver": "multigrid", "pressure_cycles": 1 })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "pressure_solver": "gauss_seidel" })
+    ));
+    assert!(rejected(serde_json::json!({ "pressure_solver": "jacobi" })));
+    assert!(rejected(serde_json::json!({ "pressure_cycles": 0 })));
+    assert!(rejected(serde_json::json!({ "pressure_cycles": 65 })));
 }
 
 /// Spec §6: a preset fills only the fields a document leaves unset, and
@@ -80,6 +98,16 @@ fn a_preset_fills_only_what_the_document_leaves_unset() {
     assert_eq!(p.max_substeps, 8, "final's cap");
     let alias = resolve_params(&serde_json::json!({ "substeps": 3 })).unwrap();
     assert_eq!(alias.max_substeps, 3, "the 2a alias");
+    // Until the 2b-3c gate decides otherwise, both presets keep Gauss–Seidel.
+    for quality in ["preview", "final"] {
+        let p = resolve_params(&serde_json::json!({ "quality": quality })).unwrap();
+        assert_eq!(p.pressure_solver, PressureSolver::GaussSeidel, "{quality}");
+        assert_eq!(p.pressure_cycles, 4, "{quality}");
+    }
+    let chosen =
+        resolve_params(&serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 9 }))
+            .unwrap();
+    assert_eq!(chosen.pressure(), PressureSolve::Mgpcg(9));
     assert_eq!(
         resolve_params(&serde_json::Value::Null).unwrap(),
         SolverParams::default()
@@ -126,7 +154,13 @@ fn a_still_domain_stays_exactly_still() {
     let sources = Sources::new(&zero, &zero);
     for _ in 0..10 {
         substep(
-            &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
+            &gpu,
+            &mut cache,
+            &mut pool,
+            &mut state,
+            sources,
+            &constants,
+            PressureSolve::GaussSeidel(20),
         )
         .unwrap();
     }
@@ -555,7 +589,13 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
     let sources = Sources::new(&zero, &zero);
 
     let err = substep(
-        &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &mut state,
+        sources,
+        &constants,
+        PressureSolve::GaussSeidel(20),
     )
     .unwrap_err();
     assert!(matches!(err, GpuError::Validation(_)), "got {err:?}");
@@ -995,4 +1035,194 @@ fn a_collider_mask_does_not_leak_across_frames() {
         counts.push(session.pool.allocation_count());
     }
     assert_eq!(counts[2], counts[5], "allocations per frame: {counts:?}");
+}
+
+/// `ANIMATED` with the pressure solve `solver` running `cycles` cycles in
+/// place of 40 Gauss–Seidel iterations.
+fn animated_with(solver: &str, cycles: u32) -> String {
+    let doc = ANIMATED.replace(
+        r#""pressure_iterations": 40,"#,
+        &format!(r#""pressure_solver": "{solver}", "pressure_cycles": {cycles},"#),
+    );
+    assert_ne!(doc, ANIMATED, "the solver must be inserted");
+    doc
+}
+
+/// Umbrella §4 with multigrid: the hierarchy is rebuilt every substep from
+/// the frame's collider mask, so frame 40 still reproduces bit for bit.
+#[test]
+fn frame_40_is_bit_identical_with_multigrid() {
+    assert_doc_frame_40_is_bit_identical(&animated_with("multigrid", 4));
+}
+
+/// As `frame_40_is_bit_identical_with_multigrid`, with MGPCG, whose scalars
+/// stay on the GPU.
+#[test]
+fn frame_40_is_bit_identical_with_mgpcg() {
+    assert_doc_frame_40_is_bit_identical(&animated_with("mgpcg", 4));
+}
+
+/// Passes density through, and keeps a read-back copy of the velocity it
+/// is given, replacing the previous frame's.
+struct VelocityProbe(Arc<Mutex<[Vec<f32>; 3]>>);
+
+impl Node for VelocityProbe {
+    fn kind(&self) -> &'static str {
+        "test.velocity_probe"
+    }
+
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Field, SocketType::VectorField],
+            outputs: vec![SocketType::Field],
+        }
+    }
+
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let velocity = ctx.take_input(1)?;
+        let faces = ctx.with_gpu(|gpu, _| {
+            let v = velocity.as_vector_field().unwrap();
+            let mut faces: [Vec<f32>; 3] = Default::default();
+            for (a, axis) in Axis::ALL.into_iter().enumerate() {
+                faces[a] = v.face(axis).read_back(gpu)?;
+            }
+            Ok(faces)
+        });
+        ctx.release(velocity);
+        *self.0.lock().unwrap() = faces?;
+        Ok(vec![ctx.take_input(0)?])
+    }
+}
+
+/// Masked divergence RMS (`metrics::measure`) at frame 20 of `plume_16`'s
+/// scene at 32³, with `solver` as the solver's params.
+fn plume_32_divergence_rms(solver: &str) -> f64 {
+    const N: u32 = 32;
+    let doc: serde_json::Value = serde_json::from_str(&plume_16(solver)).unwrap();
+    let registry = elements_ember::registry();
+    let build = |i: usize| {
+        let node = &doc["nodes"][i];
+        registry
+            .build(node["kind"].as_str().unwrap(), &node["params"])
+            .unwrap()
+    };
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(build(0));
+    let solver_node = graph.add_node(build(1));
+    let faces = Arc::new(Mutex::new(Default::default()));
+    let probe = graph.add_node(Box::new(VelocityProbe(Arc::clone(&faces))));
+    let output = graph.add_node(build(2));
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    for (from, to) in [
+        (socket(emitter, 0), socket(solver_node, 0)),
+        (socket(emitter, 1), socket(solver_node, 1)),
+        (socket(solver_node, 0), socket(probe, 0)),
+        (socket(solver_node, 2), socket(probe, 1)),
+        (socket(probe, 0), socket(output, 0)),
+    ] {
+        graph.connect(from, to).unwrap();
+    }
+    graph.set_output(output);
+    graph.set_domain_size(2.0);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let cells = FieldDims::new(N, N, N);
+    let evaluated = timeline(0)
+        .goto(&graph, &gpu, &mut pool, &mut pipelines, cells, 20)
+        .unwrap();
+    let density = evaluated.value.as_field().unwrap().read_back(&gpu).unwrap();
+    evaluated.value.release_to(&mut pool);
+    let faces = faces.lock().unwrap();
+    let m = measure(&Sample {
+        cells,
+        dx: 2.0 / f64::from(N),
+        density: &density,
+        faces: &faces,
+        solid: &[],
+    });
+    eprintln!("{solver}: {m:?}");
+    assert!(m.measured_cells > 0, "the plume must be measured");
+    m.divergence_rms
+}
+
+/// 2b-3c spec §3: four V-cycles leave less divergence in the smoke than 40
+/// red-black Gauss–Seidel iterations, so the document's choice reaches the
+/// projection.
+#[test]
+fn multigrid_leaves_less_divergence_than_gauss_seidel() {
+    // Every run sets 40 iterations, so a solver choice that were ignored
+    // would run exactly the Gauss–Seidel baseline and tie with it.
+    let rms = |solver: &str, cycles: u32| {
+        plume_32_divergence_rms(&format!(
+            r#"{{ "pressure_solver": "{solver}", "pressure_iterations": 40, "pressure_cycles": {cycles} }}"#
+        ))
+    };
+    let gauss_seidel = rms("gauss_seidel", 4);
+    let multigrid = rms("multigrid", 4);
+    let mgpcg = rms("mgpcg", 4);
+    eprintln!(
+        "divergence RMS at frame 20: gauss_seidel × 40 {gauss_seidel:.3e}, \
+         multigrid × 4 {multigrid:.3e}, mgpcg × 4 {mgpcg:.3e}"
+    );
+    assert!(multigrid < gauss_seidel, "{multigrid} vs {gauss_seidel}");
+    assert!(mgpcg < gauss_seidel, "{mgpcg} vs {gauss_seidel}");
+}
+
+/// Like `a_substep_failing_after_retiring_fields_returns_them_all`, with a
+/// multigrid or MGPCG solve and a collider, so the substep has built a
+/// hierarchy with every kind of level field (masks, fluid fractions,
+/// prolongation weights) before the mis-sized pressure fails the solve.
+fn assert_failed_solve_returns_the_hierarchy(pressure: PressureSolve) {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(8, 6, 5);
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+    let wrong_dims = FieldDims::new(cells.x + 1, cells.y, cells.z);
+    let wrong_pressure = pool.acquire_zeroed(&gpu, &mut cache, wrong_dims).unwrap();
+    pool.release(std::mem::replace(&mut state.pressure, wrong_pressure));
+
+    let zero = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
+    let mask = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
+    let obstacle = pool
+        .acquire_staggered_zeroed(&gpu, &mut cache, cells)
+        .unwrap();
+    let constants = StepConstants {
+        alpha: 0.5,
+        beta: 2.0,
+        has_solids: true,
+        ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
+    };
+    let sources = Sources::new(&zero, &zero).with_solids(Solids {
+        mask: &mask,
+        velocity: &obstacle,
+    });
+
+    let err = substep(
+        &gpu, &mut cache, &mut pool, &mut state, sources, &constants, pressure,
+    )
+    .unwrap_err();
+    assert!(matches!(err, GpuError::Validation(_)), "got {err:?}");
+
+    state.release_to(&mut pool);
+    pool.release(zero);
+    pool.release(mask);
+    pool.release_staggered(obstacle);
+    assert_eq!(
+        pool.pooled_count() as u64,
+        pool.allocation_count(),
+        "every allocated texture, the hierarchy's included, must be back in the pool"
+    );
+}
+
+#[test]
+fn a_failed_step_with_multigrid_returns_every_field_to_the_pool() {
+    assert_failed_solve_returns_the_hierarchy(PressureSolve::Multigrid(4));
+}
+
+#[test]
+fn a_failed_step_with_mgpcg_returns_every_field_to_the_pool() {
+    assert_failed_solve_returns_the_hierarchy(PressureSolve::Mgpcg(4));
 }

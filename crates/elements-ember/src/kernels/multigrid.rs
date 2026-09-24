@@ -422,16 +422,23 @@ impl Hierarchy {
     /// Return every field to `pool`. The batch that used them must have been
     /// submitted.
     pub fn release(self, pool: &mut FieldPool) {
-        for level in self.levels {
-            for field in [
-                level.rhs, level.e, level.tmp, level.mask, level.norm, level.phi,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                pool.release(field);
-            }
+        for field in self.into_fields() {
+            pool.release(field);
         }
+    }
+
+    /// Every pooled field the hierarchy holds, for a caller that returns
+    /// them to the pool itself once the batch that used them has run.
+    pub fn into_fields(self) -> Vec<Field> {
+        self.levels
+            .into_iter()
+            .flat_map(|level| {
+                [
+                    level.rhs, level.e, level.tmp, level.mask, level.norm, level.phi,
+                ]
+            })
+            .flatten()
+            .collect()
     }
 
     /// Level `l`'s `solid` view: its mask, or the placeholder without solids.

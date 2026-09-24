@@ -11,7 +11,7 @@ use elements_ember::collider::{ColliderFields, ColliderParams, fill_collider};
 use elements_ember::emitter::{Sphere, fill_sphere};
 use elements_ember::kernels::{Solids, StepConstants, Uniforms, solidify};
 use elements_ember::metrics::{centroid_z, divergence};
-use elements_ember::solver::{Emission, SolverState, Sources, Substep, substep};
+use elements_ember::solver::{Emission, PressureSolve, SolverState, Sources, Substep, substep};
 use elements_ember::transform::{Key, Shape, Transform};
 
 #[test]
@@ -41,7 +41,7 @@ fn the_centroid_is_in_cell_units_at_cell_centres() {
 /// RMS divergence after projection over before it, after 20 frames of the
 /// 16³ plume with the given open faces.
 fn projection_ratio(open_mask: u32) -> f64 {
-    const ITERATIONS: u32 = 160;
+    const ITERATIONS: PressureSolve = PressureSolve::GaussSeidel(160);
     let gpu = gpu();
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
@@ -145,7 +145,13 @@ fn a_hot_blob_rises_every_frame() {
     let mut heights = vec![centroid_z(&state.density.read_back(&gpu).unwrap(), cells).unwrap()];
     for _ in 0..20 {
         substep(
-            &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 80,
+            &gpu,
+            &mut cache,
+            &mut pool,
+            &mut state,
+            sources,
+            &constants,
+            PressureSolve::GaussSeidel(80),
         )
         .unwrap();
         heights.push(centroid_z(&state.density.read_back(&gpu).unwrap(), cells).unwrap());
@@ -170,7 +176,7 @@ fn a_hot_blob_rises_every_frame() {
 /// 0.20).
 #[test]
 fn the_warm_start_survives_a_change_of_substep_length() {
-    const ITERATIONS: u32 = 20;
+    const ITERATIONS: PressureSolve = PressureSolve::GaussSeidel(20);
     let gpu = gpu();
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
@@ -259,7 +265,13 @@ fn confinement_strengthens_a_plumes_vorticity() {
         let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
         for _ in 0..20 {
             substep(
-                &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 160,
+                &gpu,
+                &mut cache,
+                &mut pool,
+                &mut state,
+                sources,
+                &constants,
+                PressureSolve::GaussSeidel(160),
             )
             .unwrap();
         }
@@ -301,7 +313,13 @@ fn the_solver_runs_velocity_emission_and_wind() {
     });
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
     substep(
-        &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 40,
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &mut state,
+        sources,
+        &constants,
+        PressureSolve::GaussSeidel(40),
     )
     .unwrap();
     let u = state.read_velocity(&gpu).unwrap();
@@ -329,7 +347,7 @@ fn the_solver_runs_velocity_emission_and_wind() {
         &mut state,
         Sources::new(&zero, &zero),
         &windy,
-        40,
+        PressureSolve::GaussSeidel(40),
     )
     .unwrap();
     let u = state.read_velocity(&gpu).unwrap();
@@ -423,7 +441,13 @@ fn collider_scene(with_collider: bool) -> (f64, Option<(f32, f32)>) {
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
     for _ in 0..40 {
         substep(
-            &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 160,
+            &gpu,
+            &mut cache,
+            &mut pool,
+            &mut state,
+            sources,
+            &constants,
+            PressureSolve::GaussSeidel(160),
         )
         .unwrap();
     }
@@ -525,7 +549,13 @@ fn a_moving_collider_pushes_the_fluid() {
             velocity: &obstacle,
         });
         substep(
-            &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 80,
+            &gpu,
+            &mut cache,
+            &mut pool,
+            &mut state,
+            sources,
+            &constants,
+            PressureSolve::GaussSeidel(80),
         )
         .unwrap();
         pool.release(mask);

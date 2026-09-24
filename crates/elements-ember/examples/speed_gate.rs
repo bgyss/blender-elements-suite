@@ -94,7 +94,7 @@ fn divergence_at(
     let [x, y, z] = scene.cells;
     let cells = FieldDims::new(x, y, z);
     let dx = (scene.domain_size / x.max(y).max(z) as f64) as f32;
-    let n = scene.solver.pressure_iterations;
+    let n = scene.solver.pressure();
     let substeps = scene.solver.max_substeps;
     let constants =
         scene

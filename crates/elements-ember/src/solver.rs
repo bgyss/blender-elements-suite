@@ -3,6 +3,11 @@
 //! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
 //! project, and advect scalars with dissipation. Each frame first measures
 //! the fastest face and picks its substep count by CFL.
+//!
+//! The projection's pressure solve is chosen by `pressure_solver`: red-black
+//! Gauss–Seidel for `pressure_iterations` sweeps, or, on a multigrid
+//! hierarchy built each substep, `pressure_cycles` V-cycles or MGPCG
+//! iterations (2b-3c spec §3).
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError,
@@ -13,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::boundaries::Boundaries;
 use crate::cfl;
-use crate::kernels::{self, Advection, Carried, Pass, Solids, StepConstants, Uniforms};
+use crate::kernels::{self, Advection, Carried, Hierarchy, Pass, Solids, StepConstants, Uniforms};
 use crate::node_util::{pair, take_listed};
 use crate::params;
 
@@ -30,6 +35,7 @@ const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
 
 const MAX_SUBSTEPS: u32 = 16;
 const MAX_PRESSURE_ITERATIONS: u32 = 1000;
+const MAX_PRESSURE_CYCLES: u32 = 64;
 const MAX_CFL: f32 = 10.0;
 
 /// A quality preset (spec §6). It fills every field a document leaves unset.
@@ -66,8 +72,36 @@ impl Quality {
             buoyancy_temperature: 1.0,
             boundaries: Boundaries::default(),
             wind: [0.0; 3],
+            // Gauss–Seidel until the 2b-3c gate (Task 5) decides otherwise.
+            pressure_solver: PressureSolver::GaussSeidel,
+            pressure_cycles: 4,
         }
     }
+}
+
+/// Which method solves for pressure in the projection (2b-3c spec §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureSolver {
+    /// Red-black Gauss–Seidel, `pressure_iterations` sweeps.
+    #[default]
+    GaussSeidel,
+    /// `pressure_cycles` multigrid V-cycles.
+    Multigrid,
+    /// `pressure_cycles` iterations of conjugate gradients preconditioned by
+    /// one V-cycle.
+    Mgpcg,
+}
+
+/// One substep's pressure solve with its count: what `Substep::project` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureSolve {
+    /// Red-black Gauss–Seidel sweeps.
+    GaussSeidel(u32),
+    /// V-cycles on a hierarchy built for the substep.
+    Multigrid(u32),
+    /// MGPCG iterations on a hierarchy built for the substep.
+    Mgpcg(u32),
 }
 
 /// `ember.smoke_solver`'s parameters, resolved: every field has a value.
@@ -77,7 +111,8 @@ pub struct SolverParams {
     pub max_substeps: u32,
     /// Target maximum cells travelled per substep.
     pub cfl: f32,
-    /// Red-black Gauss–Seidel iterations per substep.
+    /// Red-black Gauss–Seidel iterations per substep, when `pressure_solver`
+    /// is `GaussSeidel`; 1..=1000.
     pub pressure_iterations: u32,
     /// How velocity and scalars are advected (spec §4.1).
     pub advection: Advection,
@@ -95,6 +130,11 @@ pub struct SolverParams {
     pub boundaries: Boundaries,
     /// Wind, a uniform acceleration, m/s² (spec §3.4).
     pub wind: [f32; 3],
+    /// The pressure solve: `gauss_seidel`, `multigrid` or `mgpcg`.
+    pub pressure_solver: PressureSolver,
+    /// V-cycles (`multigrid`) or PCG iterations (`mgpcg`) per substep;
+    /// 1..=64. Gauss–Seidel ignores it.
+    pub pressure_cycles: u32,
 }
 
 impl Default for SolverParams {
@@ -122,6 +162,8 @@ struct DocParams {
     buoyancy_temperature: Option<f32>,
     boundaries: Option<Boundaries>,
     wind: Option<[f32; 3]>,
+    pressure_solver: Option<PressureSolver>,
+    pressure_cycles: Option<u32>,
 }
 
 /// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
@@ -163,6 +205,8 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
             .unwrap_or(preset.buoyancy_temperature),
         boundaries: doc.boundaries.unwrap_or(preset.boundaries),
         wind: doc.wind.unwrap_or(preset.wind),
+        pressure_solver: doc.pressure_solver.unwrap_or(preset.pressure_solver),
+        pressure_cycles: doc.pressure_cycles.unwrap_or(preset.pressure_cycles),
     };
     validate(&p)?;
     Ok(p)
@@ -184,6 +228,15 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
             format!(
                 "pressure_iterations must be 1..={MAX_PRESSURE_ITERATIONS}, got {}",
                 p.pressure_iterations
+            ),
+        ));
+    }
+    if !(1..=MAX_PRESSURE_CYCLES).contains(&p.pressure_cycles) {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "pressure_cycles must be 1..={MAX_PRESSURE_CYCLES}, got {}",
+                p.pressure_cycles
             ),
         ));
     }
@@ -216,6 +269,15 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
 }
 
 impl SolverParams {
+    /// The pressure solve `pressure_solver` names, with its count.
+    pub fn pressure(&self) -> PressureSolve {
+        match self.pressure_solver {
+            PressureSolver::GaussSeidel => PressureSolve::GaussSeidel(self.pressure_iterations),
+            PressureSolver::Multigrid => PressureSolve::Multigrid(self.pressure_cycles),
+            PressureSolver::Mgpcg => PressureSolve::Mgpcg(self.pressure_cycles),
+        }
+    }
+
     /// Kernel constants for one substep of length `h`, in a domain of
     /// `cells` with voxel edge `dx`.
     pub fn step_constants(&self, cells: FieldDims, h: f32, dx: f32) -> StepConstants {
@@ -346,6 +408,7 @@ impl<'a> Sources<'a> {
 /// dispatch still reads it. Replaced fields wait in `retired` until `submit`
 /// or `abandon`.
 pub struct Substep {
+    constants: StepConstants,
     uniforms: Uniforms,
     batch: ComputeBatch,
     retired: Vec<Field>,
@@ -357,6 +420,7 @@ pub struct Substep {
 impl Substep {
     pub fn new(gpu: &GpuContext, constants: &StepConstants) -> Result<Self, GpuError> {
         Ok(Self {
+            constants: *constants,
             uniforms: Uniforms::new(gpu, constants)?,
             batch: ComputeBatch::new(),
             retired: Vec::new(),
@@ -507,45 +571,80 @@ impl Substep {
     }
 
     /// Stage 4: make the velocity divergence-free, warm-starting from
-    /// `state.pressure`. Faces touching `solids` end with the collider's velocity.
+    /// `state.pressure` with the solve `pressure` names. Faces touching
+    /// `solids` end with the collider's velocity.
+    ///
+    /// Multigrid and MGPCG build a `Hierarchy` for this substep; its fields
+    /// are retired with `div`, so they reach the pool only after the batch
+    /// has run (`submit`) or been discarded (`abandon`). On an error the
+    /// caller must `abandon` the substep: MGPCG returns its own scratch
+    /// fields to the pool before returning an error, and only discarding
+    /// the unflushed batch keeps those dispatches from ever running.
     pub fn project(
         &mut self,
         gpu: &GpuContext,
         cache: &mut PipelineCache,
         pool: &mut FieldPool,
         state: &mut SolverState,
-        iterations: u32,
+        pressure: PressureSolve,
         solids: Option<Solids<'_>>,
     ) -> Result<(), GpuError> {
-        let u = &self.uniforms;
-        let div = pool.acquire(gpu, u.cells(), FieldFormat::R32Float)?;
-        let recorded = kernels::divergence(gpu, cache, &mut self.batch, u, &state.velocity, &div)
-            .and_then(|()| {
-                kernels::solve_pressure(
-                    gpu,
-                    cache,
-                    &mut self.batch,
-                    u,
-                    &state.pressure,
-                    &div,
-                    iterations,
-                    solids,
-                )
-            })
-            .and_then(|()| {
-                kernels::subtract_gradient(
-                    gpu,
-                    cache,
-                    &mut self.batch,
-                    u,
-                    &state.velocity,
-                    &state.pressure,
-                    solids,
-                )
-            });
+        let div = pool.acquire(gpu, self.uniforms.cells(), FieldFormat::R32Float)?;
+        let recorded = self.record_projection(gpu, cache, pool, state, &div, pressure, solids);
         // The batch may reference `div` whether or not recording finished.
         self.retired.push(div);
         recorded
+    }
+
+    /// `project`'s dispatches, into `div` and `state`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_projection(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        state: &mut SolverState,
+        div: &Field,
+        pressure: PressureSolve,
+        solids: Option<Solids<'_>>,
+    ) -> Result<(), GpuError> {
+        let u = &self.uniforms;
+        kernels::divergence(gpu, cache, &mut self.batch, u, &state.velocity, div)?;
+        let p = &state.pressure;
+        match pressure {
+            PressureSolve::GaussSeidel(iterations) => {
+                kernels::solve_pressure(gpu, cache, &mut self.batch, u, p, div, iterations, solids)?
+            }
+            PressureSolve::Multigrid(count) | PressureSolve::Mgpcg(count) => {
+                let h = Hierarchy::new(
+                    gpu,
+                    cache,
+                    &mut self.batch,
+                    pool,
+                    &self.constants,
+                    solids.map(|s| s.mask),
+                )?;
+                let solved = match pressure {
+                    PressureSolve::Multigrid(_) => {
+                        kernels::v_cycles(gpu, cache, &mut self.batch, &h, p, div, count)
+                    }
+                    _ => kernels::mgpcg(gpu, cache, &mut self.batch, pool, &h, p, div, count),
+                };
+                // The batch may reference the hierarchy whether or not
+                // recording finished.
+                self.retired.extend(h.into_fields());
+                solved?;
+            }
+        }
+        kernels::subtract_gradient(
+            gpu,
+            cache,
+            &mut self.batch,
+            &self.uniforms,
+            &state.velocity,
+            &state.pressure,
+            solids,
+        )
     }
 
     /// Stage 5: carry density and temperature through the projected velocity,
@@ -726,12 +825,12 @@ pub fn substep(
     state: &mut SolverState,
     sources: Sources<'_>,
     constants: &StepConstants,
-    iterations: u32,
+    pressure: PressureSolve,
 ) -> Result<(), GpuError> {
     let mut step = Substep::new(gpu, constants)?;
     let recorded = step
         .pre_projection(gpu, cache, pool, state, sources)
-        .and_then(|()| step.project(gpu, cache, pool, state, iterations, sources.solids))
+        .and_then(|()| step.project(gpu, cache, pool, state, pressure, sources.solids))
         .and_then(|()| step.advect_scalars(gpu, cache, pool, state, sources.solids));
     match recorded {
         Ok(()) => step.submit(gpu, pool),
@@ -932,10 +1031,10 @@ impl SmokeSolver {
                 .params
                 .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx)
         };
-        let iterations = self.params.pressure_iterations;
+        let pressure = self.params.pressure();
         ctx.with_gpu_pool(|gpu, cache, pool| {
             for _ in 0..plan.count {
-                substep(gpu, cache, pool, state, sources, &constants, iterations)?;
+                substep(gpu, cache, pool, state, sources, &constants, pressure)?;
             }
             Ok(())
         })
