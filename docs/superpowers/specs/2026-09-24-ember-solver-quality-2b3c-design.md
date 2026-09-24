@@ -209,6 +209,20 @@ Pre-registered, not revised to fit the results.
   resolution in `docs/bench/results.md`. For `plume_wind` the Mantaflow
   reference is the rerun's (§7), since the scene changes; until then the
   `plume` value at that resolution stands in.
+- **Thin colliders** (amended 2026-09-24, before any gate numbers, by the
+  user's decision): MGPCG needs 14–16 iterations around a one-cell-thick
+  collider against about 4 elsewhere (Task 2), and none of the three scenes
+  has one. So the gate adds `plume_plate`: `plume` at 128³ with an open top
+  and a one-cell-thick plate across the domain at 0.8 m, split by a 2-cell
+  slit above the emitter. Mantaflow has no reference for it, so its rule is
+  relative: the RMS divergence after projection over that before it, at
+  frames 60 and 120, measured through the kernel API as the speed gate does,
+  must be at most 1e-3 (the f32 floor for this shape is about 1.5e3–2.3e3,
+  Task 2). A configuration passes only if it also passes this. The count is
+  chosen from the worst scene. The gate also checks that running past the
+  floor is stable: in `plume_collider` at 128³, the divergence after 40
+  iterations is at most 4× that after the chosen count. Plain V-cycles cannot
+  be the default, since they nearly stall around thin colliders.
 - **Choice:** the fastest passing configuration becomes the default.
 - **Fail:** if none passes, work stops and the table goes to the user.
 - The decision is a line the user fills in, never a CI check.

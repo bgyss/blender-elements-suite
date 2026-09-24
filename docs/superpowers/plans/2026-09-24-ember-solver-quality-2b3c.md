@@ -545,6 +545,26 @@ constants in the example:
 
 `plume_wind` runs with the new ambient wind from Task 4.
 
+**Thin-collider amendment (user, 2026-09-24; spec §4).**
+- Add `Scene::plume_plate(res)` in `bench/mod.rs`: `plume` plus a collider
+  union of two static boxes, one cell thick (`half_extents` z = dx/2), that
+  together span the domain at z = 0.8 m, leaving a slit 2 cells wide in x
+  centred above the emitter. Test that its `solid_mask` has exactly the
+  slit's cells open in that layer. It is a gate scene only, not a benchmark
+  scene.
+- For `plume_plate` at 128³, measure the ratio of RMS divergence after
+  projection to before it, at frames 60 and 120, through the kernel API as
+  `speed_gate.rs`'s `divergence_at` does (reach the frame's state, run
+  stages 1–3, measure, project with the candidate solver, measure). Pass
+  when ≤ 1e-3.
+- A configuration passes only if it passes the three scenes' rule **and**
+  `plume_plate`. Sweep counts until both hold; `mgpcg` up to 24.
+- Past-floor stability: in `plume_collider` at 128³, the masked divergence
+  after 40 iterations of the chosen method must be at most 4× that after the
+  chosen count. Report it; a failure stops the gate like any other.
+- Plain V-cycles (`multigrid`) are measured and reported but cannot be the
+  default.
+
 **Procedure:**
 1. Load check: record `sysctl -n vm.loadavg` before and after; flag above 2.
 2. Sweep at 128³: for `multigrid` with cycles 1..=8 and `mgpcg` with
