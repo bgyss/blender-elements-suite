@@ -1711,6 +1711,7 @@ pub enum CacheError {
     OutOfDomain { path: PathBuf, grid: String, index: [i32; 3], cells: [u32; 3] },
     /// The velocity grid holds fewer values than density (notes: tiled
     /// density can drop other grids' values).
+    /// (Superseded: `Shortfall` was replaced by `check_coverage` and `CacheError::MissingVelocity` (a2de579, 7fe5d9d); see `docs/bench/mantaflow-notes.md`, Clipping.)
     Shortfall { path: PathBuf, density: usize, velocity: usize },
 }
 // with `impl std::fmt::Display` and `impl std::error::Error`, written by hand.
@@ -1833,6 +1834,7 @@ Run: `cargo nextest run -p elements-ember --test mantaflow`
   face grid, scaled by `dx / 0.4`.
 - Count the values each grid stored (voxels, with tiles counted as their
   full extent). If velocity stored fewer than density, return `Shortfall`.
+  (Superseded: `Shortfall` was replaced by `check_coverage` and `CacheError::MissingVelocity` (a2de579, 7fe5d9d); see `docs/bench/mantaflow-notes.md`, Clipping.)
 - `examples/common/mod.rs` is shared by every example; add
   `#[allow(dead_code)]` where an example does not use the reader, as the
   module already does for any unused helpers.
@@ -1851,7 +1853,7 @@ mutation alone, recording the output:
 7. Shortfall: the fixture has equal counts, so no test reaches it. Add a
    unit test inside `mantaflow.rs` for the pure count comparison (factor
    it into `fn check_counts(density: usize, velocity: usize) -> Result<(), ...>`),
-   and prove it with `<` changed to `<=`.
+   and prove it with `<` changed to `<=`. (Superseded: `Shortfall` was replaced by `check_coverage` and `CacheError::MissingVelocity` (a2de579, 7fe5d9d); see `docs/bench/mantaflow-notes.md`, Clipping.)
 
 - [ ] **Step 5: `just check`, then commit.** Subject: "Read a Mantaflow cache
 frame into the metrics' array layout". The body says why the reader lives

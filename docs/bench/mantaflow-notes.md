@@ -171,9 +171,10 @@ values stored, and the rest read as 0), but velocity kept all 27,000.
 OpenVDB's `clip` against a tiled mask evidently keeps only voxel-level
 values, so a grid that is itself tiled there loses them. The bench scenes do
 not make whole 8³ blocks of exactly equal density outside the emitter, but at
-256³ the emitter's interior might. The Task 7 reader should compare each
-grid's value count with density's and report a shortfall, not silently use
-zeros.
+256³ the emitter's interior might. The reader must not silently use zeros
+where a value is missing. The first design compared each grid's value count
+with density's; the next paragraph shows why that was replaced by a list of
+the missing cells and a wall-face rule.
 
 **Zero velocity at a collider is left out, not lost.** The first full
 `just bench` stopped on `plume_collider` 64³: frame 39 stored 9,021 velocity
@@ -344,8 +345,10 @@ All baked with the probe. Velocities are converted with the units rule above.
   | 60 | 0.0855 / 0.781 | 0.1740 (×2.04) / 0.872 | 0.1161 (×1.36) / 0.955 | **0.0884 (×1.03) / 0.925** |
 
   (A `surface_distance` of 0.5 gave ×1.12 to ×1.17.) **The mapping is the
-  additive mode with `surface_distance = 0`.** Mass matches Ember's within 3%
-  from frame 12 to 60. The emitter-centre density rises as Ember's does:
+  additive mode with `surface_distance = 0`.** In this 64³ calibration, mass
+  matches Ember's within 3% from frame 12 to 60. Across the benchmark's runs
+  (`docs/bench/results.md`, Heat), it matches within 4% over frames 12–24
+  only; by frame 60 the solvers' advection has moved it apart. The emitter-centre density rises as Ember's does:
   0.500 at frame 12 in both.
 
   Temperature cannot be matched the same way. Mantaflow raises the emitter's
@@ -500,10 +503,17 @@ files, keeps growing. The estimate is under the 90-minute stop line.
    Blender with `--python-exit-code 1`.
 7. **Inflow matches in mass, not in heat.** With `use_absolute = False`,
    `surface_distance = 0` and density = rate / fps, Mantaflow's mass is within
-   3% of Ember's. Mantaflow's emitter heat is held at a fixed value, while
+   3% of Ember's in the 64³ calibration (within 4% over frames 12–24 across
+   the benchmark's runs). Mantaflow's emitter heat is held at a fixed value, while
    Ember's grows, so the plume heights differ (0.925 m against 0.781 m at
    frame 60). See Inflow.
 8. **Tiled density can drop other grids' values** (see Clipping). The reader
-   must report it rather than use zeros.
+   must report it rather than use zeros. As shipped (a2de579, 7fe5d9d), it
+   lists every cell with density but no velocity, and `check_coverage`
+   accepts one only when all three of its faces are walls by the mask (on
+   every axis, the cell or its −axis neighbour is solid), since the writer
+   omits those zero velocities at a collider. Any other missing cell is a
+   `MissingVelocity` error. Comparing value counts, the first design, failed
+   on `plume_collider`.
 9. **The brief's `vdb_probe.rs`** formats `VdbLevel` with `{:?}`, which does
    not compile: `VdbLevel` has no `Debug`.

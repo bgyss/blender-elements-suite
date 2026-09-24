@@ -27,10 +27,12 @@ each, and wind
 (`docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`).
 **2b-3**, the Mantaflow benchmark, is complete (`docs/bench/results.md`).
 Ember is 3–8× faster than Mantaflow and uses about half its memory or less,
-but leaves far more divergence at high resolution, and its domain-wide wind
-fails at 128³ and above: open risk (l). All timings were measured under
-load. **2b-3b**, the side-by-side render and the latency measurement, is
-next. Flame is its own later cycle, 2b-4.
+but leaves far more divergence at high resolution. Its domain-wide wind
+fails at every resolution: smoke is lost inside the domain at 128³ and 256³
+before any reaches the outflow plane, by a mechanism not yet known, and at
+64³ and 128³ the rest leaves quickly through the top: open risk (l). All
+timings were measured under load. **2b-3b**, the side-by-side render and the
+latency measurement, is next. Flame is its own later cycle, 2b-4.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -60,7 +62,7 @@ Tasks listed complete there are done — do not redo them.
 
 ```bash
 just check        # lint + test; must pass before any commit
-just test         # cargo nextest run --workspace, native GPU backend
+just test         # cargo nextest on the native GPU backend, plus tests/bench/test_mapping.py
 just lint         # cargo fmt --check, clippy -D warnings, ruff check
 just addon        # build + verify the Blender extension ZIP
 just blender-test # Blender integration test; finds the macOS app bundle
@@ -68,6 +70,8 @@ just golden       # regenerate golden files (review the PNG by eye first)
 just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
 just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
 just bench-presets # the preview preset's substep cap; minutes, real GPU, not in check
+just bench        # the Mantaflow benchmark; an hour or more, real GPU and Blender, not in check
+                  # (positional: `just bench plume 64` for one scene and resolution)
 ```
 
 Single test: `cargo nextest run -p elements-core --test noise` (a test *file*),

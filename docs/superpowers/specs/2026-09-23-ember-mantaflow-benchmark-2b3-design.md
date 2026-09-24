@@ -213,7 +213,11 @@ Every parameter mapping is in `tests/bench/mapping.py` and in the table in
 confirmed it. The ones that are not exact, found in Task 3:
 
 - **Inflow** is additive (`use_absolute = False`, `surface_distance = 0`,
-  density = rate / fps). Mass matches Ember's within 3% over frames 12–60.
+  density = rate / fps). In the 64³ `plume` calibration, mass matched
+  Ember's within 3% over frames 12–60. Across the benchmark's runs, Ember's
+  mass is 0.99–1.04× Mantaflow's over frames 12–24, but by frame 60 the
+  ratio is 0.54–1.20×, since it then also carries what each solver's
+  advection gains or loses.
 - **Temperature** cannot be additive: Mantaflow raises the emitter's heat to
   a set value, never above it, while Ember's grows at its rate. The mapping
   holds it at Ember's frame-24 emitter value, so plume heights differ (at
@@ -265,8 +269,17 @@ computes the same metrics.
   tiles to their full extent.
 - Index (0, 0, 0) is the domain's first cell; the VDB transform is ignored.
   Velocity converts to m/s as stored · dx / 0.4.
-- A missing grid, a wrong grid type, or a velocity grid holding fewer values
-  than density is an error, never a zero.
+- A missing grid or a wrong grid type is an error, never a zero.
+- The reader lists every cell that holds density but no velocity, and
+  `check_coverage` accepts such a cell only by the wall-face rule: on every
+  axis, the cell or its −axis neighbour is solid by `Scene::solid_mask` (a
+  neighbour outside the domain is not solid). All three faces the missing
+  value would hold are then walls, which no metric reads, and Mantaflow's
+  writer omits exactly such zero velocities. Any other missing cell is a
+  `MissingVelocity` error naming the frame and the cell
+  (`docs/bench/mantaflow-notes.md`, Clipping). An earlier draft compared
+  value counts; the first full run showed that a collider makes the counts
+  differ legitimately.
 - The reader's test runs on the committed 16³ fixture from task 2, so reading
   the cache is checked in CI without Blender.
 

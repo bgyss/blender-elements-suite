@@ -514,18 +514,32 @@ part of (g), (j), and (k), which 2b-2 added.
   benchmark ran anyway, with every timing flagged as measured under load
   (`docs/bench/results.md`). The rerun is still owed, on an idle machine.
 - **(l) Domain-wide wind in a closed-sided domain.** 2b-3's `plume_wind`
-  (`docs/bench/results.md`) fails in Ember. At frame 60 its RMS divergence is
-  0.14 at 64³, 1.4 at 128³ and 2.4 at 256³, against 0.003–0.25 for `plume`. At
-  128³ all of the smoke leaves through the top by frame 84.
-  - **Cause 1, measured at 128³:** the fixed-iteration pressure solve cannot
-    converge the domain-wide pressure gradient that a uniform push against
-    closed side walls needs. Divergence at frame 60 falls from 1.40 with 160
-    iterations to 0.17 with 1,000, and to 0.12 with 4 substeps.
-  - **Cause 2:** the scene itself. Every configuration still loses its smoke by
-    frame 80–90. With wind accelerating all of the air, closed sides and an
-    open top at zero pressure, the flow is driven up and out through the
-    top. Mantaflow's wind acts only on smoky cells, so it never sets up that
-    flow.
+  (`docs/bench/results.md`) fails in Ember at every resolution. At frame 60
+  its RMS divergence is 0.14 at 64³, 1.4 at 128³ and 2.4 at 256³, against
+  0.003–0.25 for `plume`. The smoke is gone long before frame 120: about 2e-6
+  of mass is left at frame 100 at 64³, and none from frame 83 at 128³.
+  - **Loss inside the domain, at 128³ and 256³.** Over frames 40–60, while
+    the emitter adds about 0.028 (as in `plume`), mass rises only 0.0524 →
+    0.0541 at 128³ and falls 0.0549 → 0.0427 at 256³, with no outflow
+    measured: outflow starts at frame 65 at 128³ and 79 at 256³. At 256³ the
+    mass falls on to 0.0155 by frame 77, still with no outflow. Mantaflow's
+    `plume_wind` holds 1.57× (128³) and 1.86× (256³) Ember's mass at frame
+    60. What removes that smoke is not yet known; it goes with the
+    unconverged solve below, but no mechanism has been shown.
+  - **Unconverged pressure, measured at 128³.** Divergence at frame 60 falls
+    from 1.40 with 160 iterations to 0.17 with 1,000, and to 0.12 with 4
+    substeps, and mass at 60 rises from 0.054 to 0.079 with 1,000 iterations
+    (Mantaflow: 0.085). So most of the loss inside the domain before frame 60
+    goes with the fixed-iteration solve, which does not converge the
+    domain-wide pressure gradient a uniform push against closed side walls
+    needs. The follow-up is recorded in `docs/bench/results.md`.
+  - **A fast exit through the top, at 64³ and 128³.** Every configuration of
+    the 128³ follow-up still loses its smoke by frame 80–90. From about frame
+    65 the outflow estimate credits nearly all of the frame-60 mass by frame
+    80 (100% at 64³, 94% at 128³). One candidate: with wind accelerating all
+    of the air, closed sides and an open top at zero pressure, the flow is
+    driven up and out through the top, while Mantaflow's wind acts only on
+    smoky cells. That is untested.
   - **Options:** a multigrid pressure solve, which piece 2's stretch goal
     already names; wind applied only where there is smoke, or relative to the
     air; open side boundaries for wind scenes; or a wind force field with
