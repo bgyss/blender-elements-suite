@@ -175,6 +175,28 @@ not make whole 8³ blocks of exactly equal density outside the emitter, but at
 grid's value count with density's and report a shortfall, not silently use
 zeros.
 
+**Zero velocity at a collider is left out, not lost.** The first full
+`just bench` stopped on `plume_collider` 64³: frame 39 stored 9,021 velocity
+values against 9,025 density values. The writer's `copyFromDense` stores no
+value equal to the background, and velocity's background is (0, 0, 0). A
+probe over all 120 frames of that bake found cells with density but no
+velocity in 82 frames (39 to 120, 4 to 14 a frame, 659 cell-frames, 14
+distinct cells). Every one is a collider cell of `Scene::solid_mask` (6
+cells) or one of their 26 neighbours (8 cells), all on the sphere's upper
++x, +y side at z index 26 to 31, where a cell's −x, −y and −z neighbours
+are all inside the sphere. For every one of the 659, each of the three
+faces the value holds is a wall face by the mask: the cell or its −axis
+neighbour is solid. Density was never stored as tiles in any frame of either
+bake, so the tile mechanism above cannot apply, and no velocity value of
+exactly (0, 0, 0) was stored anywhere. The `plume` 64³ bake had no such
+cell in any frame. So the reader lists the cells, not the counts, and the
+benchmark accepts a missing cell only at a collider cell or its 26
+neighbours, where 0 is the value's own. Any other missing cell is still an
+error that names the frame and the cell. Mantaflow's obstacle is not
+exactly the mask: in 3,940 cell-frames of the same bake, velocity was
+stored, and non-zero, where the mask makes all three faces walls, mostly on
+the sphere's underside (z index 19).
+
 ## Velocity location and units
 
 **Faces.** Three pieces of evidence:

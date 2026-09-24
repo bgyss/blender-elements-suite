@@ -13,6 +13,11 @@
 //!   u [m/s] = stored · dx / 0.4.
 //! - `vdb-rs` does not check value types, so the reader checks each grid's
 //!   type string before reading it.
+//! - The writer leaves out a velocity equal to the background, (0, 0, 0),
+//!   even where there is smoke. Against a collider that happens at cells
+//!   whose −x, −y and −z faces are all walls. The reader lists the cells that
+//!   have density but no velocity, and the caller decides whether each is
+//!   such a cell (`unexplained_missing`).
 
 use std::fmt;
 use std::fs::File;
@@ -39,6 +44,9 @@ pub struct CacheFrame {
     /// (`StaggeredField::face_dims`), as `metrics::Sample::faces` expects.
     /// Faces the cache does not store, including every face at index n, are 0.
     pub faces: [Vec<f32>; 3],
+    /// Cells that store density but no velocity, in x-fastest order. Their
+    /// faces read as 0 in `faces`.
+    pub missing_velocity: Vec<[u32; 3]>,
 }
 
 #[derive(Debug)]
@@ -67,13 +75,6 @@ pub enum CacheError {
         grid: String,
         index: [i32; 3],
         cells: [u32; 3],
-    },
-    /// The velocity grid holds fewer values than density (notes: tiled
-    /// density can drop other grids' values).
-    Shortfall {
-        path: PathBuf,
-        density: usize,
-        velocity: usize,
     },
 }
 
@@ -109,16 +110,6 @@ impl fmt::Display for CacheError {
             } => write!(
                 f,
                 "grid {grid:?} in {} stores index {index:?}, outside a domain of {cells:?} cells",
-                path.display()
-            ),
-            CacheError::Shortfall {
-                path,
-                density,
-                velocity,
-            } => write!(
-                f,
-                "{} stores {velocity} velocity values but {density} density values; \
-                 missing velocity would read as 0",
                 path.display()
             ),
         }
@@ -168,13 +159,14 @@ pub fn read_frame_with(
         .read_grid::<f32>(density_grid)
         .map_err(|e| parse(path, e))?;
     let mut density = vec![0.0f32; cells.voxel_count()];
-    let mut density_count = 0usize;
+    let mut has_density = vec![false; cells.voxel_count()];
     for (at, value, level) in grid.iter() {
         for index in expand([at.x, at.y, at.z], level) {
             let [i, j, k] =
                 in_domain(index, cells).ok_or_else(|| out_of_domain(density_grid, index))?;
-            density[i + cells.x as usize * (j + cells.y as usize * k)] = value;
-            density_count += 1;
+            let n = i + cells.x as usize * (j + cells.y as usize * k);
+            density[n] = value;
+            has_density[n] = true;
         }
     }
 
@@ -185,7 +177,7 @@ pub fn read_frame_with(
         .map_err(|e| parse(path, e))?;
     let face_dims = [Axis::X, Axis::Y, Axis::Z].map(|a| StaggeredField::face_dims(cells, a));
     let mut faces = face_dims.map(|d| vec![0.0f32; d.voxel_count()]);
-    let mut velocity_count = 0usize;
+    let mut has_velocity = vec![false; cells.voxel_count()];
     for (at, value, level) in grid.iter() {
         for index in expand([at.x, at.y, at.z], level) {
             let [i, j, k] =
@@ -195,22 +187,15 @@ pub fn read_frame_with(
                 faces[axis][i + d.x as usize * (j + d.y as usize * k)] =
                     (value[axis] as f64 * dx / TIME_UNIT_S) as f32;
             }
-            velocity_count += 1;
+            has_velocity[i + cells.x as usize * (j + cells.y as usize * k)] = true;
         }
     }
-
-    check_counts(density_count, velocity_count).map_err(|(density, velocity)| {
-        CacheError::Shortfall {
-            path: path.to_owned(),
-            density,
-            velocity,
-        }
-    })?;
 
     Ok(CacheFrame {
         cells,
         density,
         faces,
+        missing_velocity: missing_cells(&has_density, &has_velocity, cells),
     })
 }
 
@@ -270,28 +255,128 @@ fn in_domain(index: [i32; 3], cells: FieldDims) -> Option<[usize; 3]> {
     Some(out)
 }
 
-/// Velocity must store at least as many values as density: the notes found
-/// that a tiled density can drop other grids' values, which would otherwise
-/// read as zero velocity inside the smoke. Returns the two counts on failure.
-fn check_counts(density: usize, velocity: usize) -> Result<(), (usize, usize)> {
-    if velocity < density {
-        return Err((density, velocity));
+/// The cells with density but no velocity, x-fastest. A count comparison
+/// is not enough: velocity stored outside the smoke would hide a hole
+/// inside it.
+fn missing_cells(has_density: &[bool], has_velocity: &[bool], cells: FieldDims) -> Vec<[u32; 3]> {
+    let (nx, ny) = (cells.x as usize, cells.y as usize);
+    has_density
+        .iter()
+        .zip(has_velocity)
+        .enumerate()
+        .filter(|(_, (d, v))| **d && !**v)
+        .map(|(n, _)| {
+            [
+                (n % nx) as u32,
+                ((n / nx) % ny) as u32,
+                (n / (nx * ny)) as u32,
+            ]
+        })
+        .collect()
+}
+
+/// The missing-velocity cells that are neither a collider cell nor one of a
+/// collider cell's 26 neighbours, by `solid` (x-fastest over `cells`; empty
+/// for no collider).
+///
+/// Next to a collider, a cell's −x, −y and −z faces can all be walls, so its
+/// stored velocity is (0, 0, 0), which the writer leaves out because it
+/// equals the background (notes: Clipping). Reading it as 0 is then its true
+/// value. Anywhere else a missing value is lost data (notes: tiles can drop
+/// values from the other grids).
+pub fn unexplained_missing(
+    missing: &[[u32; 3]],
+    solid: &[bool],
+    cells: FieldDims,
+) -> Vec<[u32; 3]> {
+    let dims = [cells.x, cells.y, cells.z].map(i64::from);
+    let is_solid = |c: [i64; 3]| {
+        (0..3).all(|a| (0..dims[a]).contains(&c[a]))
+            && solid[(c[0] + dims[0] * (c[1] + dims[1] * c[2])) as usize]
+    };
+    let near_collider = |c: [u32; 3]| {
+        let c = c.map(i64::from);
+        (-1..=1).any(|dk| {
+            (-1..=1).any(|dj| (-1..=1).any(|di| is_solid([c[0] + di, c[1] + dj, c[2] + dk])))
+        })
+    };
+    if solid.is_empty() {
+        return missing.to_vec();
     }
-    Ok(())
+    missing
+        .iter()
+        .copied()
+        .filter(|&c| !near_collider(c))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check_counts;
+    use super::{missing_cells, unexplained_missing};
+    use elements_core::gpu::FieldDims;
 
-    #[test]
-    fn fewer_velocity_values_than_density_is_a_shortfall() {
-        assert_eq!(check_counts(240, 239), Err((240, 239)));
+    const CELLS: FieldDims = FieldDims { x: 4, y: 4, z: 4 };
+
+    fn mask(solid: &[[u32; 3]]) -> Vec<bool> {
+        let mut m = vec![false; 64];
+        for c in solid {
+            m[(c[0] + 4 * (c[1] + 4 * c[2])) as usize] = true;
+        }
+        m
     }
 
     #[test]
-    fn equal_or_more_velocity_values_is_fine() {
-        assert_eq!(check_counts(240, 240), Ok(()));
-        assert_eq!(check_counts(240, 241), Ok(()));
+    fn a_cell_with_density_but_no_velocity_is_missing() {
+        let mut d = vec![false; 64];
+        let mut v = vec![false; 64];
+        d[1 + 4 * (2 + 4 * 3)] = true;
+        d[5] = true;
+        v[5] = true;
+        // Velocity elsewhere does not make up for it, although the counts match.
+        v[0] = true;
+        assert_eq!(missing_cells(&d, &v, CELLS), vec![[1, 2, 3]]);
+    }
+
+    #[test]
+    fn full_coverage_misses_nothing() {
+        let d = vec![true; 64];
+        assert_eq!(missing_cells(&d, &d, CELLS), Vec::<[u32; 3]>::new());
+    }
+
+    #[test]
+    fn a_collider_cell_or_its_neighbour_is_explained() {
+        let solid = mask(&[[1, 1, 1]]);
+        // The cell itself, a face neighbour and a corner neighbour.
+        let missing = [[1, 1, 1], [2, 1, 1], [2, 2, 2], [0, 0, 0]];
+        assert_eq!(
+            unexplained_missing(&missing, &solid, CELLS),
+            Vec::<[u32; 3]>::new()
+        );
+    }
+
+    #[test]
+    fn a_cell_two_away_from_the_collider_is_unexplained() {
+        let solid = mask(&[[0, 0, 0]]);
+        let missing = [[1, 1, 1], [2, 0, 0], [0, 3, 0]];
+        assert_eq!(
+            unexplained_missing(&missing, &solid, CELLS),
+            vec![[2, 0, 0], [0, 3, 0]]
+        );
+    }
+
+    #[test]
+    fn without_a_collider_every_missing_cell_is_unexplained() {
+        let missing = [[1, 1, 1]];
+        assert_eq!(unexplained_missing(&missing, &[], CELLS), vec![[1, 1, 1]]);
+    }
+
+    #[test]
+    fn a_neighbour_past_the_domain_edge_is_not_solid() {
+        // (3, 3, 3)'s neighbours past the edge must not wrap to (0, ...).
+        let solid = mask(&[[0, 3, 3]]);
+        assert_eq!(
+            unexplained_missing(&[[3, 3, 3]], &solid, CELLS),
+            vec![[3, 3, 3]]
+        );
     }
 }

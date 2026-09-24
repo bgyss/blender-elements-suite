@@ -122,3 +122,33 @@ fn a_grid_of_the_wrong_type_is_an_error() {
     .err();
     assert!(matches!(err, Some(CacheError::WrongType { .. })), "{err:?}");
 }
+
+/// The fixture's density and velocity cover the same cells.
+#[test]
+fn the_fixture_misses_no_velocity() {
+    let f = read_frame(&fixture(), FieldDims::new(N, N, N), DX).unwrap();
+    assert_eq!(f.missing_velocity, Vec::<[u32; 3]>::new());
+}
+
+/// The fixture's `shadow` grid fills the whole domain, much of it as tiles,
+/// while velocity covers only the smoke. Read as the density grid, every
+/// cell outside the smoke is missing velocity, and no smoky cell is.
+#[test]
+fn a_cell_with_density_but_no_velocity_is_listed() {
+    let f = read_frame_with(
+        &fixture(),
+        FieldDims::new(N, N, N),
+        DX,
+        "shadow",
+        "velocity",
+    )
+    .unwrap();
+    let smoke = read_frame(&fixture(), FieldDims::new(N, N, N), DX).unwrap();
+    let smoky = |c: &[u32; 3]| smoke.density[at(c[0], c[1], c[2], N, N)] != 0.0;
+    assert_eq!(f.missing_velocity.len(), (N * N * N) as usize - 240);
+    assert!(f.missing_velocity.contains(&[0, 0, 0]));
+    assert!(
+        !f.missing_velocity.iter().any(smoky),
+        "a smoky cell is listed"
+    );
+}
