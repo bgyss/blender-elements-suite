@@ -139,6 +139,12 @@ today's preview, misses Mantaflow's reference in every scene with smoke to measu
 `plume_collider` at frames 60 and 120 (1.09e-4 against 9.12e-5, 7.68e-5 against 5.25e-5). `plume_wind`'s
 frame 120 has no measured cells for either solver.
 
+*Provenance.* Every number above was measured before 63a7c7e, which makes
+the multigrid prolongation normaliser exactly 1 where no corner is dropped
+(it was 1.0000001 in f32 next to open faces). That changes results with a
+collider at rounding level only, so the figures are not bit-reproducible
+from later commits; the conclusions stand.
+
 Decision (recorded by the user, 2026-09-24): the registered rule failed. MGPCG ×10's solve is 1–42% slower
 than Gauss–Seidel's at 128³ (12% in `plume`, 42% in `plume_collider`, 1% in `plume_wind`). Preview uses
 MGPCG ×4. Its solve takes 42–59% of Gauss–Seidel ×160's at 128³ and 34–41% at 256³. It meets Mantaflow's
