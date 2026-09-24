@@ -31,8 +31,10 @@ impl FieldPool {
         self.next_generation
     }
 
-    /// Bytes of every texture this pool has ever created. The pool frees
-    /// textures only in `clear`, so between clears this is its peak.
+    /// Bytes of every texture this pool has ever created. `clear` frees the
+    /// idle textures but does not reset this count, so it is the pool's peak
+    /// only until the first clear; after that it also counts textures
+    /// already freed.
     pub fn allocated_bytes(&self) -> u64 {
         self.allocated_bytes
     }

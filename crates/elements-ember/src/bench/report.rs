@@ -112,10 +112,22 @@ pub const IDLE_LOAD: f64 = 2.0;
 /// last frame.
 const REPORT_FRAMES: [usize; 2] = [60, 120];
 
-/// The frames at which the table reports drift, 1-based. At 80 no smoke has
-/// yet reached the outflow plane in the 64³ smoke test, so drift there is
-/// almost all advection; 120 includes the outflow period.
+/// The frames at which the table reports drift, 1-based. 80 is meant to come
+/// before most of the outflow, but in some runs smoke reaches the outflow
+/// plane earlier, so the frame-80 cell says when a run's outflow starts and
+/// how much of its drift the outflow estimate credits; 120 includes the
+/// whole outflow period.
 const DRIFT_FRAMES: [usize; 2] = [80, 120];
+
+/// Below this mass (the density sum, in the solvers' units) a frame's domain
+/// is treated as empty: its centroid, top and per-cell values are shown as
+/// "—", since they would describe a few stray cells rather than a plume.
+pub const MASS_FLOOR: f64 = 1e-9;
+
+/// The frames, 1-based, over which the Notes compare the two solvers'
+/// emitted mass: after the first few frames' start-up and before the
+/// plumes have diverged.
+const EMISSION_CHECK_FRAMES: std::ops::RangeInclusive<usize> = 12..=24;
 
 /// The commit every summary was built from, or one line per summary,
 /// `{solver}-{scene}-{resolution}: {commit}`, when they differ. A table
@@ -224,8 +236,37 @@ pub fn results_markdown(summaries: &[RunSummary], ctx: &Context) -> Result<Strin
         md.push('\n');
     }
 
-    md.push_str(NOTES);
+    md.push_str(&notes(&find));
     Ok(md)
+}
+
+/// Ember's mass over Mantaflow's, as the least and greatest ratio over
+/// `frames` (1-based) and every scene and resolution. `None` if no pair of
+/// runs has a frame in range with Mantaflow mass above [`MASS_FLOOR`].
+fn mass_ratio_range<'a>(
+    find: &impl Fn(&str, &str, u32) -> Option<&'a RunSummary>,
+    frames: std::ops::RangeInclusive<usize>,
+) -> Option<(f64, f64)> {
+    let mut range: Option<(f64, f64)> = None;
+    for scene in SCENES {
+        for res in RESOLUTIONS {
+            let (Some(e), Some(m)) = (find("ember", scene, res), find("mantaflow", scene, res))
+            else {
+                continue;
+            };
+            for n in frames.clone() {
+                let (Some(fe), Some(fm)) = (e.frames.get(n - 1), m.frames.get(n - 1)) else {
+                    continue;
+                };
+                if fm.mass < MASS_FLOOR {
+                    continue;
+                }
+                let r = fe.mass / fm.mass;
+                range = Some(range.map_or((r, r), |(lo, hi)| (lo.min(r), hi.max(r))));
+            }
+        }
+    }
+    range
 }
 
 /// The summaries in table order: solver, then scene, then resolution.
@@ -258,23 +299,25 @@ fn row(s: &RunSummary) -> String {
             REPORT_FRAMES.map(|n| at(n).map_or("—".to_owned(), |f| f.measured_cells.to_string()));
         format!("{a} / {b}")
     };
-    let per_cell =
-        |v: f64, f: &FrameMetrics| (f.measured_cells > 0).then(|| v / f.measured_cells as f64);
+    // Where the domain is all but empty, the shape and per-cell values
+    // describe stray cells, not a plume.
+    let smoky = |f: &FrameMetrics| f.mass >= MASS_FLOOR;
+    let per_cell = |v: f64, f: &FrameMetrics| {
+        (f.measured_cells > 0 && smoky(f)).then(|| v / f.measured_cells as f64)
+    };
     // drift[0] is the last emitting frame, and the percentage is of the mass
     // below the outflow plane then.
     let cut_off = REPORT_FRAMES[0];
+    let base = at(cut_off).map_or(0.0, |f| f.mass_below);
     let drift_at = |frame: usize| match s.drift.get(frame - cut_off) {
-        Some(&d) => {
-            let base = at(cut_off).map_or(0.0, |f| f.mass_below);
-            if base > 0.0 {
-                format!("{} ({:+.1}%)", sig(d), 100.0 * d / base)
-            } else {
-                format!("{} (—)", sig(d))
-            }
-        }
+        Some(&d) if base > 0.0 => format!("{} ({:+.1}%)", sig(d), 100.0 * d / base),
+        Some(&d) => format!("{} (—)", sig(d)),
         None => "—".to_owned(),
     };
-    let [drift_a, drift_b] = DRIFT_FRAMES.map(drift_at);
+    let [mut drift_a, drift_b] = DRIFT_FRAMES.map(drift_at);
+    if let Some(note) = early_outflow(s, DRIFT_FRAMES[0]) {
+        drift_a.push_str(&note);
+    }
     format!(
         "| {} | {}³ | {} ({}–{}), {runs} | {:.1} | {} | {cells} | {} | {} | {} | {} | {} | {} \
          | {drift_a} | {drift_b} |\n",
@@ -289,9 +332,40 @@ fn row(s: &RunSummary) -> String {
         pair(&|f| per_cell(f.kinetic_energy, f)),
         pair(&|f| Some(f.vorticity)),
         pair(&|f| per_cell(f.vorticity, f)),
-        pair(&|f| f.centroid_m),
-        pair(&|f| f.top_m),
+        pair(&|f| f.centroid_m.filter(|_| smoky(f))),
+        pair(&|f| f.top_m.filter(|_| smoky(f))),
     )
+}
+
+/// For a run whose outflow rate is non-zero at or before `frame` (1-based):
+/// the first such frame, and the share of the frame-60 mass below the
+/// outflow plane that the drift at `frame` credits as outflow, which rests
+/// on the frame-resolution outflow estimate. `None` when no outflow has
+/// started by then.
+fn early_outflow(s: &RunSummary, frame: usize) -> Option<String> {
+    let cut_off = REPORT_FRAMES[0];
+    let first = s
+        .frames
+        .iter()
+        .take(frame)
+        .position(|f| f.outflow_rate != 0.0)?
+        + 1;
+    let below = |n: usize| s.frames.get(n - 1).map(|f| f.mass_below);
+    let (Some(d), Some(then), Some(now)) =
+        (s.drift.get(frame - cut_off), below(cut_off), below(frame))
+    else {
+        return Some(format!("; outflow from frame {first}"));
+    };
+    // drift = mass_below(frame) + outflow − mass_below(60).
+    let outflow = d - (now - then);
+    if then > 0.0 {
+        Some(format!(
+            "; outflow from frame {first} credits {:.1}%",
+            100.0 * outflow / then
+        ))
+    } else {
+        Some(format!("; outflow from frame {first}"))
+    }
 }
 
 /// Three significant figures, in scientific notation outside [1e-3, 1e5).
@@ -309,8 +383,26 @@ fn sig(v: f64) -> String {
 }
 
 /// What every number in the table does and does not compare
-/// (`docs/bench/mantaflow-notes.md`).
-const NOTES: &str = "## Notes\n\n\
+/// (`docs/bench/mantaflow-notes.md`). The emitted-mass comparison is
+/// computed from the runs, so it cannot go stale when they are redone.
+fn notes<'a>(find: &impl Fn(&str, &str, u32) -> Option<&'a RunSummary>) -> String {
+    let ratio = |frames: std::ops::RangeInclusive<usize>| {
+        mass_ratio_range(find, frames)
+            .map_or("—".to_owned(), |(lo, hi)| format!("{lo:.2}–{hi:.2}"))
+    };
+    let (first, last) = (EMISSION_CHECK_FRAMES.start(), EMISSION_CHECK_FRAMES.end());
+    let cut_off = REPORT_FRAMES[0];
+    let emitted = format!(
+        "Emitted mass matches while both solvers are still emitting and the plumes have not \
+         yet diverged: over frames {first}–{last}, Ember's mass is {}× Mantaflow's across \
+         every run. By frame {cut_off} the ratio is {}×, since it then also carries what \
+         each solver's advection gains or loses (most of all in `plume_wind`).",
+        ratio(EMISSION_CHECK_FRAMES),
+        ratio(cut_off..=cut_off),
+    );
+    let floor = MASS_FLOOR;
+    format!(
+        "## Notes\n\n\
 - **Velocity metrics** (divergence, kinetic energy, vorticity) cover only measured cells: \
 those whose whole 3×3×3 neighbourhood is inside the domain, outside any collider and holds \
 smoke (density > 1e-6). The rule is the same for both solvers, because Mantaflow's cache \
@@ -319,25 +411,30 @@ much of each field that is.\n\
 - **Per-cell values.** The solvers' smoky regions differ in size, so their measured cells \
 differ too, and the kinetic energy and vorticity totals partly measure that size. The totals \
 divided by the measured-cell count are the fairer comparison.\n\
+- **Near-empty domains.** Where a frame's mass is below {floor:e}, its centroid, top and \
+per-cell values are shown as —, since they would describe a few stray cells.\n\
 - **Wind.** Mantaflow's wind field acts only on cells that hold smoke; Ember's wind \
 accelerates every cell. `plume_wind` compares the plume's shape, not a matched force field.\n\
 - **Heat.** Mantaflow's emitter heat is held at a set value (Ember's emitter-centre heat at \
 frame 24), not added at Ember's rate, so Mantaflow's emitter is hotter before frame 24 and \
-cooler after it. Plume centroid and top carry that difference. Emitted mass matches within 3%.\n\
+cooler after it. Plume centroid and top carry that difference. {emitted}\n\
 - **Pressure.** Mantaflow solves with multigrid-preconditioned conjugate gradients to a \
 tolerance; Ember runs a fixed count of red-black Gauss–Seidel iterations.\n\
 - **Drift** is (mass below the outflow plane + outflow since frame 60) − that mass at frame \
 60, with outflow estimated at frame resolution as the net upwind flux through the z-faces two \
 cells below the top, and mass summed over the layers below them (spec §4.3). Emission stops \
-after frame 60, so a perfect solver drifts 0. Drift at 80 is almost entirely mass gained by \
-advection, since little or no smoke has reached the outflow plane by then (in the 64³ \
-smoke test, neither solver had outflow before frame 74; each run's CSV `outflow_rate` column \
-shows when it starts). Drift at 120 also covers the outflow period, where \
-the frame-resolution outflow estimate adds uncertainty.\n\
+after frame 60, so a perfect solver drifts 0. Where no outflow has started by frame 80, drift \
+at 80 is mass gained or lost inside the domain. Where it has, the frame-80 cell names the \
+first frame whose outflow rate is non-zero and the share of the frame-60 mass that the \
+outflow estimate credits by frame 80; that share rests on the frame-resolution estimate, and \
+so does that part of the drift. Drift at 120 covers the whole outflow period.\n\
 - **Frame times** exclude frame 1. Ember's frame is `eval_frame` plus a blocking GPU wait; \
 Mantaflow's is the difference between consecutive cache files' modification times, so it \
 includes writing the cache. 256³ is one run of each solver, the other resolutions the median \
 of three runs' medians; the min–max range pools every timed frame.\n\
-- **Peak memory.** Ember's is the field pool's allocated bytes, with the frame cache off. \
-Mantaflow's is Blender's peak resident memory while baking, minus the same scene's peak \
-without a bake.\n";
+- **Peak memory** is in MiB (2²⁰ bytes), and the two solvers' figures count different \
+things. Ember's is the field pool's allocated bytes, with the frame cache off: textures only, \
+not buffers, pipelines or the driver. Mantaflow's is Blender's peak resident memory while \
+baking, minus the same scene's peak without a bake.\n"
+    )
+}

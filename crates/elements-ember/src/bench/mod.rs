@@ -108,8 +108,10 @@ impl Scene {
             return Vec::new();
         };
         let keys = &collider.transform.keys;
-        debug_assert_eq!(keys.len(), 1, "bench colliders are static");
-        debug_assert!(keys[0].rotate.is_none(), "bench colliders are unrotated");
+        // Checked in release too: the benchmark runs optimised, and a moving
+        // collider would give a mask that matches neither solver.
+        assert_eq!(keys.len(), 1, "bench colliders are static");
+        assert!(keys[0].rotate.is_none(), "bench colliders are unrotated");
         let centre = keys[0].translate.map(f64::from);
         let [nx, ny, nz] = self.cells;
         let dx = self.domain_size / f64::from(nx.max(ny).max(nz));
@@ -141,12 +143,23 @@ impl Scene {
     /// The values `tests/bench/mantaflow_scene.py` builds the Mantaflow twin
     /// from (2b-3 spec §5). Ember's units throughout; `tests/bench/mapping.py`
     /// converts them. Bench emitters and colliders are static spheres.
+    ///
+    /// # Panics
+    ///
+    /// If the domain is not cubic (Mantaflow's domain object is sized by one
+    /// resolution along its longest side, and `mapping.py` assumes one `dx`),
+    /// if an emitter or collider is not a sphere, or if either is keyframed.
     pub fn mantaflow_json(&self) -> serde_json::Value {
+        let [nx, ny, nz] = self.cells;
+        assert!(
+            nx == ny && ny == nz,
+            "the Mantaflow twin needs a cubic domain, not {nx}×{ny}×{nz}"
+        );
         let sphere = |shape: &Shape, transform: &Transform, what: &str| {
             let Shape::Sphere { radius } = *shape else {
                 panic!("the Mantaflow twin supports only a sphere {what}");
             };
-            debug_assert_eq!(transform.keys.len(), 1, "bench {what}s are static");
+            assert_eq!(transform.keys.len(), 1, "bench {what}s are static");
             (transform.keys[0].translate.map(decimal), decimal(radius))
         };
         let (center, radius) = sphere(&self.emitter.shape, &self.emitter.transform, "emitter");
@@ -161,7 +174,7 @@ impl Scene {
         serde_json::json!({
             "name": self.name,
             "domain_size": self.domain_size,
-            "resolution": self.cells.into_iter().max(),
+            "resolution": nx,
             "fps": self.fps,
             "frames": self.frames,
             "substeps": s.max_substeps,

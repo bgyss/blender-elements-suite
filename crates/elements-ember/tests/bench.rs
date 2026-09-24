@@ -355,3 +355,105 @@ fn the_report_refuses_summaries_from_more_than_one_commit() {
         "{lines:?}"
     );
 }
+
+/// The drift-at-80 cell says when a run's outflow started, and how much of
+/// the frame-60 mass the outflow estimate credits by frame 80, only for a
+/// run whose outflow rate is non-zero by then.
+#[test]
+fn the_drift_cell_marks_outflow_before_frame_80() {
+    let mut s = all();
+    let early = s
+        .iter_mut()
+        .find(|r| r.solver == "ember" && r.scene == "plume" && r.resolution == 64)
+        .unwrap();
+    for f in &mut early.frames[69..] {
+        f.outflow_rate = 0.01;
+    }
+    // mass_below goes 0.054 → 0.072 from frame 60 to 80, so a drift of
+    // 0.0234 credits 0.0054 to outflow: 10.0% of 0.054.
+    early.drift[20] = 0.0234;
+    let late = s
+        .iter_mut()
+        .find(|r| r.solver == "mantaflow" && r.scene == "plume" && r.resolution == 64)
+        .unwrap();
+    for f in &mut late.frames[80..] {
+        f.outflow_rate = 0.01;
+    }
+    let md = report::results_markdown(&s, &context()).unwrap();
+    assert!(
+        md.contains("| 0.0234 (+43.3%); outflow from frame 70 credits 10.0% |"),
+        "{md}"
+    );
+    assert_eq!(
+        md.matches("outflow from frame").count(),
+        1,
+        "outflow that starts at frame 81 is not marked"
+    );
+}
+
+/// A frame whose mass is below the floor shows "—" for its centroid, top
+/// and per-cell values, rather than numbers from a few stray cells.
+#[test]
+fn a_near_empty_frame_shows_no_shape_or_per_cell_values() {
+    let mut s = all();
+    let empty = s
+        .iter_mut()
+        .find(|r| r.solver == "mantaflow" && r.scene == "plume_wind" && r.resolution == 128)
+        .unwrap();
+    empty.frames[119].mass = 1e-12;
+    let md = report::results_markdown(&s, &context()).unwrap();
+    let wind = md.split("## `plume_wind`").nth(1).unwrap();
+    let row = wind
+        .lines()
+        .find(|l| l.starts_with("| mantaflow | 128³"))
+        .unwrap();
+    assert!(row.contains("| 1.50e-4 / — |"), "KE per cell: {row}");
+    assert!(row.contains("| 3.00e-4 / — |"), "vorticity per cell: {row}");
+    assert!(
+        row.contains("| 0.600 / — | 0.900 / — |"),
+        "centroid, top: {row}"
+    );
+    // Totals are still shown: they are sums, not shape.
+    assert!(row.contains("| 0.600 / 1.20 |"), "kinetic energy: {row}");
+}
+
+/// The Notes compare the solvers' emitted mass from the runs themselves,
+/// over frames 12–24 and at frame 60.
+#[test]
+fn the_notes_compute_the_emitted_mass_ratio() {
+    let mut s = all();
+    let e = s
+        .iter_mut()
+        .find(|r| r.solver == "ember" && r.scene == "plume_collider" && r.resolution == 128)
+        .unwrap();
+    e.frames[11].mass *= 1.1;
+    e.frames[59].mass *= 0.5;
+    let md = report::results_markdown(&s, &context()).unwrap();
+    assert!(
+        md.contains("over frames 12–24, Ember's mass is 1.00–1.10× Mantaflow's"),
+        "{md}"
+    );
+    assert!(md.contains("By frame 60 the ratio is 0.50–1.00×"), "{md}");
+}
+
+/// Mantaflow's twin is built for a cube (one `dx` in `mapping.py`).
+#[test]
+#[should_panic(expected = "needs a cubic domain")]
+fn the_mantaflow_twin_refuses_a_non_cubic_domain() {
+    let mut s = Scene::plume(64);
+    s.cells = [64, 64, 128];
+    let _ = s.mantaflow_json();
+}
+
+/// The mask is computed from the collider's one key; a keyframed collider
+/// would give a mask that matches neither solver.
+#[test]
+#[should_panic(expected = "bench colliders are static")]
+fn the_bench_mask_refuses_a_keyframed_collider() {
+    let mut s = Scene::plume_collider(16);
+    let c = s.collider.as_mut().unwrap();
+    let mut key = c.transform.keys[0];
+    key.frame += 10.0;
+    c.transform.keys.push(key);
+    let _ = s.solid_mask();
+}

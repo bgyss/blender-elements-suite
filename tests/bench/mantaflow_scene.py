@@ -53,7 +53,14 @@ def build_domain(sc: dict, cache_dir: str) -> bpy.types.Object:
     d.use_adaptive_domain = False
     d.use_noise = False
     d.use_adaptive_timesteps = False
-    d.timesteps_min = d.timesteps_max = sc["substeps"]
+    # mapping.py's per-frame conversions (inflow density = rate / fps, wind,
+    # vorticity) hold only for one Mantaflow step per frame.
+    if sc["substeps"] != 1:
+        sys.exit(
+            f"substeps = {sc['substeps']}: the Mantaflow mappings hold only for "
+            "one step per frame"
+        )
+    d.timesteps_min = d.timesteps_max = 1
     d.cache_directory = cache_dir
     d.cache_type = "ALL"
     d.cache_data_format = "OPENVDB"
