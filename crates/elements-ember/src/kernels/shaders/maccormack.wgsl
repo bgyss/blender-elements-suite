@@ -1,6 +1,29 @@
 // MacCormack's correction (Selle et al. 2008): q̂ + ½(q − q̃), clamped to
 // the range of the 8 texels of q that the forward pass interpolated, then
 // the scalar's dissipation. `fwd` is q̂ = A(q) and `bwd` is q̃ = A⁻¹(q̂).
+//
+// A scalar reads ambient 0 beyond an open face. Where either trace reaches
+// past one, q̃ is built partly from that 0, and the correction would treat
+// what flowed out as error and put part of it back, so smoke piled up
+// against open faces (2b-3c spec §5). Such cells take the first-order value
+// q̂ instead, as Selle et al. revert to first order where the scheme cannot
+// be trusted. Velocity faces clamp at the domain edge rather than reading
+// an ambient value, and walls never read past the domain, so both keep the
+// corrected value.
+
+// Whether the trace position `p`, in the grid's texel index space, draws
+// on a texel beyond an open face: past the last cell centre towards one.
+fn beyond_open(p: vec3<f32>) -> bool {
+    for (var a = 0u; a < 3u; a = a + 1u) {
+        if (p[a] < 0.0 && is_open(a, 0u)) {
+            return true;
+        }
+        if (p[a] > f32(params.dims[a]) - 1.0 && is_open(a, 1u)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 @group(0) @binding(0) var vel_x: texture_3d<f32>;
 @group(0) @binding(1) var vel_y: texture_3d<f32>;
@@ -37,7 +60,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let x = vec3<f32>(gid) + grid_offset(axis);
-    let k = fluid_corners(orig, axis, backtrace(x, 1.0) - grid_offset(axis));
+    let back = backtrace(x, 1.0) - grid_offset(axis);
+    if (axis == CELL && (beyond_open(back) || beyond_open(backtrace(x, -1.0) - grid_offset(axis)))) {
+        textureStore(dst, p, vec4<f32>(textureLoad(fwd, p, 0).x * params.decay, 0.0, 0.0, 0.0));
+        return;
+    }
+    let k = fluid_corners(orig, axis, back);
     var lo = k.c[0];
     var hi = k.c[0];
     for (var n = 1u; n < 8u; n = n + 1u) {

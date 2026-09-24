@@ -607,3 +607,120 @@ fn scalars_next_to_a_solid_never_sample_its_contents() {
         }
     }
 }
+
+/// One step of `src` along x at 2/3 of a cell, towards +x when `speed` is
+/// 1 and −x when it is −1, in a 16×2×2 domain whose faces `open_mask`
+/// names are open, by semi-Lagrangian and by MacCormack.
+fn leave_along_x(src_values: &[f32], open_mask: u32, speed: f32) -> (Vec<f32>, Vec<f32>) {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(16, 2, 2);
+    // 1 m/s × (1/24) s / (1/16) m = 2/3 of a cell.
+    let c = StepConstants {
+        open_mask,
+        ..StepConstants::new(cells, 1.0 / 24.0, 1.0 / 16.0)
+    };
+    let faces: [Vec<f32>; 3] = std::array::from_fn(|a| {
+        let n = face_dims(cells, a).voxel_count();
+        let mut v = vec![if a == 0 { speed } else { 0.0 }; n];
+        // A wall face carries no velocity, as projection would leave it.
+        if a == 0 {
+            for k in 0..cells.z {
+                for j in 0..cells.y {
+                    for i in [0, cells.x] {
+                        if is_wall_in(cells, open_mask, 0, i) {
+                            v[index(face_dims(cells, 0), i, j, k)] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        v
+    });
+    let velocity = upload_staggered(&gpu, &mut pool, cells, &faces);
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let src = upload(&gpu, &mut pool, cells, src_values);
+    let semi = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    let mut batch = ComputeBatch::new();
+    advect(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &u,
+        Carried::Density,
+        Pass::SemiLagrangian,
+        &velocity,
+        &src,
+        &semi,
+        None,
+    )
+    .unwrap();
+    batch.submit(&gpu).unwrap();
+    let mac = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    maccormack_step(
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &u,
+        Carried::Density,
+        &velocity,
+        &src,
+        &mac,
+    );
+    (semi.read_back(&gpu).unwrap(), mac.read_back(&gpu).unwrap())
+}
+
+/// 2b-3c spec §5: MacCormack's backward pass reads ambient 0 beyond an
+/// open face, and its correction then put back part of what flowed out, so
+/// smoke piled up against open faces. Where a trace crosses an open face,
+/// MacCormack now takes the first-order value there. Walls and the
+/// interior keep the corrected value, and MacCormack is not conservative in
+/// the interior either, so a blob leaving the domain loses about, not
+/// exactly, what semi-Lagrangian loses: 1.494 against 1.617, where before
+/// it lost 1.126.
+#[test]
+fn maccormack_falls_back_to_first_order_where_a_trace_crosses_an_open_face() {
+    let cells = FieldDims::new(16, 2, 2);
+    // A blob whose peak sits two cells inside the +x face.
+    let blob: Vec<f32> = (0..cells.voxel_count())
+        .map(|n| {
+            let x = (n % 16) as f32 + 0.5;
+            (-(x - 13.5).powi(2) / 8.0).exp()
+        })
+        .collect();
+    let total = |v: &[f32]| v.iter().map(|&q| f64::from(q)).sum::<f64>();
+    let column = |v: &[f32], i: u32| -> Vec<f32> {
+        (0..4).map(|r| v[index(cells, i, r % 2, r / 2)]).collect()
+    };
+
+    let (semi, mac) = leave_along_x(&blob, 0b10, 1.0);
+    let lost_semi = total(&blob) - total(&semi);
+    let lost_mac = total(&blob) - total(&mac);
+    eprintln!("+x open: lost by semi-Lagrangian {lost_semi}, by MacCormack {lost_mac}");
+    // The last column's backward trace leaves through the open face.
+    assert_eq!(
+        column(&mac, 15),
+        column(&semi, 15),
+        "the open face's column"
+    );
+    // Well inside, MacCormack still corrects.
+    assert_ne!(column(&mac, 12), column(&semi, 12), "an interior column");
+    assert!(
+        lost_mac >= 0.9 * lost_semi,
+        "MacCormack lost {lost_mac}, semi-Lagrangian {lost_semi}"
+    );
+
+    // Against a wall nothing crosses an open face, and the corrected value
+    // stays.
+    let (semi, mac) = leave_along_x(&blob, 0, 1.0);
+    assert_ne!(column(&mac, 14), column(&semi, 14), "beside a wall");
+
+    // The same through the low face: the blob mirrored, moving −x.
+    let mirrored: Vec<f32> = (0..cells.voxel_count())
+        .map(|n| blob[n - n % 16 + 15 - n % 16])
+        .collect();
+    let (semi, mac) = leave_along_x(&mirrored, 0b01, -1.0);
+    assert_eq!(column(&mac, 0), column(&semi, 0), "the −x face's column");
+    assert_ne!(column(&mac, 3), column(&semi, 3), "an interior column, −x");
+}
