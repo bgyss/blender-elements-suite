@@ -20,7 +20,7 @@ use std::time::Instant;
 use elements_core::gpu::{Axis, FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::report::{
-    Context, RunSummary, load_average, results_markdown, write_summary,
+    Context, RunSummary, load_average, results_markdown, single_commit, write_summary,
 };
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
 use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
@@ -154,6 +154,7 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
         load_before,
         load_after,
         blender: None,
+        commit: commit_label(),
         drift: drift_from_cut_off(&frames, scene.fps),
         frames,
     };
@@ -174,9 +175,25 @@ fn blender() -> String {
         .unwrap_or_else(|_| "/Applications/Blender.app/Contents/MacOS/Blender".to_owned())
 }
 
+/// Blender's own lines kept from its stderr for error messages.
+const STDERR_TAIL: usize = 40;
+
+/// The last `STDERR_TAIL` lines Blender wrote, without the rusage block that
+/// `/usr/bin/time -l` appends (it starts with the line holding "real").
+fn blender_tail(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let end = lines
+        .iter()
+        .rposition(|l| l.contains(" real ") && l.contains(" user "))
+        .unwrap_or(lines.len());
+    let start = end.saturating_sub(STDERR_TAIL);
+    lines[start..end].join("\n")
+}
+
 /// Run the scene script under `/usr/bin/time -l`, returning peak resident
-/// bytes. `-l` prints "maximum resident set size" in bytes on macOS.
-fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<u64> {
+/// bytes and the tail of Blender's stderr, for errors found after it exits.
+/// `-l` prints "maximum resident set size" in bytes on macOS.
+fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<(u64, String)> {
     let script = workspace().join("tests/bench/mantaflow_scene.py");
     let mut cmd = Command::new("/usr/bin/time");
     cmd.arg("-l")
@@ -197,22 +214,27 @@ fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<u64> {
     }
     let output = cmd.output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail = blender_tail(&stderr);
     if !output.status.success() {
-        let tail: Vec<&str> = stderr.lines().rev().take(40).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
         return Err(format!(
-            "Blender exited with {}; stderr ends:\n{}",
-            output.status,
-            tail.join("\n")
+            "Blender exited with {}; its stderr ends:\n{tail}",
+            output.status
         )
         .into());
     }
-    stderr
+    let rss = stderr
         .lines()
         .find(|l| l.contains("maximum resident set size"))
         .and_then(|l| l.split_whitespace().next())
         .and_then(|n| n.parse().ok())
-        .ok_or_else(|| "no \"maximum resident set size\" in /usr/bin/time -l output".into())
+        .ok_or("no \"maximum resident set size\" in /usr/bin/time -l output")?;
+    Ok((rss, tail))
+}
+
+/// `e` with Blender's stderr tail appended, for failures found after a bake
+/// that Blender reported as successful.
+fn with_stderr(e: impl std::fmt::Display, tail: &str) -> Box<dyn Error> {
+    format!("{e}\nBlender exited 0; its stderr ends:\n{tail}").into()
 }
 
 /// `timings.json` from the scene script.
@@ -265,7 +287,7 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     eprintln!("mantaflow {name} {res}³: baseline (no bake)");
     let base_dir = scratch.join("baseline");
     clear_dir(&base_dir)?;
-    let baseline = run_blender(&scene_json, &base_dir, true).map_err(context)?;
+    let (baseline, _) = run_blender(&scene_json, &base_dir, true).map_err(context)?;
 
     // The scene script never clears an old cache, so a stale frame would
     // pass its missing-frame check: clear the output before every bake.
@@ -276,13 +298,22 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     let mut all = Vec::new();
     let mut peak = 0;
     let mut version = String::new();
+    let mut tail = String::new();
     for r in 0..runs {
         eprintln!("mantaflow {name} {res}³: timed run {} of {runs}", r + 1);
         clear_dir(&out)?;
-        let rss = run_blender(&scene_json, &out, false).map_err(context)?;
-        let timings: Timings =
-            serde_json::from_str(&std::fs::read_to_string(out.join("timings.json"))?)?;
-        let frames = frame_times(&timings, scene.frames).map_err(context)?;
+        let (rss, stderr) = run_blender(&scene_json, &out, false).map_err(context)?;
+        tail = stderr;
+        let path = out.join("timings.json");
+        let timings: Timings = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            .and_then(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|e| format!("cannot parse {}: {e}", path.display()))
+            })
+            .map_err(|e| context(with_stderr(e, &tail)))?;
+        let frames =
+            frame_times(&timings, scene.frames).map_err(|e| context(with_stderr(e, &tail)))?;
         medians.push(median(&frames));
         all.extend(frames);
         peak = peak.max(rss);
@@ -297,7 +328,8 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     let mut frames = Vec::new();
     for n in 1..=scene.frames {
         let path = out.join(format!("cache/data/fluid_data_{n:04}.vdb"));
-        let f = common::mantaflow::read_frame(&path, cells, dx).map_err(|e| context(e.into()))?;
+        let f = common::mantaflow::read_frame(&path, cells, dx)
+            .map_err(|e| context(with_stderr(e, &tail)))?;
         frames.push(measure(&Sample {
             cells,
             dx,
@@ -318,6 +350,7 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
         load_before,
         load_after,
         blender: Some(version),
+        commit: commit_label(),
         drift: drift_from_cut_off(&frames, scene.fps),
         frames,
     };
@@ -341,10 +374,18 @@ fn report() -> Res<()> {
             }
         }
     }
+    // The header names the commit the results came from, not the one that
+    // happens to build the report.
+    let commit = single_commit(&summaries).map_err(|lines| {
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        "result files come from more than one commit; results.md not written"
+    })?;
     let ctx = Context {
         machine: shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
         os: format!("macOS {}", shell("sw_vers", &["-productVersion"])),
-        commit: commit_label(),
+        commit,
         blender: summaries
             .iter()
             .find_map(|s| s.blender.clone())
@@ -371,7 +412,16 @@ fn report() -> Res<()> {
     }
 }
 
-fn main() -> Res<()> {
+/// Errors print with Display, so a multi-line Blender stderr tail stays
+/// readable rather than one escaped Debug string.
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Res<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args
         .iter()

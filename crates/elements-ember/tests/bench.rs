@@ -201,6 +201,7 @@ fn a_summary_round_trips_through_its_file() {
         load_before: 1.5,
         load_after: 2.25,
         blender: None,
+        commit: "abc1234-dirty".into(),
         frames: vec![frame(1.0), frame(2.0)],
         drift: vec![0.0, -0.001],
     };
@@ -245,7 +246,7 @@ fn summary(solver: &str, scene: &str, res: u32) -> report::RunSummary {
                 divergence_rms: 1e-4 * n,
                 kinetic_energy: 0.01 * n,
                 vorticity: 0.02 * n,
-                measured_cells: 50 * n as u64,
+                measured_cells: 1000 + 50 * n as u64,
                 mass: 0.001 * n,
                 mass_below: 0.0009 * n,
                 centroid_m: Some(0.01 * n),
@@ -266,8 +267,11 @@ fn summary(solver: &str, scene: &str, res: u32) -> report::RunSummary {
         load_before: 1.0,
         load_after: 1.5,
         blender: (solver == "mantaflow").then(|| "5.2.2 LTS".to_owned()),
+        commit: "abc1234".into(),
         frames,
-        drift: vec![0.0; 61],
+        // drift[i] is frame 60 + i; each frame's value is distinct, so a
+        // wrong index shows up as a wrong number.
+        drift: (0..=60).map(|i| 1e-4 * f64::from(i)).collect(),
     }
 }
 
@@ -312,4 +316,42 @@ fn the_results_table_has_one_section_per_scene_and_names_run_counts() {
     assert!(md.contains("1 run"), "256³ says it is one run");
     assert!(md.contains("median of 3"), "64³ and 128³ say three");
     assert!(md.contains(&ctx.commit) && md.contains(&ctx.blender));
+}
+
+/// The row reads drift at frames 80 and 120 (`drift[20]`, `drift[60]`) as a
+/// percentage of `mass_below` at frame 60, and divides kinetic energy and
+/// vorticity by the measured cells of the same frame.
+#[test]
+fn the_results_row_pins_drift_frames_and_per_cell_values() {
+    let md = report::results_markdown(&all(), &context()).unwrap();
+    // mass_below at 60 is 0.0009 · 60 = 0.054.
+    // Frame 120: 0.006, 11.1%. Frame 80: 0.002, 3.7%.
+    assert!(
+        md.contains("| 0.00200 (+3.7%) | 0.00600 (+11.1%) |"),
+        "{md}"
+    );
+    // Kinetic energy 0.01 n over 1000 + 50 n cells: 0.6 / 4000 at 60,
+    // 1.2 / 7000 at 120. Vorticity is twice that.
+    assert!(
+        md.contains("| 1.50e-4 / 1.71e-4 |"),
+        "kinetic energy per cell"
+    );
+    assert!(md.contains("| 3.00e-4 / 3.43e-4 |"), "vorticity per cell");
+}
+
+#[test]
+fn the_report_refuses_summaries_from_more_than_one_commit() {
+    let mut s = all();
+    assert_eq!(report::single_commit(&s), Ok("abc1234".to_owned()));
+    s[4].commit = "def5678".into();
+    let lines = report::single_commit(&s).unwrap_err();
+    assert_eq!(lines.len(), s.len(), "every file is listed with its commit");
+    assert!(
+        lines.contains(&"ember-plume_collider-128: def5678".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"ember-plume-64: abc1234".to_owned()),
+        "{lines:?}"
+    );
 }

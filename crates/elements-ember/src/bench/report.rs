@@ -32,6 +32,9 @@ pub struct RunSummary {
     pub load_after: f64,
     /// Blender's version string for Mantaflow runs; `None` for Ember.
     pub blender: Option<String>,
+    /// The Ember commit the run was built from, with `-dirty` for a changed
+    /// tree. The report refuses to mix commits.
+    pub commit: String,
     /// One entry per frame, frame 1 first.
     pub frames: Vec<FrameMetrics>,
     /// `drift` from frame 60, one entry per frame from 60 on.
@@ -109,6 +112,30 @@ pub const IDLE_LOAD: f64 = 2.0;
 /// last frame.
 const REPORT_FRAMES: [usize; 2] = [60, 120];
 
+/// The frames at which the table reports drift, 1-based. At 80 no smoke has
+/// yet reached the outflow plane in the 64³ smoke test, so drift there is
+/// almost all advection; 120 includes the outflow period.
+const DRIFT_FRAMES: [usize; 2] = [80, 120];
+
+/// The commit every summary was built from, or one line per summary,
+/// `{solver}-{scene}-{resolution}: {commit}`, when they differ. A table
+/// mixing commits would compare different code.
+pub fn single_commit(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
+    let first = summaries
+        .first()
+        .map(|s| s.commit.clone())
+        .unwrap_or_default();
+    if summaries.iter().all(|s| s.commit == first) {
+        return Ok(first);
+    }
+    let mut lines: Vec<String> = summaries
+        .iter()
+        .map(|s| format!("{}-{}-{}: {}", s.solver, s.scene, s.resolution, s.commit))
+        .collect();
+    lines.sort();
+    Err(lines)
+}
+
 /// Where and on what the results were produced, for the table's header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Context {
@@ -182,9 +209,11 @@ pub fn results_markdown(summaries: &[RunSummary], ctx: &Context) -> Result<Strin
             "## `{scene}`\n\n\
              | solver | cells | frame ms (median, min–max) | peak MiB \
              | div. RMS 1/s (60 / 120) | measured cells (60 / 120) \
-             | kinetic energy m⁵/s² (60 / 120) | vorticity m³/s (60 / 120) \
-             | centroid m (60 / 120) | top m (60 / 120) | drift at 120 (% of mass at 60) |\n\
-             |---|---|---|---|---|---|---|---|---|---|---|\n"
+             | kinetic energy m⁵/s² (60 / 120) | kinetic energy per measured cell (60 / 120) \
+             | vorticity m³/s (60 / 120) | vorticity per measured cell (60 / 120) \
+             | centroid m (60 / 120) | top m (60 / 120) \
+             | drift at 80 (% of mass at 60) | drift at 120 (% of mass at 60) |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
         );
         for res in RESOLUTIONS {
             for solver in SOLVERS {
@@ -229,23 +258,26 @@ fn row(s: &RunSummary) -> String {
             REPORT_FRAMES.map(|n| at(n).map_or("—".to_owned(), |f| f.measured_cells.to_string()));
         format!("{a} / {b}")
     };
-    // drift[0] is frame 60, so frame 120 is drift[60].
-    let drift = {
-        let [first, last] = REPORT_FRAMES;
-        match s.drift.get(last - first) {
-            Some(&d) => {
-                let base = at(first).map_or(0.0, |f| f.mass_below);
-                if base > 0.0 {
-                    format!("{} ({:+.1}%)", sig(d), 100.0 * d / base)
-                } else {
-                    format!("{} (—)", sig(d))
-                }
+    let per_cell =
+        |v: f64, f: &FrameMetrics| (f.measured_cells > 0).then(|| v / f.measured_cells as f64);
+    // drift[0] is the last emitting frame, and the percentage is of the mass
+    // below the outflow plane then.
+    let cut_off = REPORT_FRAMES[0];
+    let drift_at = |frame: usize| match s.drift.get(frame - cut_off) {
+        Some(&d) => {
+            let base = at(cut_off).map_or(0.0, |f| f.mass_below);
+            if base > 0.0 {
+                format!("{} ({:+.1}%)", sig(d), 100.0 * d / base)
+            } else {
+                format!("{} (—)", sig(d))
             }
-            None => "—".to_owned(),
         }
+        None => "—".to_owned(),
     };
+    let [drift_a, drift_b] = DRIFT_FRAMES.map(drift_at);
     format!(
-        "| {} | {}³ | {} ({}–{}), {runs} | {:.1} | {} | {cells} | {} | {} | {} | {} | {drift} |\n",
+        "| {} | {}³ | {} ({}–{}), {runs} | {:.1} | {} | {cells} | {} | {} | {} | {} | {} | {} \
+         | {drift_a} | {drift_b} |\n",
         s.solver,
         s.resolution,
         sig(s.frame_ms_median),
@@ -254,7 +286,9 @@ fn row(s: &RunSummary) -> String {
         s.peak_bytes as f64 / f64::from(1u32 << 20),
         pair(&|f| Some(f.divergence_rms)),
         pair(&|f| Some(f.kinetic_energy)),
+        pair(&|f| per_cell(f.kinetic_energy, f)),
         pair(&|f| Some(f.vorticity)),
+        pair(&|f| per_cell(f.vorticity, f)),
         pair(&|f| f.centroid_m),
         pair(&|f| f.top_m),
     )
@@ -282,6 +316,9 @@ those whose whole 3×3×3 neighbourhood is inside the domain, outside any collid
 smoke (density > 1e-6). The rule is the same for both solvers, because Mantaflow's cache \
 stores velocity only where there is smoke (spec §4.1). The measured-cell count says how \
 much of each field that is.\n\
+- **Per-cell values.** The solvers' smoky regions differ in size, so their measured cells \
+differ too, and the kinetic energy and vorticity totals partly measure that size. The totals \
+divided by the measured-cell count are the fairer comparison.\n\
 - **Wind.** Mantaflow's wind field acts only on cells that hold smoke; Ember's wind \
 accelerates every cell. `plume_wind` compares the plume's shape, not a matched force field.\n\
 - **Heat.** Mantaflow's emitter heat is held at a set value (Ember's emitter-centre heat at \
@@ -292,7 +329,11 @@ tolerance; Ember runs a fixed count of red-black Gauss–Seidel iterations.\n\
 - **Drift** is (mass below the outflow plane + outflow since frame 60) − that mass at frame \
 60, with outflow estimated at frame resolution as the net upwind flux through the z-faces two \
 cells below the top, and mass summed over the layers below them (spec §4.3). Emission stops \
-after frame 60, so a perfect solver drifts 0.\n\
+after frame 60, so a perfect solver drifts 0. Drift at 80 is almost entirely mass gained by \
+advection, since little or no smoke has reached the outflow plane by then (in the 64³ \
+smoke test, neither solver had outflow before frame 74; each run's CSV `outflow_rate` column \
+shows when it starts). Drift at 120 also covers the outflow period, where \
+the frame-resolution outflow estimate adds uncertainty.\n\
 - **Frame times** exclude frame 1. Ember's frame is `eval_frame` plus a blocking GPU wait; \
 Mantaflow's is the difference between consecutive cache files' modification times, so it \
 includes writing the cache. 256³ is one run of each solver, the other resolutions the median \
