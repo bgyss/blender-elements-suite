@@ -1,7 +1,8 @@
 //! `ember.smoke_solver`: a dense-grid smoke solver (spec §2.4, §3).
 //!
 //! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
-//! project, and advect scalars with dissipation. Each frame first measures
+//! project, and advect scalars with dissipation, each followed by the mass
+//! correction when `conserve_mass` is set. Each frame first measures
 //! the fastest face and picks its substep count by CFL.
 //!
 //! The projection's pressure solve is chosen by `pressure_solver`: red-black
@@ -11,14 +12,16 @@
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError,
-    PipelineCache, StaggeredField,
+    PipelineCache, ReduceTarget, StaggeredField,
 };
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::boundaries::Boundaries;
 use crate::cfl;
-use crate::kernels::{self, Advection, Carried, Hierarchy, Pass, Solids, StepConstants, Uniforms};
+use crate::kernels::{
+    self, Advection, Carried, Hierarchy, Pass, Solids, StepConstants, Uniforms, conserve,
+};
 use crate::node_util::{pair, take_listed};
 use crate::params;
 
@@ -84,6 +87,7 @@ impl Quality {
             wind_rate: 0.0,
             pressure_solver: PressureSolver::Mgpcg,
             pressure_cycles,
+            conserve_mass: true,
         }
     }
 }
@@ -153,6 +157,12 @@ pub struct SolverParams {
     /// target): scenes with thin walls should use `final` or set this to
     /// at least 10 (`docs/bench/solver-gate.md`).
     pub pressure_cycles: u32,
+    /// Rescale density and temperature after each advection so that their
+    /// totals change only by what left through open faces, what solids
+    /// removed and dissipation (2b-3c spec §5). The correction is global:
+    /// it removes advection's net gain or loss, spread over the field in
+    /// proportion to each cell's value, and cannot fix where mass sits.
+    pub conserve_mass: bool,
 }
 
 impl Default for SolverParams {
@@ -186,6 +196,7 @@ struct DocParams {
     wind_rate: Option<f32>,
     pressure_solver: Option<PressureSolver>,
     pressure_cycles: Option<u32>,
+    conserve_mass: Option<bool>,
 }
 
 /// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
@@ -236,6 +247,7 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
         wind_rate: doc.wind_rate.unwrap_or(preset.wind_rate),
         pressure_solver: doc.pressure_solver.unwrap_or(preset.pressure_solver),
         pressure_cycles: doc.pressure_cycles.unwrap_or(preset.pressure_cycles),
+        conserve_mass: doc.conserve_mass.unwrap_or(preset.conserve_mass),
     };
     validate(&p)?;
     Ok(p)
@@ -327,6 +339,7 @@ impl SolverParams {
             vorticity: self.vorticity,
             wind_velocity: self.wind_velocity,
             wind_rate: self.wind_rate,
+            conserve_mass: self.conserve_mass,
             ..StepConstants::new(cells, h, dx)
         }
     }
@@ -449,9 +462,12 @@ pub struct Substep {
     uniforms: Uniforms,
     batch: ComputeBatch,
     retired: Vec<Field>,
+    /// The mass corrections' slots, kept with `retired` until the batch runs.
+    targets: Vec<ReduceTarget>,
     advection: Advection,
     vorticity: bool,
     wind: bool,
+    conserve_mass: bool,
 }
 
 impl Substep {
@@ -461,10 +477,18 @@ impl Substep {
             uniforms: Uniforms::new(gpu, constants)?,
             batch: ComputeBatch::new(),
             retired: Vec::new(),
+            targets: Vec::new(),
             advection: constants.advection,
             vorticity: constants.vorticity > 0.0,
             wind: constants.wind_rate > 0.0,
+            conserve_mass: constants.conserve_mass,
         })
+    }
+
+    /// Dispatches recorded and not yet flushed, for tests that count the
+    /// work a stage adds.
+    pub fn recorded_dispatches(&self) -> usize {
+        self.batch.len()
     }
 
     /// Everything before projection, four passes: emit, buoyancy, vorticity
@@ -694,7 +718,7 @@ impl Substep {
         state: &mut SolverState,
         solids: Option<Solids<'_>>,
     ) -> Result<(), GpuError> {
-        let density = self.advect_grid(
+        let density = self.advect_scalar(
             gpu,
             cache,
             pool,
@@ -705,7 +729,7 @@ impl Substep {
         )?;
         self.retired
             .push(std::mem::replace(&mut state.density, density));
-        let temperature = self.advect_grid(
+        let temperature = self.advect_scalar(
             gpu,
             cache,
             pool,
@@ -717,6 +741,60 @@ impl Substep {
         self.retired
             .push(std::mem::replace(&mut state.temperature, temperature));
         Ok(())
+    }
+
+    /// One scalar's advection into a fresh pooled field, with the mass
+    /// correction around it when `conserve_mass` is set (2b-3c spec §5).
+    /// With it off this is exactly `advect_grid`: no dispatch, acquisition
+    /// or buffer is added.
+    #[allow(clippy::too_many_arguments)]
+    fn advect_scalar(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        carried: Carried,
+        velocity: &StaggeredField,
+        src: &Field,
+        solids: Option<Solids<'_>>,
+    ) -> Result<Field, GpuError> {
+        if !self.conserve_mass {
+            return self.advect_grid(gpu, cache, pool, carried, velocity, src, solids);
+        }
+        let target = ReduceTarget::new(gpu, conserve::SLOTS)?;
+        let scratch = pool.acquire(gpu, src.dims(), FieldFormat::R32Float)?;
+        let measured = conserve::measure_before(
+            gpu,
+            cache,
+            &mut self.batch,
+            &self.uniforms,
+            src,
+            velocity,
+            &scratch,
+            &target,
+            solids.map(|s| s.mask),
+        );
+        // The batch may reference both whether or not recording finished.
+        self.retired.push(scratch);
+        self.targets.push(target);
+        measured?;
+        let dst = self.advect_grid(gpu, cache, pool, carried, velocity, src, solids)?;
+        let target = self.targets.last().expect("pushed above");
+        match conserve::correct_after(
+            gpu,
+            cache,
+            &mut self.batch,
+            &self.uniforms,
+            carried,
+            &dst,
+            target,
+        ) {
+            Ok(()) => Ok(dst),
+            Err(e) => {
+                self.retired.push(dst);
+                Err(e)
+            }
+        }
     }
 
     /// `src`, carried through `velocity` into a fresh pooled field. Scratch

@@ -6,6 +6,7 @@
 //! `shaders/common.wgsl`.
 
 mod advect;
+pub mod conserve;
 mod forces;
 pub mod mgpcg;
 pub mod multigrid;
@@ -59,11 +60,14 @@ pub struct StepConstants {
     pub wind_rate: f32,
     /// Whether this substep's kernels read a solid mask (spec §3.2).
     pub has_solids: bool,
+    /// Whether each scalar advection is followed by the global mass
+    /// correction (2b-3c spec §5).
+    pub conserve_mass: bool,
 }
 
 impl StepConstants {
-    /// No buoyancy, no dissipation, no vorticity confinement, MacCormack
-    /// advection and 2a's boundaries. Build variations with
+    /// No buoyancy, no dissipation, no vorticity confinement, no mass
+    /// correction, MacCormack advection and 2a's boundaries. Build variations with
     /// `StepConstants { beta: 1.0, ..StepConstants::new(cells, h, dx) }`, so
     /// fields added later get their defaults here instead of breaking callers.
     pub fn new(cells: FieldDims, h: f32, dx: f32) -> Self {
@@ -81,6 +85,7 @@ impl StepConstants {
             wind_velocity: [0.0; 3],
             wind_rate: 0.0,
             has_solids: false,
+            conserve_mass: false,
         }
     }
 }

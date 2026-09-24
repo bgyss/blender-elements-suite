@@ -13,7 +13,7 @@ use elements_ember::kernels::Advection;
 use elements_ember::kernels::{Solids, StepConstants};
 use elements_ember::metrics::{Sample, measure};
 use elements_ember::solver::{
-    KIND, PressureSolve, SolverParams, SolverState, Sources, resolve_params, substep,
+    KIND, PressureSolve, SolverParams, SolverState, Sources, Substep, resolve_params, substep,
 };
 use std::sync::{Arc, Mutex};
 
@@ -124,7 +124,11 @@ fn a_preset_fills_only_what_the_document_leaves_unset() {
     for (quality, cycles) in [("preview", 4), ("final", 10)] {
         let p = resolve_params(&serde_json::json!({ "quality": quality })).unwrap();
         assert_eq!(p.pressure(), PressureSolve::Mgpcg(cycles), "{quality}");
+        // 2b-3c spec §5: both presets conserve scalar mass.
+        assert!(p.conserve_mass, "{quality}");
     }
+    let off = resolve_params(&serde_json::json!({ "conserve_mass": false })).unwrap();
+    assert!(!off.conserve_mass, "a document may turn the correction off");
     let chosen =
         resolve_params(&serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 9 }))
             .unwrap();
@@ -143,7 +147,8 @@ fn step_constants_carry_every_solver_parameter() {
         "density_dissipation": 0.5, "temperature_dissipation": 0.25,
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
         "boundaries": { "-x": "open" },
-        "wind_velocity": [0.5, 0.0, -1.0], "wind_rate": 2.5
+        "wind_velocity": [0.5, 0.0, -1.0], "wind_rate": 2.5,
+        "conserve_mass": false
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -156,6 +161,12 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.open_mask, 0b100001);
     assert_eq!(c.wind_velocity, [0.5, 0.0, -1.0]);
     assert_eq!(c.wind_rate, 2.5);
+    assert!(!c.conserve_mass);
+    let on = resolve_params(&serde_json::json!({})).unwrap();
+    assert!(
+        on.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125)
+            .conserve_mass
+    );
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.
@@ -1300,4 +1311,51 @@ fn a_failed_step_with_multigrid_returns_every_field_to_the_pool() {
 #[test]
 fn a_failed_step_with_mgpcg_returns_every_field_to_the_pool() {
     assert_failed_solve_returns_the_hierarchy(PressureSolve::Mgpcg(4));
+}
+
+/// Pool acquisitions and recorded dispatches of one `advect_scalars`.
+fn scalar_advection_work(advection: Advection, conserve_mass: bool) -> (u64, usize) {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(8, 6, 5);
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+    let constants = StepConstants {
+        advection,
+        conserve_mass,
+        ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
+    };
+    let mut step = Substep::new(&gpu, &constants).unwrap();
+    let before = pool.acquisitions();
+    step.advect_scalars(&gpu, &mut cache, &mut pool, &mut state, None)
+        .unwrap();
+    let work = (pool.acquisitions() - before, step.recorded_dispatches());
+    step.submit(&gpu, &mut pool).unwrap();
+    state.release_to(&mut pool);
+    work
+}
+
+/// 2b-3c spec §5: with `conserve_mass` off, scalar advection does exactly
+/// the work it did before the correction existed. The expected counts are
+/// the parent commit's (9940e8c): its acquisitions were measured there
+/// (6 for MacCormack, 2 for semi-Lagrangian); it had no dispatch counter,
+/// and its code records one dispatch per pass: forward, backward and
+/// correction for MacCormack, one pass for semi-Lagrangian, per scalar.
+/// With the flag on the same counter sees the correction's work, so the
+/// comparison can tell the two apart.
+#[test]
+fn conserve_mass_off_adds_no_work() {
+    for (advection, parent) in [
+        (Advection::MacCormack, (6, 6)),
+        (Advection::SemiLagrangian, (2, 2)),
+    ] {
+        let off = scalar_advection_work(advection, false);
+        let on = scalar_advection_work(advection, true);
+        eprintln!("{advection:?}: off {off:?}, on {on:?}");
+        assert_eq!(off, parent, "{advection:?} with the correction off");
+        assert!(
+            on.0 > off.0 && on.1 > off.1,
+            "{advection:?}: on {on:?}, off {off:?}"
+        );
+    }
 }
