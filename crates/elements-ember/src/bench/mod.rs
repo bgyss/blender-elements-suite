@@ -2,6 +2,7 @@
 
 use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION, NodeId};
 
+use crate::boundaries::{Boundaries, Face};
 use crate::collider::{self, ColliderParams};
 use crate::shape_emitter::{self, EmitterParams};
 use crate::solver::{self, SolverParams};
@@ -80,12 +81,20 @@ impl Scene {
         }
     }
 
-    /// `plume` with wind of 0.5 m/s² along +x. Piece 2 spec §5.3 names the
-    /// scene; the numbers are from the 2b-2 spec §6.
+    /// `plume` in an ambient airflow of 1 m/s along +x that the air relaxes
+    /// towards at 1/s, blowing in at −x and out at +x; the top stays open
+    /// and the other faces are walls. Piece 2 spec §5.3 names the scene;
+    /// the numbers are from the 2b-3c spec §6.
     pub fn plume_wind(resolution: u32) -> Self {
         let mut scene = Self::plume(resolution);
         scene.name = "plume_wind";
-        scene.solver.wind = [0.5, 0.0, 0.0];
+        scene.solver.wind_velocity = [1.0, 0.0, 0.0];
+        scene.solver.wind_rate = 1.0;
+        scene.solver.boundaries = Boundaries {
+            neg_x: Face::Open,
+            pos_x: Face::Open,
+            ..Boundaries::default()
+        };
         scene
     }
 
@@ -190,7 +199,8 @@ impl Scene {
             "vorticity": decimal(s.vorticity),
             "density_dissipation": decimal(s.density_dissipation),
             "temperature_dissipation": decimal(s.temperature_dissipation),
-            "wind": s.wind.map(decimal),
+            "wind_velocity": s.wind_velocity.map(decimal),
+            "wind_rate": decimal(s.wind_rate),
             "collider": collider,
             "boundaries": {
                 "neg_x": face(b.neg_x),

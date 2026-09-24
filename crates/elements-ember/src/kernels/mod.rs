@@ -52,8 +52,11 @@ pub struct StepConstants {
     pub temperature_dissipation: f32,
     /// Vorticity confinement strength ε, 1/s; 0 skips the stage (spec §4.4).
     pub vorticity: f32,
-    /// Wind, a uniform acceleration, m/s² (spec §3.4).
-    pub wind: [f32; 3],
+    /// The ambient airflow the air relaxes towards, m/s (2b-3c spec §6).
+    pub wind_velocity: [f32; 3],
+    /// How fast the air relaxes towards `wind_velocity`, 1/s; 0 skips the
+    /// stage.
+    pub wind_rate: f32,
     /// Whether this substep's kernels read a solid mask (spec §3.2).
     pub has_solids: bool,
 }
@@ -75,7 +78,8 @@ impl StepConstants {
             density_dissipation: 0.0,
             temperature_dissipation: 0.0,
             vorticity: 0.0,
-            wind: [0.0; 3],
+            wind_velocity: [0.0; 3],
+            wind_rate: 0.0,
             has_solids: false,
         }
     }
@@ -96,9 +100,9 @@ struct KernelParams {
     open_mask: u32,
     decay: f32,
     confinement: f32,
-    face_accel: f32,
+    face_wind: f32,
     has_solids: u32,
-    _pad: u32,
+    wind_blend: f32,
 }
 
 // `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
@@ -124,7 +128,7 @@ pub struct Uniforms {
     temperature: wgpu::Buffer,
     cells: FieldDims,
     open_mask: u32,
-    wind: [f32; 3],
+    wind: bool,
     has_solids: bool,
     /// Bound as `solid` and `obstacle` when there are no solids. Kept so it
     /// outlives its view.
@@ -147,9 +151,15 @@ impl Uniforms {
                 open_mask: c.open_mask,
                 decay,
                 confinement: c.vorticity * c.dx,
-                face_accel: if axis < 3 { c.wind[axis as usize] } else { 0.0 },
+                face_wind: if axis < 3 {
+                    c.wind_velocity[axis as usize]
+                } else {
+                    0.0
+                },
                 has_solids: u32::from(c.has_solids),
-                _pad: 0,
+                // The fraction of the way to the wind one substep closes:
+                // exact for any h, so the stage cannot overshoot.
+                wind_blend: 1.0 - (-c.wind_rate * c.h).exp(),
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -189,7 +199,7 @@ impl Uniforms {
             temperature,
             cells: c.cells,
             open_mask: c.open_mask,
-            wind: c.wind,
+            wind: c.wind_rate > 0.0,
             has_solids: c.has_solids,
             _placeholder: placeholder,
             placeholder_view,
@@ -206,8 +216,8 @@ impl Uniforms {
         self.open_mask
     }
 
-    /// Wind, as in `StepConstants::wind`.
-    pub(crate) fn wind(&self) -> [f32; 3] {
+    /// Whether the wind stage runs: `StepConstants::wind_rate` is above 0.
+    pub(crate) fn wind(&self) -> bool {
         self.wind
     }
 

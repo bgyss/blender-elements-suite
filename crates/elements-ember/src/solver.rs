@@ -71,7 +71,8 @@ impl Quality {
             // Provisional until 2b-3 maps parameters to Mantaflow's.
             buoyancy_temperature: 1.0,
             boundaries: Boundaries::default(),
-            wind: [0.0; 3],
+            wind_velocity: [0.0; 3],
+            wind_rate: 0.0,
             // Gauss–Seidel until the 2b-3c gate (Task 5) decides otherwise.
             pressure_solver: PressureSolver::GaussSeidel,
             pressure_cycles: 4,
@@ -128,8 +129,12 @@ pub struct SolverParams {
     pub buoyancy_temperature: f32,
     /// Which domain faces are open; the rest are walls (spec §4.2).
     pub boundaries: Boundaries,
-    /// Wind, a uniform acceleration, m/s² (spec §3.4).
-    pub wind: [f32; 3],
+    /// The ambient airflow, m/s: the velocity the air relaxes towards
+    /// (2b-3c spec §6).
+    pub wind_velocity: [f32; 3],
+    /// How fast the air relaxes towards `wind_velocity`, 1/s, at least 0;
+    /// 0 turns wind off.
+    pub wind_rate: f32,
     /// The pressure solve: `gauss_seidel`, `multigrid` or `mgpcg`.
     pub pressure_solver: PressureSolver,
     /// V-cycles (`multigrid`) or PCG iterations (`mgpcg`) per substep;
@@ -161,7 +166,11 @@ struct DocParams {
     buoyancy_density: Option<f32>,
     buoyancy_temperature: Option<f32>,
     boundaries: Option<Boundaries>,
-    wind: Option<[f32; 3]>,
+    /// 2b-3's wind, an acceleration. Accepted by the parser only so that
+    /// validation can name its replacements instead of an unknown key.
+    wind: Option<serde_json::Value>,
+    wind_velocity: Option<[f32; 3]>,
+    wind_rate: Option<f32>,
     pressure_solver: Option<PressureSolver>,
     pressure_cycles: Option<u32>,
 }
@@ -175,6 +184,12 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
     } else {
         params::parse(KIND, params)?
     };
+    if doc.wind.is_some() {
+        return Err(params::bad(
+            KIND,
+            "\"wind\" was replaced by \"wind_velocity\" (m/s) and \"wind_rate\" (1/s)",
+        ));
+    }
     if doc.substeps.is_some() && doc.max_substeps.is_some() {
         return Err(params::bad(
             KIND,
@@ -204,7 +219,8 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
             .buoyancy_temperature
             .unwrap_or(preset.buoyancy_temperature),
         boundaries: doc.boundaries.unwrap_or(preset.boundaries),
-        wind: doc.wind.unwrap_or(preset.wind),
+        wind_velocity: doc.wind_velocity.unwrap_or(preset.wind_velocity),
+        wind_rate: doc.wind_rate.unwrap_or(preset.wind_rate),
         pressure_solver: doc.pressure_solver.unwrap_or(preset.pressure_solver),
         pressure_cycles: doc.pressure_cycles.unwrap_or(preset.pressure_cycles),
     };
@@ -252,7 +268,14 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
         "buoyancy",
         &[p.buoyancy_density, p.buoyancy_temperature],
     )?;
-    params::finite(KIND, "wind", &p.wind)?;
+    params::finite(KIND, "wind_velocity", &p.wind_velocity)?;
+    params::finite(KIND, "wind_rate", &[p.wind_rate])?;
+    if p.wind_rate < 0.0 {
+        return Err(params::bad(
+            KIND,
+            format!("wind_rate must be at least 0, got {}", p.wind_rate),
+        ));
+    }
     let rates = [
         p.vorticity,
         p.density_dissipation,
@@ -289,7 +312,8 @@ impl SolverParams {
             density_dissipation: self.density_dissipation,
             temperature_dissipation: self.temperature_dissipation,
             vorticity: self.vorticity,
-            wind: self.wind,
+            wind_velocity: self.wind_velocity,
+            wind_rate: self.wind_rate,
             ..StepConstants::new(cells, h, dx)
         }
     }
@@ -426,7 +450,7 @@ impl Substep {
             retired: Vec::new(),
             advection: constants.advection,
             vorticity: constants.vorticity > 0.0,
-            wind: constants.wind != [0.0; 3],
+            wind: constants.wind_rate > 0.0,
         })
     }
 

@@ -137,43 +137,61 @@ fn velocity_emission_approaches_the_target_exponentially() {
     assert!(got[1].iter().chain(&got[2]).all(|&v| v == 0.0));
 }
 
-/// Spec §3.4: wind is a uniform acceleration on every non-wall face.
+/// 2b-3c spec §6: wind relaxes every non-wall face towards the wind's
+/// velocity, u += (w − u)(1 − e^{−rate·h}): the emitter blend's form, exact
+/// for any h and never past w. Faces start at 0 and at 3 m/s, so each axis
+/// is approached from both sides; y's wind is 0, which must still pull
+/// moving air back to rest. Wall faces keep their value.
 #[test]
-fn wind_accelerates_every_non_wall_face_uniformly() {
+fn wind_relaxes_towards_its_velocity_without_overshoot() {
     let gpu = gpu();
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
-    let c = StepConstants {
-        wind: [0.5, 0.0, -1.0],
-        ..StepConstants::new(CELLS, 0.1, 0.125)
-    };
-    let zero: [Vec<f32>; 3] = std::array::from_fn(|a| vec![0.0; face_dims(CELLS, a).voxel_count()]);
-    let velocity = upload_staggered(&gpu, &mut pool, CELLS, &zero);
-    let u = Uniforms::new(&gpu, &c).unwrap();
-    for _ in 0..4 {
+    let target = [1.0f32, 0.0, 1.0];
+    let start: [Vec<f32>; 3] = std::array::from_fn(|a| {
+        (0..face_dims(CELLS, a).voxel_count())
+            .map(|n| if n % 2 == 0 { 0.0 } else { 3.0 })
+            .collect()
+    });
+    for h in [0.01f32, 0.5, 5.0] {
+        let c = StepConstants {
+            wind_velocity: target,
+            wind_rate: 1.0,
+            ..StepConstants::new(CELLS, h, 0.125)
+        };
+        let velocity = upload_staggered(&gpu, &mut pool, CELLS, &start);
+        let u = Uniforms::new(&gpu, &c).unwrap();
         let mut batch = ComputeBatch::new();
         wind(&gpu, &mut cache, &mut batch, &u, &velocity, None).unwrap();
         batch.submit(&gpu).unwrap();
-    }
-    let got = read_staggered(&gpu, &velocity);
-    for (a, rate) in [(0usize, 0.5f32), (1, 0.0), (2, -1.0)] {
-        let d = face_dims(CELLS, a);
-        for k in 0..d.z {
-            for j in 0..d.y {
-                for i in 0..d.x {
-                    let want = if is_wall(CELLS, a, [i, j, k][a]) {
-                        0.0
-                    } else {
-                        4.0 * 0.1 * rate
-                    };
-                    let v = got[a][index(d, i, j, k)];
-                    assert!(
-                        (v - want).abs() <= 1e-6,
-                        "face {a} {:?}: {v} vs {want}",
-                        [i, j, k]
-                    );
+        let got = read_staggered(&gpu, &velocity);
+        let blend = 1.0 - (-h).exp();
+        for (a, &w) in target.iter().enumerate() {
+            let d = face_dims(CELLS, a);
+            for k in 0..d.z {
+                for j in 0..d.y {
+                    for i in 0..d.x {
+                        let n = index(d, i, j, k);
+                        let (u0, v) = (start[a][n], got[a][n]);
+                        if is_wall(CELLS, a, [i, j, k][a]) {
+                            assert_eq!(v, u0, "h {h}: wall face {a} {:?}", [i, j, k]);
+                            continue;
+                        }
+                        let want = u0 + (w - u0) * blend;
+                        assert!(
+                            (v - want).abs() <= 1e-6,
+                            "h {h}: face {a} {:?}: {v} vs {want}",
+                            [i, j, k]
+                        );
+                        assert!(
+                            u0.min(w) <= v && v <= u0.max(w),
+                            "h {h}: face {a} {:?}: {v} outside [{u0}, {w}]",
+                            [i, j, k]
+                        );
+                    }
                 }
             }
         }
+        pool.release_staggered(velocity);
     }
 }

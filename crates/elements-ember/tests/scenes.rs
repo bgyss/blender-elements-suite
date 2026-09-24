@@ -334,9 +334,10 @@ fn the_solver_runs_velocity_emission_and_wind() {
     }
     state.release_to(&mut pool);
 
-    // Wind alone: 2 m/s² along +z.
+    // Wind alone: air relaxing towards 2 m/s along +z at 5/s.
     let windy = StepConstants {
-        wind: [0.0, 0.0, 2.0],
+        wind_velocity: [0.0, 0.0, 2.0],
+        wind_rate: 5.0,
         ..constants
     };
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();

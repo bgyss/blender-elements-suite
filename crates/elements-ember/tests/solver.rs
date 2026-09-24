@@ -73,7 +73,16 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(
         serde_json::json!({ "temperature_dissipation": 1e39 })
     ));
-    assert!(rejected(serde_json::json!({ "wind": [1e39, 0.0, 0.0] })));
+    assert!(rejected(
+        serde_json::json!({ "wind_velocity": [1e39, 0.0, 0.0] })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "wind_velocity": [1.0, 0.0, 0.0], "wind_rate": 1.0 })
+    ));
+    assert!(rejected(serde_json::json!({ "wind_rate": -1.0 })));
+    // JSON has no NaN; a number too large for f32 is the non-finite value a
+    // document can hold.
+    assert!(rejected(serde_json::json!({ "wind_rate": 1e39 })));
     assert!(!rejected(
         serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 64 })
     ));
@@ -86,6 +95,20 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(serde_json::json!({ "pressure_solver": "jacobi" })));
     assert!(rejected(serde_json::json!({ "pressure_cycles": 0 })));
     assert!(rejected(serde_json::json!({ "pressure_cycles": 65 })));
+}
+
+/// 2b-3c spec §6: `wind` was an acceleration and is gone. A document still
+/// using it must fail, and the message must name what replaced it.
+#[test]
+fn the_old_wind_parameter_is_rejected_with_its_replacements() {
+    let err = resolve_params(&serde_json::json!({ "wind": [0.5, 0.0, 0.0] })).unwrap_err();
+    let DocError::BadParams { reason, .. } = &err else {
+        panic!("expected BadParams, got {err:?}");
+    };
+    assert!(
+        reason.contains("wind_velocity") && reason.contains("wind_rate"),
+        "{reason}"
+    );
 }
 
 /// Spec §6: a preset fills only the fields a document leaves unset, and
@@ -121,7 +144,8 @@ fn step_constants_carry_every_solver_parameter() {
         "advection": "semi_lagrangian", "vorticity": 3.0,
         "density_dissipation": 0.5, "temperature_dissipation": 0.25,
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
-        "boundaries": { "-x": "open" }, "wind": [0.5, 0.0, -1.0]
+        "boundaries": { "-x": "open" },
+        "wind_velocity": [0.5, 0.0, -1.0], "wind_rate": 2.5
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -132,7 +156,8 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.alpha, 0.75);
     assert_eq!(c.beta, 2.0);
     assert_eq!(c.open_mask, 0b100001);
-    assert_eq!(c.wind, [0.5, 0.0, -1.0]);
+    assert_eq!(c.wind_velocity, [0.5, 0.0, -1.0]);
+    assert_eq!(c.wind_rate, 2.5);
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.
@@ -1141,6 +1166,7 @@ fn plume_32_divergence_rms(solver: &str) -> f64 {
         density: &density,
         faces: &faces,
         solid: &[],
+        open_mask: elements_ember::boundaries::DEFAULT_OPEN_MASK,
     });
     eprintln!("{solver}: {m:?}");
     assert!(m.measured_cells > 0, "the plume must be measured");

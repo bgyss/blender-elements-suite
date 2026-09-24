@@ -61,7 +61,7 @@ fn frames_csv(frames: &[FrameMetrics]) -> String {
     let opt = |v: Option<f64>| v.map(|v| v.to_string()).unwrap_or_default();
     let mut out = String::from(
         "frame,divergence_max,divergence_rms,kinetic_energy,vorticity,measured_cells,\
-         mass,mass_below,centroid_m,top_m,outflow_rate\n",
+         mass,mass_inside,centroid_m,top_m,outflow_rate\n",
     );
     for (n, f) in frames.iter().enumerate() {
         let _ = writeln!(
@@ -74,7 +74,7 @@ fn frames_csv(frames: &[FrameMetrics]) -> String {
             f.vorticity,
             f.measured_cells,
             f.mass,
-            f.mass_below,
+            f.mass_inside,
             opt(f.centroid_m),
             opt(f.top_m),
             f.outflow_rate,
@@ -306,9 +306,9 @@ fn row(s: &RunSummary) -> String {
         (f.measured_cells > 0 && smoky(f)).then(|| v / f.measured_cells as f64)
     };
     // drift[0] is the last emitting frame, and the percentage is of the mass
-    // below the outflow plane then.
+    // inside the outflow planes then.
     let cut_off = REPORT_FRAMES[0];
-    let base = at(cut_off).map_or(0.0, |f| f.mass_below);
+    let base = at(cut_off).map_or(0.0, |f| f.mass_inside);
     let drift_at = |frame: usize| match s.drift.get(frame - cut_off) {
         Some(&d) if base > 0.0 => format!("{} ({:+.1}%)", sig(d), 100.0 * d / base),
         Some(&d) => format!("{} (—)", sig(d)),
@@ -338,8 +338,8 @@ fn row(s: &RunSummary) -> String {
 }
 
 /// For a run whose outflow rate is non-zero at or before `frame` (1-based):
-/// the first such frame, and the share of the frame-60 mass below the
-/// outflow plane that the drift at `frame` credits as outflow, which rests
+/// the first such frame, and the share of the frame-60 mass inside the
+/// outflow planes that the drift at `frame` credits as outflow, which rests
 /// on the frame-resolution outflow estimate. `None` when no outflow has
 /// started by then.
 fn early_outflow(s: &RunSummary, frame: usize) -> Option<String> {
@@ -350,13 +350,13 @@ fn early_outflow(s: &RunSummary, frame: usize) -> Option<String> {
         .take(frame)
         .position(|f| f.outflow_rate != 0.0)?
         + 1;
-    let below = |n: usize| s.frames.get(n - 1).map(|f| f.mass_below);
+    let inside = |n: usize| s.frames.get(n - 1).map(|f| f.mass_inside);
     let (Some(d), Some(then), Some(now)) =
-        (s.drift.get(frame - cut_off), below(cut_off), below(frame))
+        (s.drift.get(frame - cut_off), inside(cut_off), inside(frame))
     else {
         return Some(format!("; outflow from frame {first}"));
     };
-    // drift = mass_below(frame) + outflow − mass_below(60).
+    // drift = mass_inside(frame) + outflow − mass_inside(60).
     let outflow = d - (now - then);
     if then > 0.0 {
         Some(format!(
@@ -413,16 +413,17 @@ differ too, and the kinetic energy and vorticity totals partly measure that size
 divided by the measured-cell count are the fairer comparison.\n\
 - **Near-empty domains.** Where a frame's mass is below {floor:e}, its centroid, top and \
 per-cell values are shown as —, since they would describe a few stray cells.\n\
-- **Wind.** Mantaflow's wind field acts only on cells that hold smoke; Ember's wind \
-accelerates every cell. `plume_wind` compares the plume's shape, not a matched force field.\n\
+- **Wind.** Mantaflow's wind field acts only on cells that hold smoke; Ember's air relaxes \
+towards the ambient airflow in every cell. `plume_wind` compares the plume's shape, not a matched force field.\n\
 - **Heat.** Mantaflow's emitter heat is held at a set value (Ember's emitter-centre heat at \
 frame 24), not added at Ember's rate, so Mantaflow's emitter is hotter before frame 24 and \
 cooler after it. Plume centroid and top carry that difference. {emitted}\n\
 - **Pressure.** Mantaflow solves with multigrid-preconditioned conjugate gradients to a \
 tolerance; Ember runs a fixed count of red-black Gauss–Seidel iterations.\n\
-- **Drift** is (mass below the outflow plane + outflow since frame 60) − that mass at frame \
-60, with outflow estimated at frame resolution as the net upwind flux through the z-faces two \
-cells below the top, and mass summed over the layers below them (spec §4.3). Emission stops \
+- **Drift** is (mass inside the outflow planes + outflow since frame 60) − that mass at frame \
+60, with outflow estimated at frame resolution as the net upwind flux out through a plane two \
+cells in from each open face (the top, and in `plume_wind` both x sides), and mass summed \
+over the cells inside those planes (2b-3 spec §4.3, 2b-3c spec §6). Emission stops \
 after frame 60, so a perfect solver drifts 0. Where no outflow has started by frame 80, drift \
 at 80 is mass gained or lost inside the domain. Where it has, the frame-80 cell names the \
 first frame whose outflow rate is non-zero and the share of the frame-60 mass that the \

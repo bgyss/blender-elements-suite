@@ -102,6 +102,9 @@ pub struct Sample<'a> {
     pub faces: &'a [Vec<f32>; 3],
     /// One entry per cell, true inside a collider; empty when there is none.
     pub solid: &'a [bool],
+    /// The domain's open faces, as `Boundaries::open_mask` gives them. Each
+    /// one gets an outflow plane (2b-3c spec §6).
+    pub open_mask: u32,
 }
 
 /// Everything the benchmark reports about one frame (spec §4).
@@ -122,14 +125,20 @@ pub struct FrameMetrics {
     pub measured_cells: u64,
     /// Σ ρ dV over every cell, density × m³.
     pub mass: f64,
-    /// Σ ρ dV over cell layers 0 … nz − 3, below the outflow plane (spec §4.3).
-    pub mass_below: f64,
+    /// Σ ρ dV over the control volume: every cell except the two outer
+    /// layers at each open face, so inside every outflow plane (2b-3 spec
+    /// §4.3, 2b-3c spec §6). With only the top open, layers 0 … nz − 3.
+    /// 2b-3's result files call it `mass_below`.
+    #[serde(alias = "mass_below")]
+    pub mass_inside: f64,
     /// Density-weighted mean height, metres.
     pub centroid_m: Option<f64>,
     /// Height below which 95% of the above-threshold density lies, metres.
     pub top_m: Option<f64>,
-    /// Net upwind flux of density through the z-faces at index nz − 2,
-    /// density × m³ / s; positive leaves the control volume.
+    /// Net upwind flux of density out of the control volume, density × m³
+    /// / s, positive leaving: through the faces two cells in from each open
+    /// face (for the top, z-faces at index nz − 2; for −x, x-faces at index
+    /// 2), each plane spanning the control volume's cross-section.
     pub outflow_rate: f64,
 }
 
@@ -187,8 +196,8 @@ fn measured(sample: &Sample<'_>, i: u32, j: u32, k: u32) -> bool {
 /// # Panics
 ///
 /// If the arrays do not match `cells` (with `solid` allowed to be empty),
-/// or the grid has fewer than three layers, which the outflow plane at
-/// z-face index nz − 2 needs.
+/// if an open face's axis has fewer than three layers, which its outflow
+/// plane two faces in needs, or if the planes leave no control volume.
 pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
     let c = sample.cells;
     let dx = sample.dx;
@@ -207,7 +216,22 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
             "axis {axis} faces do not match the cells"
         );
     }
-    assert!(c.z >= 3, "the outflow plane needs at least three layers");
+    // The control volume is lo ≤ index < hi on each axis: two layers in from
+    // each open face.
+    let dims = [c.x, c.y, c.z];
+    let open = |axis: usize, side: usize| (sample.open_mask >> (2 * axis + side)) & 1 == 1;
+    for (axis, &n) in dims.iter().enumerate() {
+        assert!(
+            !(open(axis, 0) || open(axis, 1)) || n >= 3,
+            "an outflow plane on axis {axis} needs at least three layers"
+        );
+    }
+    let lo: [u32; 3] = std::array::from_fn(|a| if open(a, 0) { 2 } else { 0 });
+    let hi: [u32; 3] = std::array::from_fn(|a| if open(a, 1) { dims[a] - 2 } else { dims[a] });
+    assert!(
+        (0..3).all(|a| lo[a] < hi[a]),
+        "the outflow planes leave no control volume"
+    );
 
     // Velocity, over measured cells.
     let centre = cell_centred(sample.faces, c);
@@ -246,17 +270,21 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
     };
 
     // Density, over every cell. Per-layer sums serve the mass, the control
-    // volume below the outflow plane, and the plume top.
+    // volume, and the plume top.
     let rho = |i: u32, j: u32, k: u32| sample.density[at(c, i, j, k)] as f64;
     let peak = sample.density.iter().fold(0.0f64, |m, &r| m.max(r as f64));
     let cut = 0.01 * peak;
     let mut layer_mass = vec![0.0f64; c.z as usize];
+    let mut layer_inside = vec![0.0f64; c.z as usize];
     let mut layer_above_cut = vec![0.0f64; c.z as usize];
     for k in 0..c.z {
         for j in 0..c.y {
             for i in 0..c.x {
                 let r = rho(i, j, k);
                 layer_mass[k as usize] += r;
+                if (lo[0]..hi[0]).contains(&i) && (lo[1]..hi[1]).contains(&j) {
+                    layer_inside[k as usize] += r;
+                }
                 if r >= cut {
                     layer_above_cut[k as usize] += r;
                 }
@@ -264,7 +292,10 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
         }
     }
     let mass = layer_mass.iter().sum::<f64>() * dv;
-    let mass_below = layer_mass[..(c.z - 2) as usize].iter().sum::<f64>() * dv;
+    let mass_inside = layer_inside[lo[2] as usize..hi[2] as usize]
+        .iter()
+        .sum::<f64>()
+        * dv;
     let top_m = (peak > 0.0).then(|| {
         let total: f64 = layer_above_cut.iter().sum();
         let mut cumulative = 0.0;
@@ -279,18 +310,39 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
         top
     });
 
-    // Net upwind flux through the z-faces at index nz − 2.
-    let plane = c.z - 2;
+    // Net upwind flux out through each open face's plane. The plane spans
+    // the control volume on the other two axes; `b` is the slower-varying
+    // of them, so the top plane sums rows of x within y as it always has.
     let mut flux = 0.0f64;
-    for j in 0..c.y {
-        for i in 0..c.x {
-            let w = sample.faces[2][at(grids[2], i, j, plane)] as f64;
-            let upwind = if w > 0.0 {
-                rho(i, j, plane - 1)
-            } else {
-                rho(i, j, plane)
-            };
-            flux += upwind * w;
+    for axis in 0..3 {
+        let (a, b) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        for side in 0..2 {
+            if !open(axis, side) {
+                continue;
+            }
+            let plane = if side == 1 { dims[axis] - 2 } else { 2 };
+            for q in lo[b]..hi[b] {
+                for p in lo[a]..hi[a] {
+                    let mut f = [0u32; 3];
+                    f[axis] = plane;
+                    f[a] = p;
+                    f[b] = q;
+                    let u = sample.faces[axis][at(grids[axis], f[0], f[1], f[2])] as f64;
+                    // The cell on the face's low side, and the one on its high side.
+                    let mut below = f;
+                    below[axis] -= 1;
+                    let upwind = if u > 0.0 {
+                        rho(below[0], below[1], below[2])
+                    } else {
+                        rho(f[0], f[1], f[2])
+                    };
+                    flux += if side == 1 { upwind * u } else { -(upwind * u) };
+                }
+            }
         }
     }
 
@@ -301,7 +353,7 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
         vorticity,
         measured_cells,
         mass,
-        mass_below,
+        mass_inside,
         centroid_m: centroid_z(sample.density, c).map(|z| z * dx),
         top_m,
         outflow_rate: flux * dx * dx,
@@ -310,7 +362,7 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
 
 /// Mass drift at every frame index from `from` (0-based into the series),
 /// spec §4.3: (M(n) + outflow integrated from `from` to n) − M(from), where
-/// M is [`FrameMetrics::mass_below`] and the outflow rates are integrated
+/// M is [`FrameMetrics::mass_inside`] and the outflow rates are integrated
 /// over `frame_seconds` per frame with the trapezoid rule. Entries before
 /// `from` are 0.
 ///
