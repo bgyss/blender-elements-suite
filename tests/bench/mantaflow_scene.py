@@ -57,8 +57,7 @@ def build_domain(sc: dict, cache_dir: str) -> bpy.types.Object:
     # vorticity) hold only for one Mantaflow step per frame.
     if sc["substeps"] != 1:
         sys.exit(
-            f"substeps = {sc['substeps']}: the Mantaflow mappings hold only for "
-            "one step per frame"
+            f"substeps = {sc['substeps']}: the Mantaflow mappings hold only for one step per frame"
         )
     d.timesteps_min = d.timesteps_max = 1
     d.cache_directory = cache_dir
@@ -119,16 +118,20 @@ def build_collider(sc: dict) -> None:
 
 
 def build_wind(sc: dict) -> None:
-    if not any(sc["wind"]):
+    # A scene without wind has no wind_rate, or a rate of 0: no field at all.
+    rate = sc.get("wind_rate", 0.0)
+    if not rate:
         return
     size = sc["domain_size"]
-    strength, direction = mapping.wind(tuple(sc["wind"]), sc["fps"])
+    strength, flow, direction = mapping.wind(
+        tuple(sc.get("wind_velocity", (0.0, 0.0, 0.0))), rate, sc["fps"], size
+    )
     bpy.ops.object.effector_add(type="WIND", location=(size / 2,) * 3)
     wind = bpy.context.active_object
     f = wind.field
     f.shape = "PLANE"
     f.strength = strength
-    f.flow = 0.0  # WIND defaults to 1, which drags towards the smoke's velocity
+    f.flow = flow  # the drag towards the wind's velocity that makes it a relaxation
     # Blender has no "none" falloff: a sphere falloff of power 0 is 1 everywhere,
     # and BOTH keeps both sides of the field's plane.
     f.falloff_type = "SPHERE"

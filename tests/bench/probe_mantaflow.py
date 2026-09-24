@@ -19,8 +19,10 @@ Options, all optional, for the experiments in docs/bench/mantaflow-notes.md:
   alpha=A beta=B    the domain's buoyancy coefficients
   vorticity=V       the domain's vorticity
   wind=S            add a WIND force field of strength S blowing along +x
+  wind_flow=F       that field's flow: drag towards the wind (default 0, off)
   closed=0|1        close all six domain walls (default: Blender's default)
   bench=1           close the sides and floor and leave the top open, as Ember does
+  open=S1,S2,...    then open these borders (left, right, front, back, bottom, top)
   heat_fill=T       add a second flow filling the domain: temperature T, no density
   script=0|1        also export Blender's generated Mantaflow script
 """
@@ -76,6 +78,8 @@ def main() -> None:
         for side in ("front", "back", "right", "left", "bottom"):
             setattr(s, f"use_collision_border_{side}", True)
         s.use_collision_border_top = False
+    for side in filter(None, opts.get("open", "").split(",")):
+        setattr(s, f"use_collision_border_{side}", False)
     if opts.get("script") == "1":
         s.export_manta_script = True
 
@@ -123,7 +127,7 @@ def main() -> None:
         wind = bpy.context.active_object
         wind.rotation_euler = (0.0, math.pi / 2, 0.0)
         wind.field.strength = float(opts["wind"])
-        wind.field.flow = 0.0
+        wind.field.flow = float(opts.get("wind_flow", "0"))
         # Blender has no "none" falloff: a sphere falloff of power 0 is 1 everywhere
         # (effect.cc, falloff_func), and BOTH keeps both sides of the plane.
         wind.field.falloff_type = "SPHERE"
