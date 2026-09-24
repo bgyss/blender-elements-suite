@@ -3,6 +3,10 @@
 
 use std::process::Command;
 
+// Only the benchmark example reads Mantaflow caches.
+#[allow(dead_code)]
+pub mod mantaflow;
+
 pub fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
