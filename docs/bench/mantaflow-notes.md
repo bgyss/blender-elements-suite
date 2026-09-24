@@ -190,9 +190,13 @@ neighbour is solid. Density was never stored as tiles in any frame of either
 bake, so the tile mechanism above cannot apply, and no velocity value of
 exactly (0, 0, 0) was stored anywhere. The `plume` 64³ bake had no such
 cell in any frame. So the reader lists the cells, not the counts, and the
-benchmark accepts a missing cell only at a collider cell or its 26
-neighbours, where 0 is the value's own. Any other missing cell is still an
-error that names the frame and the cell. Mantaflow's obstacle is not
+benchmark accepts a missing cell only by that wall-face rule: on every axis,
+the cell or its −axis neighbour is solid by the mask (a neighbour outside the
+domain is not solid). Every face a metric reads lies between two fluid cells
+by the same mask, so an accepted value is never read, whatever the reason it
+was left out. A cell merely next to the collider is not enough, since its
+faces between fluid cells are read. Any other missing cell is still an error
+that names the frame and the cell. Mantaflow's obstacle is not
 exactly the mask: in 3,940 cell-frames of the same bake, velocity was
 stored, and non-zero, where the mask makes all three faces walls, mostly on
 the sphere's underside (z index 19).

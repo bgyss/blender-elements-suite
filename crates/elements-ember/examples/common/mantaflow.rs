@@ -14,10 +14,12 @@
 //! - `vdb-rs` does not check value types, so the reader checks each grid's
 //!   type string before reading it.
 //! - The writer leaves out a velocity equal to the background, (0, 0, 0),
-//!   even where there is smoke. Against a collider that happens at cells
-//!   whose −x, −y and −z faces are all walls. The reader lists the cells that
-//!   have density but no velocity, and the caller decides whether each is
-//!   such a cell (`unexplained_missing`).
+//!   even where there is smoke, as at a collider. The reader lists the cells
+//!   that have density but no velocity. `check_coverage` accepts one only
+//!   when all three faces it holds are wall faces by the collider mask (the
+//!   cell or its −axis neighbour is solid, on every axis). No metric reads a
+//!   wall face, so the value is never used; any other missing cell is an
+//!   error.
 
 use std::fmt;
 use std::fs::File;
@@ -37,6 +39,8 @@ pub const VEC3_TREE: &str = "Tree_vec3s_5_4_3";
 const TIME_UNIT_S: f64 = 0.4;
 
 pub struct CacheFrame {
+    /// The file the frame was read from, for error messages.
+    pub path: PathBuf,
     pub cells: FieldDims,
     /// x-fastest, at the cell dims; 0 where the cache stores nothing.
     pub density: Vec<f32>,
@@ -45,7 +49,7 @@ pub struct CacheFrame {
     /// Faces the cache does not store, including every face at index n, are 0.
     pub faces: [Vec<f32>; 3],
     /// Cells that store density but no velocity, in x-fastest order. Their
-    /// faces read as 0 in `faces`.
+    /// faces read as 0 in `faces`; `check_coverage` decides if that is safe.
     pub missing_velocity: Vec<[u32; 3]>,
 }
 
@@ -75,6 +79,15 @@ pub enum CacheError {
         grid: String,
         index: [i32; 3],
         cells: [u32; 3],
+    },
+    /// A cell stores density but no velocity, and not every face that value
+    /// holds is a wall face, so a metric could read the missing value as 0.
+    /// `cell` is the first such cell; `count` is how many the frame has.
+    MissingVelocity {
+        path: PathBuf,
+        cell: [u32; 3],
+        density: f32,
+        count: usize,
     },
 }
 
@@ -110,6 +123,18 @@ impl fmt::Display for CacheError {
             } => write!(
                 f,
                 "grid {grid:?} in {} stores index {index:?}, outside a domain of {cells:?} cells",
+                path.display()
+            ),
+            CacheError::MissingVelocity {
+                path,
+                cell: [i, j, k],
+                density,
+                count,
+            } => write!(
+                f,
+                "{} stores density {density:e} but no velocity at cell ({i}, {j}, {k}), \
+                 and not all of that cell's −x, −y and −z faces are collider walls \
+                 ({count} such cells in this frame); the missing velocity would read as 0",
                 path.display()
             ),
         }
@@ -192,6 +217,7 @@ pub fn read_frame_with(
     }
 
     Ok(CacheFrame {
+        path: path.to_owned(),
         cells,
         density,
         faces,
@@ -275,44 +301,62 @@ fn missing_cells(has_density: &[bool], has_velocity: &[bool], cells: FieldDims) 
         .collect()
 }
 
-/// The missing-velocity cells that are neither a collider cell nor one of a
-/// collider cell's 26 neighbours, by `solid` (x-fastest over `cells`; empty
-/// for no collider).
+/// Check that every missing-velocity cell of `frame` is safe to read as 0,
+/// by the collider mask `solid` (x-fastest over `cells`; empty for no
+/// collider). Returns how many cells it accepted.
 ///
-/// Next to a collider, a cell's −x, −y and −z faces can all be walls, so its
-/// stored velocity is (0, 0, 0), which the writer leaves out because it
-/// equals the background (notes: Clipping). Reading it as 0 is then its true
-/// value. Anywhere else a missing value is lost data (notes: tiles can drop
-/// values from the other grids).
-pub fn unexplained_missing(
-    missing: &[[u32; 3]],
+/// A cell is accepted only when, on every axis, the cell or its −axis
+/// neighbour is solid: all three faces its value holds (the −x, −y and −z
+/// faces) are then wall faces. Every face a metric reads lies between two
+/// fluid cells by the same mask, so an accepted value is never read. A
+/// neighbour outside the domain is not solid. The writer omits a velocity
+/// of (0, 0, 0), which is what walls give (notes: Clipping); a missing cell
+/// anywhere else could be lost data (notes: tiles can drop values from the
+/// other grids).
+pub fn check_coverage(
+    frame: &CacheFrame,
     solid: &[bool],
     cells: FieldDims,
-) -> Vec<[u32; 3]> {
+) -> Result<usize, CacheError> {
     let dims = [cells.x, cells.y, cells.z].map(i64::from);
     let is_solid = |c: [i64; 3]| {
-        (0..3).all(|a| (0..dims[a]).contains(&c[a]))
+        !solid.is_empty()
+            && (0..3).all(|a| (0..dims[a]).contains(&c[a]))
             && solid[(c[0] + dims[0] * (c[1] + dims[1] * c[2])) as usize]
     };
-    let near_collider = |c: [u32; 3]| {
+    let walls_only = |c: [u32; 3]| {
         let c = c.map(i64::from);
-        (-1..=1).any(|dk| {
-            (-1..=1).any(|dj| (-1..=1).any(|di| is_solid([c[0] + di, c[1] + dj, c[2] + dk])))
+        (0..3).all(|a| {
+            let mut below = c;
+            below[a] -= 1;
+            is_solid(c) || is_solid(below)
         })
     };
-    if solid.is_empty() {
-        return missing.to_vec();
-    }
-    missing
+    let unexplained: Vec<[u32; 3]> = frame
+        .missing_velocity
         .iter()
         .copied()
-        .filter(|&c| !near_collider(c))
-        .collect()
+        .filter(|&c| !walls_only(c))
+        .collect();
+    match unexplained.first() {
+        None => Ok(frame.missing_velocity.len()),
+        Some(&cell) => {
+            let [i, j, k] = cell;
+            Err(CacheError::MissingVelocity {
+                path: frame.path.clone(),
+                cell,
+                density: frame.density[(i + cells.x * (j + cells.y * k)) as usize],
+                count: unexplained.len(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_cells, unexplained_missing};
+    use std::path::PathBuf;
+
+    use super::{CacheError, CacheFrame, check_coverage, missing_cells};
     use elements_core::gpu::FieldDims;
 
     const CELLS: FieldDims = FieldDims { x: 4, y: 4, z: 4 };
@@ -343,40 +387,90 @@ mod tests {
         assert_eq!(missing_cells(&d, &d, CELLS), Vec::<[u32; 3]>::new());
     }
 
+    /// A 4³ frame with density 0.5 everywhere and these cells missing.
+    fn frame(missing: &[[u32; 3]]) -> CacheFrame {
+        CacheFrame {
+            path: PathBuf::from("frame.vdb"),
+            cells: CELLS,
+            density: vec![0.5; 64],
+            faces: [vec![0.0; 80], vec![0.0; 80], vec![0.0; 80]],
+            missing_velocity: missing.to_vec(),
+        }
+    }
+
+    fn rejected(result: Result<usize, CacheError>) -> ([u32; 3], usize) {
+        match result {
+            Err(CacheError::MissingVelocity { cell, count, .. }) => (cell, count),
+            other => panic!("expected MissingVelocity, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_collider_cell_or_its_neighbour_is_explained() {
+    fn a_missing_solid_cell_is_accepted() {
         let solid = mask(&[[1, 1, 1]]);
-        // The cell itself, a face neighbour and a corner neighbour.
-        let missing = [[1, 1, 1], [2, 1, 1], [2, 2, 2], [0, 0, 0]];
-        assert_eq!(
-            unexplained_missing(&missing, &solid, CELLS),
-            Vec::<[u32; 3]>::new()
-        );
+        let f = frame(&[[1, 1, 1]]);
+        assert_eq!(check_coverage(&f, &solid, CELLS).unwrap(), 1);
     }
 
     #[test]
-    fn a_cell_two_away_from_the_collider_is_unexplained() {
+    fn a_fluid_cell_whose_faces_are_all_walls_is_accepted() {
+        // (1, 1, 1) is fluid, but its −x, −y and −z neighbours are solid.
+        let solid = mask(&[[0, 1, 1], [1, 0, 1], [1, 1, 0]]);
+        let f = frame(&[[1, 1, 1]]);
+        assert_eq!(check_coverage(&f, &solid, CELLS).unwrap(), 1);
+    }
+
+    #[test]
+    fn one_fluid_face_rejects_a_cell_next_to_the_collider() {
+        // Walls on two axes; the third face, between fluid cells, is read.
+        let walls = [[0, 1, 1], [1, 0, 1], [1, 1, 0]];
+        for fluid in 0..3 {
+            let others: Vec<[u32; 3]> = (0..3).filter(|&a| a != fluid).map(|a| walls[a]).collect();
+            let f = frame(&[[1, 1, 1]]);
+            assert_eq!(
+                rejected(check_coverage(&f, &mask(&others), CELLS)),
+                ([1, 1, 1], 1),
+                "axis {fluid} fluid"
+            );
+        }
+    }
+
+    #[test]
+    fn a_diagonal_neighbour_of_the_collider_is_rejected() {
         let solid = mask(&[[0, 0, 0]]);
-        let missing = [[1, 1, 1], [2, 0, 0], [0, 3, 0]];
-        assert_eq!(
-            unexplained_missing(&missing, &solid, CELLS),
-            vec![[2, 0, 0], [0, 3, 0]]
-        );
-    }
-
-    #[test]
-    fn without_a_collider_every_missing_cell_is_unexplained() {
-        let missing = [[1, 1, 1]];
-        assert_eq!(unexplained_missing(&missing, &[], CELLS), vec![[1, 1, 1]]);
+        let f = frame(&[[0, 0, 0], [1, 1, 1], [2, 0, 0]]);
+        assert_eq!(rejected(check_coverage(&f, &solid, CELLS)), ([1, 1, 1], 2));
     }
 
     #[test]
     fn a_neighbour_past_the_domain_edge_is_not_solid() {
-        // (3, 3, 3)'s neighbours past the edge must not wrap to (0, ...).
-        let solid = mask(&[[0, 3, 3]]);
+        // (0, 1, 1)'s −x neighbour (−1, 1, 1) would wrap to (3, 0, 1).
+        let solid = mask(&[[3, 0, 1], [0, 0, 1], [0, 1, 0]]);
+        let f = frame(&[[0, 1, 1]]);
+        assert_eq!(rejected(check_coverage(&f, &solid, CELLS)), ([0, 1, 1], 1));
+    }
+
+    #[test]
+    fn without_a_collider_a_missing_cell_is_rejected() {
+        let f = frame(&[[1, 1, 1]]);
+        assert_eq!(rejected(check_coverage(&f, &[], CELLS)), ([1, 1, 1], 1));
+    }
+
+    #[test]
+    fn no_missing_cells_is_fine_with_or_without_a_collider() {
+        assert_eq!(check_coverage(&frame(&[]), &[], CELLS).unwrap(), 0);
         assert_eq!(
-            unexplained_missing(&[[3, 3, 3]], &solid, CELLS),
-            vec![[3, 3, 3]]
+            check_coverage(&frame(&[]), &mask(&[[1, 1, 1]]), CELLS).unwrap(),
+            0
         );
+    }
+
+    #[test]
+    fn the_error_names_the_file_the_cell_and_its_density() {
+        let e = check_coverage(&frame(&[[1, 2, 3]]), &[], CELLS).unwrap_err();
+        let text = e.to_string();
+        for part in ["frame.vdb", "(1, 2, 3)", "5e-1", "1 such cells"] {
+            assert!(text.contains(part), "{text:?} lacks {part:?}");
+        }
     }
 }

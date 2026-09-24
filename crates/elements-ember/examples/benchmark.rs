@@ -346,24 +346,10 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
         let path = out.join(format!("cache/data/fluid_data_{n:04}.vdb"));
         let f = common::mantaflow::read_frame(&path, cells, dx)
             .map_err(|e| context(with_stderr(e, &tail)))?;
-        // Velocity left out at the collider is a (0, 0, 0) the writer does
-        // not store; anywhere else it is lost data (notes: Clipping).
-        let unexplained =
-            common::mantaflow::unexplained_missing(&f.missing_velocity, &solid, cells);
-        if let Some(&[i, j, k]) = unexplained.first() {
-            let d = f.density[(i + cells.x * (j + cells.y * k)) as usize];
-            return Err(context(with_stderr(
-                format!(
-                    "{} stores density {d:e} but no velocity at cell ({i}, {j}, {k}), \
-                     which is not a collider cell or next to one ({} such cells in \
-                     this frame); missing velocity would read as 0",
-                    path.display(),
-                    unexplained.len()
-                ),
-                &tail,
-            )));
-        }
-        omitted += f.missing_velocity.len();
+        // A missing velocity is accepted only where every face it holds
+        // is a collider wall, which no metric reads (notes: Clipping).
+        omitted += common::mantaflow::check_coverage(&f, &solid, cells)
+            .map_err(|e| context(with_stderr(format!("frame {n}: {e}"), &tail)))?;
         frames.push(measure(&Sample {
             cells,
             dx,
@@ -374,8 +360,8 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     }
     if omitted > 0 {
         eprintln!(
-            "mantaflow {name} {res}³: {omitted} cell-frames at the collider store density \
-             but no velocity; read as 0, their true value"
+            "mantaflow {name} {res}³: {omitted} cell-frames store density but no velocity, \
+             all at collider wall faces, which no metric reads"
         );
     }
     let summary = RunSummary {
