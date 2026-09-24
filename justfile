@@ -66,3 +66,19 @@ bench-sweep iterations="160,240,320,400,480,560,640":
 # Takes minutes, needs the real GPU, and is not part of `check`.
 bench-presets:
     cargo run --release -p elements-ember --example presets
+
+# The Mantaflow benchmark (2b-3 spec). Takes about an hour or more, needs the
+# real GPU and Blender, and is not part of `check`. Writes
+# docs/bench/results/ per run, then docs/bench/results.md from a complete set.
+bench scenes="plume plume_collider plume_wind" resolutions="64 128 256":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p elements-ember --example benchmark
+    B=target/release/examples/benchmark
+    for res in {{resolutions}}; do
+      for scene in {{scenes}}; do
+        "$B" ember "$scene" "$res"
+        "$B" mantaflow "$scene" "$res"
+      done
+    done
+    "$B" report

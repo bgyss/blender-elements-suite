@@ -233,3 +233,83 @@ fn the_mantaflow_json_carries_every_matched_parameter() {
     assert_eq!(w["wind"], serde_json::json!([0.5, 0.0, 0.0]));
     assert!(Scene::plume(64).mantaflow_json()["collider"].is_null());
 }
+
+/// A run with 120 frames of made-up metrics; only the shape matters to the
+/// results table.
+fn summary(solver: &str, scene: &str, res: u32) -> report::RunSummary {
+    let frames = (1..=120)
+        .map(|n| {
+            let n = f64::from(n);
+            FrameMetrics {
+                divergence_max: 1e-3 * n,
+                divergence_rms: 1e-4 * n,
+                kinetic_energy: 0.01 * n,
+                vorticity: 0.02 * n,
+                measured_cells: 50 * n as u64,
+                mass: 0.001 * n,
+                mass_below: 0.0009 * n,
+                centroid_m: Some(0.01 * n),
+                top_m: Some(0.015 * n),
+                outflow_rate: 0.0,
+            }
+        })
+        .collect();
+    report::RunSummary {
+        solver: solver.into(),
+        scene: scene.into(),
+        resolution: res,
+        runs: if res >= 256 { 1 } else { 3 },
+        frame_ms_median: 10.0,
+        frame_ms_min: 9.0,
+        frame_ms_max: 12.0,
+        peak_bytes: 64 << 20,
+        load_before: 1.0,
+        load_after: 1.5,
+        blender: (solver == "mantaflow").then(|| "5.2.2 LTS".to_owned()),
+        frames,
+        drift: vec![0.0; 61],
+    }
+}
+
+fn all() -> Vec<report::RunSummary> {
+    let mut v = Vec::new();
+    for solver in report::SOLVERS {
+        for scene in report::SCENES {
+            for res in report::RESOLUTIONS {
+                v.push(summary(solver, scene, res));
+            }
+        }
+    }
+    v
+}
+
+fn context() -> report::Context {
+    report::Context {
+        machine: "Apple M-test".into(),
+        os: "macOS 99.1".into(),
+        commit: "abc1234".into(),
+        blender: "5.2.2 LTS".into(),
+        date: "2026-09-23".into(),
+    }
+}
+
+#[test]
+fn the_results_table_needs_every_run() {
+    let ctx = context();
+    let mut s = all();
+    s.retain(|r| !(r.solver == "mantaflow" && r.scene == "plume_wind" && r.resolution == 256));
+    let missing = report::results_markdown(&s, &ctx).unwrap_err();
+    assert_eq!(missing, vec!["mantaflow-plume_wind-256".to_owned()]);
+}
+
+#[test]
+fn the_results_table_has_one_section_per_scene_and_names_run_counts() {
+    let ctx = context();
+    let md = report::results_markdown(&all(), &ctx).unwrap();
+    for scene in report::SCENES {
+        assert!(md.contains(&format!("## `{scene}`")), "{scene}");
+    }
+    assert!(md.contains("1 run"), "256³ says it is one run");
+    assert!(md.contains("median of 3"), "64³ and 128³ say three");
+    assert!(md.contains(&ctx.commit) && md.contains(&ctx.blender));
+}

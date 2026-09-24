@@ -4,35 +4,38 @@
 //!   benchmark ember SCENE RES      time and measure Ember
 //!   benchmark scene-json SCENE RES print the scene's Mantaflow twin as JSON,
 //!                                  for tests/bench/mantaflow_scene.py
-//!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow (Task 8)
-//!   benchmark report               build docs/bench/results.md (Task 8)
+//!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow in
+//!                                  Blender ($BLENDER_BIN, or the macOS app)
+//!   benchmark report               build docs/bench/results.md
 //!
 //! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv.
 
-// The report mode (Task 8) uses the rest of the shared helpers.
-#[allow(dead_code)]
 mod common;
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
-use elements_core::gpu::{Axis, FieldPool, GpuContext, PipelineCache};
+use elements_core::gpu::{Axis, FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
-use elements_ember::bench::report::{RunSummary, load_average, write_summary};
+use elements_ember::bench::report::{
+    Context, RunSummary, load_average, results_markdown, write_summary,
+};
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
 use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
 use elements_ember::solver;
 
-use common::median;
+use common::{commit_label, median, shell};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
 fn results_dir() -> PathBuf {
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/bench/results"
-    ))
+    workspace().join("docs/bench/results")
+}
+
+fn workspace() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }
 
 fn scene(name: &str, res: u32) -> Res<Scene> {
@@ -139,10 +142,6 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
     let load_after = load_average();
     eprintln!("ember {name} {res}³: metrics run");
     let frames = metrics_run(&gpu, &registry, &scene)?;
-    // The 0-based index of the last emitting frame, so `drift[0]` is frame 60.
-    let from = (EMISSION_FRAMES[1] - 1) as usize;
-    let mass: Vec<f64> = frames.iter().map(|f| f.mass_below).collect();
-    let outflow: Vec<f64> = frames.iter().map(|f| f.outflow_rate).collect();
     let summary = RunSummary {
         solver: "ember".into(),
         scene: name.into(),
@@ -155,11 +154,221 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
         load_before,
         load_after,
         blender: None,
-        drift: drift(&mass, &outflow, 1.0 / scene.fps, from)[from..].to_vec(),
+        drift: drift_from_cut_off(&frames, scene.fps),
         frames,
     };
     write_summary(&results_dir(), &summary)?;
     Ok(())
+}
+
+/// Drift from the last emitting frame on, so `drift[0]` is frame 60.
+fn drift_from_cut_off(frames: &[FrameMetrics], fps: f64) -> Vec<f64> {
+    let from = (EMISSION_FRAMES[1] - 1) as usize;
+    let mass: Vec<f64> = frames.iter().map(|f| f.mass_below).collect();
+    let outflow: Vec<f64> = frames.iter().map(|f| f.outflow_rate).collect();
+    drift(&mass, &outflow, 1.0 / fps, from)[from..].to_vec()
+}
+
+fn blender() -> String {
+    std::env::var("BLENDER_BIN")
+        .unwrap_or_else(|_| "/Applications/Blender.app/Contents/MacOS/Blender".to_owned())
+}
+
+/// Run the scene script under `/usr/bin/time -l`, returning peak resident
+/// bytes. `-l` prints "maximum resident set size" in bytes on macOS.
+fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<u64> {
+    let script = workspace().join("tests/bench/mantaflow_scene.py");
+    let mut cmd = Command::new("/usr/bin/time");
+    cmd.arg("-l")
+        .arg(blender())
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+        ])
+        .arg("--python")
+        .arg(&script)
+        .arg("--")
+        .arg(scene_json)
+        .arg(out);
+    if no_bake {
+        cmd.arg("--no-bake");
+    }
+    let output = cmd.output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let tail: Vec<&str> = stderr.lines().rev().take(40).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(format!(
+            "Blender exited with {}; stderr ends:\n{}",
+            output.status,
+            tail.join("\n")
+        )
+        .into());
+    }
+    stderr
+        .lines()
+        .find(|l| l.contains("maximum resident set size"))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| "no \"maximum resident set size\" in /usr/bin/time -l output".into())
+}
+
+/// `timings.json` from the scene script.
+#[derive(serde::Deserialize)]
+struct Timings {
+    frames: Vec<FrameTime>,
+    blender: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FrameTime {
+    frame: u32,
+    mtime_ns: u128,
+}
+
+/// Each frame's time in ms from consecutive cache-file modification times,
+/// frames 2 onwards (notes: Timing).
+fn frame_times(t: &Timings, frames: u32) -> Res<Vec<f64>> {
+    let expected: Vec<u32> = (1..=frames).collect();
+    let got: Vec<u32> = t.frames.iter().map(|f| f.frame).collect();
+    if got != expected {
+        return Err(format!("timings.json lists frames {got:?}, expected 1..={frames}").into());
+    }
+    Ok(t.frames
+        .windows(2)
+        .map(|w| w[1].mtime_ns.saturating_sub(w[0].mtime_ns) as f64 / 1e6)
+        .collect())
+}
+
+fn clear_dir(dir: &Path) -> Res<()> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+fn run_mantaflow(name: &str, res: u32) -> Res<()> {
+    let scene = scene(name, res)?;
+    let context =
+        |e: Box<dyn Error>| -> Box<dyn Error> { format!("mantaflow {name} {res}³: {e}").into() };
+    let scratch = workspace().join(format!("target/bench/{name}-{res}"));
+    std::fs::create_dir_all(&scratch)?;
+    let scene_json = scratch.join("scene.json");
+    std::fs::write(
+        &scene_json,
+        serde_json::to_string_pretty(&scene.mantaflow_json())? + "\n",
+    )?;
+
+    eprintln!("mantaflow {name} {res}³: baseline (no bake)");
+    let base_dir = scratch.join("baseline");
+    clear_dir(&base_dir)?;
+    let baseline = run_blender(&scene_json, &base_dir, true).map_err(context)?;
+
+    // The scene script never clears an old cache, so a stale frame would
+    // pass its missing-frame check: clear the output before every bake.
+    let out = scratch.join("bake");
+    let load_before = load_average();
+    let runs = runs_for(res);
+    let mut medians = Vec::new();
+    let mut all = Vec::new();
+    let mut peak = 0;
+    let mut version = String::new();
+    for r in 0..runs {
+        eprintln!("mantaflow {name} {res}³: timed run {} of {runs}", r + 1);
+        clear_dir(&out)?;
+        let rss = run_blender(&scene_json, &out, false).map_err(context)?;
+        let timings: Timings =
+            serde_json::from_str(&std::fs::read_to_string(out.join("timings.json"))?)?;
+        let frames = frame_times(&timings, scene.frames).map_err(context)?;
+        medians.push(median(&frames));
+        all.extend(frames);
+        peak = peak.max(rss);
+        version = timings.blender;
+    }
+    let load_after = load_average();
+
+    eprintln!("mantaflow {name} {res}³: reading the last run's cache");
+    let cells = FieldDims::new(scene.cells[0], scene.cells[1], scene.cells[2]);
+    let dx = scene.domain_size / f64::from(*scene.cells.iter().max().unwrap());
+    let solid = scene.solid_mask();
+    let mut frames = Vec::new();
+    for n in 1..=scene.frames {
+        let path = out.join(format!("cache/data/fluid_data_{n:04}.vdb"));
+        let f = common::mantaflow::read_frame(&path, cells, dx).map_err(|e| context(e.into()))?;
+        frames.push(measure(&Sample {
+            cells,
+            dx,
+            density: &f.density,
+            faces: &f.faces,
+            solid: &solid,
+        }));
+    }
+    let summary = RunSummary {
+        solver: "mantaflow".into(),
+        scene: name.into(),
+        resolution: res,
+        runs,
+        frame_ms_median: median(&medians),
+        frame_ms_min: all.iter().copied().fold(f64::INFINITY, f64::min),
+        frame_ms_max: all.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        peak_bytes: peak.saturating_sub(baseline),
+        load_before,
+        load_after,
+        blender: Some(version),
+        drift: drift_from_cut_off(&frames, scene.fps),
+        frames,
+    };
+    write_summary(&results_dir(), &summary)?;
+    Ok(())
+}
+
+/// Build `docs/bench/results.md` from every result file, or name the
+/// missing ones and fail.
+fn report() -> Res<()> {
+    let dir = results_dir();
+    let mut summaries = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let text = std::fs::read_to_string(&path)?;
+                let s: RunSummary =
+                    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                summaries.push(s);
+            }
+        }
+    }
+    let ctx = Context {
+        machine: shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
+        os: format!("macOS {}", shell("sw_vers", &["-productVersion"])),
+        commit: commit_label(),
+        blender: summaries
+            .iter()
+            .find_map(|s| s.blender.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        date: shell("date", &["-u", "+%Y-%m-%d"]),
+    };
+    match results_markdown(&summaries, &ctx) {
+        Ok(md) => {
+            let path = workspace().join("docs/bench/results.md");
+            std::fs::write(&path, md)?;
+            eprintln!("wrote {}", path.display());
+            Ok(())
+        }
+        Err(missing) => {
+            for m in &missing {
+                eprintln!("missing: {}", dir.join(format!("{m}.json")).display());
+            }
+            Err(format!(
+                "{} result files missing; results.md not written",
+                missing.len()
+            )
+            .into())
+        }
+    }
 }
 
 fn main() -> Res<()> {
@@ -171,6 +380,8 @@ fn main() -> Res<()> {
         .as_slice()
     {
         ["ember", name, res] => run_ember(name, res.parse()?),
+        ["mantaflow", name, res] => run_mantaflow(name, res.parse()?),
+        ["report"] => report(),
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
             println!("{}", serde_json::to_string_pretty(&json)?);
