@@ -17,9 +17,9 @@
 //! path the plate uses, from an idle GPU to a blocking wait after the
 //! projection (see `kernel_path`). Frame time is kept as a secondary column.
 //!
-//! `SOLVER_GATE_TIMING_ONLY=<mgpcg count>` reruns only the timing phase and
-//! splices it into the existing record, leaving the divergence, plate and
-//! stability results as they stand.
+//! `SOLVER_GATE_COMPARE=1` prints Gauss–Seidel ×160 against MGPCG ×4 on the
+//! gate's accuracy measures, which informed the presets after the rule
+//! failed.
 //!
 //! `SOLVER_GATE_SMOKE=1` runs a short plumbing pass at 32³ and 64³ with small
 //! caps and writes to `$SOLVER_GATE_OUT` (default: the system temp dir)
@@ -973,98 +973,6 @@ fn timing_configs(candidates: &[PressureSolve]) -> (Vec<PressureSolve>, usize) {
     (configs, rule)
 }
 
-/// Replace `[start, end)` of `text`, where `start` and `end` are markers
-/// (the end marker is kept).
-fn splice(text: &str, start: &str, end: &str, with: &str) -> Res<String> {
-    let a = text
-        .find(start)
-        .ok_or_else(|| format!("the record has no {start:?}"))?;
-    let b = a + text[a..]
-        .find(end)
-        .ok_or_else(|| format!("the record has no {end:?} after {start:?}"))?;
-    Ok(format!("{}{with}{}", &text[..a], &text[b..]))
-}
-
-/// `SOLVER_GATE_TIMING_ONLY=<mgpcg count>`: rerun only the timing phase
-/// with that MGPCG candidate, and splice its results into the existing
-/// record. The divergence, plate and stability results stand.
-fn timing_only(plan: &Plan, count: u32) -> Res<()> {
-    let clock = Clock(Instant::now());
-    let gpu = GpuContext::new_headless()?;
-    let registry = elements_ember::registry();
-    let [low, _] = plan.res;
-    let record = std::fs::read_to_string(&plan.out)?;
-    let candidate = PressureSolve::Mgpcg(count);
-
-    let check = kernel_path_check(&gpu, &registry, low, candidate, MEASURED[0] + 5)?;
-    clock.log(kernel_check_line(low, candidate, check));
-
-    let stable_line = record
-        .lines()
-        .find(|l| l.starts_with("- `mgpcg`: ×"))
-        .ok_or("the record has no mgpcg stability line")?;
-    let stable = BTreeMap::from([(Method::Mgpcg, stable_line.ends_with("— stable"))]);
-    let wind_f120_empty = record.contains("plume_wind frame 120");
-
-    let (initial, start, waited_s) = wait_for_load(&clock, plan.load_wait_s());
-    clock.log(format!(
-        "load {initial}; timing at {start} after {waited_s} s"
-    ));
-    let (configs, rule) = timing_configs(&[candidate]);
-    let t = time_solves(&gpu, &clock, plan.res, configs, rule, plan.runs)?;
-    let phase = PhaseLoad {
-        initial,
-        start,
-        waited_s,
-        after: load(),
-    };
-    clock.log(format!("load after: {}", phase.after));
-
-    let commit = commit_label();
-    let date = shell("date", &["-u", "+%Y-%m-%d %H:%M UTC"]);
-    let mut out = splice(
-        &record,
-        "- Kernel path check:",
-        "\n",
-        &format!(
-            "{}\n- Timing phase rerun per solve (spec §4): commit {commit}, {date}",
-            kernel_check_line(low, candidate, check)
-        ),
-    )?;
-    out = out.replace(
-        &format!(
-            "its median frame time over frames {TIMED_FROM}–{TIMED_FRAMES} is at most the \
-             Gauss–Seidel ×{GS_ITERATIONS} median in the same process"
-        ),
-        &rule_timing_clause(),
-    );
-    out = splice(
-        &out,
-        "Then each candidate and Gauss–Seidel",
-        "\n\n## Divergence sweep",
-        &procedure_timing(plan.runs),
-    )?;
-    out = splice(
-        &out,
-        "## Timing\n",
-        "## Past-floor stability",
-        &timing_section(plan.res, &t, &phase),
-    )?;
-    out = splice(
-        &out,
-        "## Rule applied\n",
-        "Decision (recorded by the user)",
-        &rule_section(plan.res, &t, &stable, wind_f120_empty),
-    )?;
-    if !out.contains(&rule_timing_clause()) {
-        return Err("the rule's timing clause was not rewritten".into());
-    }
-    std::fs::write(&plan.out, &out)?;
-    clock.log(format!("wrote {}", plan.out.display()));
-    println!("{out}");
-    Ok(())
-}
-
 /// `SOLVER_GATE_COMPARE=1`: Gauss–Seidel ×160 against MGPCG ×4 on the
 /// gate's accuracy measures (the three scenes' masked divergence at both
 /// resolutions, `plume_plate`'s ratio at the low one), as a Markdown table
@@ -1120,9 +1028,6 @@ fn compare(plan: &Plan) -> Res<()> {
 
 fn main() -> Res<()> {
     let plan = Plan::from_env();
-    if let Ok(count) = std::env::var("SOLVER_GATE_TIMING_ONLY") {
-        return timing_only(&plan, count.trim().parse()?);
-    }
     if std::env::var_os("SOLVER_GATE_COMPARE").is_some() {
         return compare(&plan);
     }

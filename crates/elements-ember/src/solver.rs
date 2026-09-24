@@ -58,9 +58,10 @@ impl Quality {
         let (pressure_iterations, max_substeps, pressure_cycles) = match self {
             // One substep: the largest cap whose 128³ frame fits in 100 ms
             // (spec §6), decided 2026-09-22 in `docs/bench/presets.md`.
-            // MGPCG ×4: less than half Gauss–Seidel ×160's solve time at
-            // 128³ and 256³, and more accurate in every scene and on the thin
-            // plate, but short of the plate's 1e-3 target (`solver-gate.md`).
+            // MGPCG ×4: 42–59% of Gauss–Seidel ×160's solve time at 128³,
+            // 34–41% at 256³, and more accurate in every scene and on the
+            // thin plate, but short of the plate's 1e-3 target
+            // (`solver-gate.md`).
             Self::Preview => (160, 1, 4),
             // 480 iterations: ratio 0.0076 in `docs/bench/iteration-sweep.md`.
             // MGPCG ×10: passes every accuracy check of the solver gate,

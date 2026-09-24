@@ -218,8 +218,22 @@ fn plume_16(solver: &str) -> String {
     )
 }
 
-/// The preview defaults: one substep, no confinement, no dissipation, open top.
-const PREVIEW: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0 }"#;
+/// The preview defaults: one substep, no confinement, no dissipation, open
+/// top, and the preset's pressure solve, MGPCG ×4.
+const PREVIEW: &str = r#"{ "buoyancy_temperature": 1.0 }"#;
+
+/// `solver`, a solver's parameter object, with Gauss–Seidel for 40
+/// iterations in place of the preset's MGPCG: the path documents that
+/// choose Gauss–Seidel take.
+fn gauss_seidel(solver: &str) -> String {
+    let doc = solver.replacen(
+        '{',
+        r#"{ "pressure_solver": "gauss_seidel", "pressure_iterations": 40,"#,
+        1,
+    );
+    assert_ne!(doc, solver, "the solver must be inserted");
+    doc
+}
 
 struct Session {
     gpu: GpuContext,
@@ -315,8 +329,13 @@ fn assert_doc_frame_40_is_bit_identical(doc: &str) {
 }
 
 #[test]
-fn frame_40_is_bit_identical_however_it_is_reached() {
+fn frame_40_is_bit_identical_however_it_is_reached_with_mgpcg() {
     assert_frame_40_is_bit_identical(PREVIEW);
+}
+
+#[test]
+fn frame_40_is_bit_identical_however_it_is_reached_with_gauss_seidel() {
+    assert_frame_40_is_bit_identical(&gauss_seidel(PREVIEW));
 }
 
 /// A 16³ document with an animated, noisy box emitter (all four outputs
@@ -337,7 +356,7 @@ const ANIMATED: &str = r#"{
         "transform": { "keys": [
           { "frame": 1, "translate": [0.6, 1.0, 1.2] },
           { "frame": 40, "translate": [1.4, 1.0, 1.1] } ] } } },
-    { "id": 2, "kind": "ember.smoke_solver", "params": { "pressure_iterations": 40, "buoyancy_temperature": 1.0, "vorticity": 2.0 } },
+    { "id": 2, "kind": "ember.smoke_solver", "params": { "buoyancy_temperature": 1.0, "vorticity": 2.0 } },
     { "id": 3, "kind": "core.output", "params": {} }
   ],
   "edges": [
@@ -355,9 +374,17 @@ const ANIMATED: &str = r#"{
 /// Umbrella §4: frame 40 is bit-identical in order, after scrubbing and after
 /// eviction, with an animated collider and an animated, noisy emitter,
 /// because poses, masks and noise are recomputed from the document's time.
+/// The preset's MGPCG rebuilds its hierarchy from each frame's mask.
 #[test]
-fn frame_40_is_bit_identical_with_animated_emitter_and_collider() {
+fn frame_40_is_bit_identical_with_animated_emitter_and_collider_with_mgpcg() {
     assert_doc_frame_40_is_bit_identical(ANIMATED);
+}
+
+#[test]
+fn frame_40_is_bit_identical_with_animated_emitter_and_collider_with_gauss_seidel() {
+    assert_doc_frame_40_is_bit_identical(&animated_with(
+        r#""pressure_solver": "gauss_seidel", "pressure_iterations": 40"#,
+    ));
 }
 
 /// Spec §3: the frame after the emitter switches off reproduces bit for bit
@@ -375,13 +402,14 @@ fn frame_40_is_bit_identical_after_the_emitter_switches_off() {
 /// Everything 2b-1 added, switched on: a CFL count that varies from frame to
 /// frame, confinement, and dissipation. `cfl` is small enough that the count
 /// changes within the first 40 frames (`substep_counts` shows it does).
-const STRESSED: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0,
+const STRESSED: &str = r#"{ "buoyancy_temperature": 1.0,
     "max_substeps": 8, "cfl": 0.1, "vorticity": 2.0,
     "density_dissipation": 0.2, "temperature_dissipation": 0.5 }"#;
 
 /// `STRESSED` in a box with every face a wall, so the closed-domain pressure
-/// mean removal runs too.
-const STRESSED_CLOSED: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0,
+/// mean removal runs too: MGPCG's fluid means of r and p, and Gauss–Seidel's
+/// pressure mean.
+const STRESSED_CLOSED: &str = r#"{ "buoyancy_temperature": 1.0,
     "max_substeps": 8, "cfl": 0.1, "vorticity": 2.0,
     "density_dissipation": 0.2, "temperature_dissipation": 0.5,
     "boundaries": { "-x": "wall", "+x": "wall", "-y": "wall",
@@ -491,15 +519,29 @@ fn assert_counts_vary(solver: &str) {
 }
 
 #[test]
-fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation() {
+fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation_with_mgpcg() {
     assert_counts_vary(STRESSED);
     assert_frame_40_is_bit_identical(STRESSED);
 }
 
 #[test]
-fn frame_40_is_bit_identical_in_a_closed_domain() {
+fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation_with_gauss_seidel() {
+    let solver = gauss_seidel(STRESSED);
+    assert_counts_vary(&solver);
+    assert_frame_40_is_bit_identical(&solver);
+}
+
+#[test]
+fn frame_40_is_bit_identical_in_a_closed_domain_with_mgpcg() {
     assert_counts_vary(STRESSED_CLOSED);
     assert_frame_40_is_bit_identical(STRESSED_CLOSED);
+}
+
+#[test]
+fn frame_40_is_bit_identical_in_a_closed_domain_with_gauss_seidel() {
+    let solver = gauss_seidel(STRESSED_CLOSED);
+    assert_counts_vary(&solver);
+    assert_frame_40_is_bit_identical(&solver);
 }
 
 /// Outputs a zero field one cell larger than the domain: a mis-sized source.
@@ -926,16 +968,7 @@ fn plume_16_with_far_collider(solver: &str, velocity: bool) -> String {
 
 /// Spec §3.1: a collider entirely outside the domain changes nothing, bit for
 /// bit, so the solid code paths are exact when nothing is solid.
-///
-/// That holds for Gauss–Seidel, which this pins. The multigrid hierarchy's
-/// solid path (fluid fractions, weighted prolongation) rounds differently
-/// even when every cell is fluid: with MGPCG ×4 the first density bit
-/// differs at frame 4, and by frame 40 the largest difference is 5.7e-7
-/// against a peak density of 1.2 (2b-3c Task 5).
-#[test]
-fn a_collider_outside_the_domain_changes_nothing() {
-    let solver = r#"{ "pressure_solver": "gauss_seidel", "pressure_iterations": 40,
-                      "buoyancy_temperature": 1.0 }"#;
+fn assert_far_collider_changes_nothing(solver: &str) {
     let mut plain = Session::new(&plume_16(solver));
     let mut far = Session::new(&plume_16_with_far_collider(solver, true));
     let (mut a, mut b) = (timeline(0), timeline(0));
@@ -945,6 +978,21 @@ fn a_collider_outside_the_domain_changes_nothing() {
             "frame {frame}"
         );
     }
+}
+
+/// With MGPCG the hierarchy takes its solid path (fluid fractions,
+/// renormalised prolongation), which must reduce exactly to the plain one
+/// when every cell is fluid. Before 2b-3c Task 5's fix it did not: the
+/// prolongation weight at the open top was 1.0000001, and density drifted
+/// from frame 4.
+#[test]
+fn a_collider_outside_the_domain_changes_nothing_with_mgpcg() {
+    assert_far_collider_changes_nothing(PREVIEW);
+}
+
+#[test]
+fn a_collider_outside_the_domain_changes_nothing_with_gauss_seidel() {
+    assert_far_collider_changes_nothing(&gauss_seidel(PREVIEW));
 }
 
 /// Spec §3.1: a collider SDF without its velocity is an error naming both inputs.
@@ -1068,12 +1116,12 @@ fn a_collider_mask_does_not_leak_across_frames() {
     assert_eq!(counts[2], counts[5], "allocations per frame: {counts:?}");
 }
 
-/// `ANIMATED` with the pressure solve `solver` running `cycles` cycles in
-/// place of 40 Gauss–Seidel iterations.
-fn animated_with(solver: &str, cycles: u32) -> String {
+/// `ANIMATED` with `fields` (solver parameters, comma-separated) choosing
+/// its pressure solve in place of the preset's MGPCG ×4.
+fn animated_with(fields: &str) -> String {
     let doc = ANIMATED.replace(
-        r#""pressure_iterations": 40,"#,
-        &format!(r#""pressure_solver": "{solver}", "pressure_cycles": {cycles},"#),
+        r#""params": { "buoyancy_temperature": 1.0,"#,
+        &format!(r#""params": {{ {fields}, "buoyancy_temperature": 1.0,"#),
     );
     assert_ne!(doc, ANIMATED, "the solver must be inserted");
     doc
@@ -1083,14 +1131,9 @@ fn animated_with(solver: &str, cycles: u32) -> String {
 /// the frame's collider mask, so frame 40 still reproduces bit for bit.
 #[test]
 fn frame_40_is_bit_identical_with_multigrid() {
-    assert_doc_frame_40_is_bit_identical(&animated_with("multigrid", 4));
-}
-
-/// As `frame_40_is_bit_identical_with_multigrid`, with MGPCG, whose scalars
-/// stay on the GPU.
-#[test]
-fn frame_40_is_bit_identical_with_mgpcg() {
-    assert_doc_frame_40_is_bit_identical(&animated_with("mgpcg", 4));
+    assert_doc_frame_40_is_bit_identical(&animated_with(
+        r#""pressure_solver": "multigrid", "pressure_cycles": 4"#,
+    ));
 }
 
 /// Passes density through, and keeps a read-back copy of the velocity it

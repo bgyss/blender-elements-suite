@@ -322,6 +322,53 @@ fn a_hierarchy_halves_every_axis_down_to_one_cell_and_returns_every_field() {
     }
 }
 
+/// With a mask where every cell is fluid, the solid path's fluid fractions
+/// φ and prolongation weights are exactly 1 on every level, so it applies
+/// the plain path's stencil and transfers. Odd sizes give partial coarse
+/// cells at the domain's edge.
+#[test]
+fn an_all_fluid_mask_gives_unit_fractions_and_weights() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    for (cells, open) in [
+        (FieldDims::new(32, 32, 32), DEFAULT_OPEN_MASK),
+        (FieldDims::new(16, 16, 16), 0),
+        (FieldDims::new(40, 24, 20), DEFAULT_OPEN_MASK),
+        (FieldDims::new(21, 13, 11), 0b111111),
+    ] {
+        let mut pool = FieldPool::new();
+        let mask = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
+        let c = StepConstants {
+            has_solids: true,
+            open_mask: open,
+            ..StepConstants::new(cells, H, 1.0)
+        };
+        let mut batch = ComputeBatch::new();
+        let h = Hierarchy::new(&gpu, &mut cache, &mut batch, &mut pool, &c, Some(&mask)).unwrap();
+        batch.submit(&gpu).unwrap();
+        for l in 0..h.depth() {
+            let (phi, norm) = h.solid_weights(l);
+            for (name, field) in [("φ", phi), ("prolongation weight", norm)] {
+                let Some(field) = field else { continue };
+                let values = field.read_back(&gpu).unwrap();
+                let off: Vec<(usize, f32)> = values
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(_, v)| v != 1.0)
+                    .collect();
+                assert!(
+                    off.is_empty(),
+                    "{cells:?} open {open:#b} level {l}: {} {name}s are not 1, first {:?}",
+                    off.len(),
+                    &off[..off.len().min(4)]
+                );
+            }
+        }
+        h.release(&mut pool);
+    }
+}
+
 #[test]
 fn a_coarse_cell_is_solid_only_when_all_its_children_are() {
     let gpu = gpu();

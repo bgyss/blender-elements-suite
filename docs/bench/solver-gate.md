@@ -133,7 +133,7 @@ to decide the presets after the registered rule failed. It is not part of the ru
 | `plume_wind` masked RMS | 256³ | 2.22e-3 / 0.00e0 | 5.42e-6 / 0.00e0 |
 
 MGPCG ×4 is at least as accurate as Gauss–Seidel ×160 on every row: on the thin plate by 1.8× (frame
-60) and 5.3× (frame 120), and in the three scenes by two to four orders of magnitude. Gauss–Seidel ×160,
+60) and 5.2× (frame 120), and in the three scenes by two to four orders of magnitude. Gauss–Seidel ×160,
 today's preview, misses Mantaflow's reference in every scene with smoke to measure. MGPCG ×4 meets it at
 128³. At 256³ it misses by up to 1.5×: `plume` at frame 120 (6.19e-5 against 4.51e-5), and
 `plume_collider` at frames 60 and 120 (1.09e-4 against 9.12e-5, 7.68e-5 against 5.25e-5). `plume_wind`'s

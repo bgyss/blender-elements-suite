@@ -77,11 +77,6 @@ bench-presets:
 bench-solver:
     cargo run --release -p elements-ember --example solver_gate
 
-# Rerun only the solver gate's per-solve timing with MGPCG at `count`, into
-# the existing docs/bench/solver-gate.md. About an hour, real GPU.
-bench-solver-timing count="10":
-    SOLVER_GATE_TIMING_ONLY={{count}} cargo run --release -p elements-ember --example solver_gate
-
 # The Mantaflow benchmark (2b-3 spec). Takes about an hour or more, needs the
 # real GPU and Blender, and is not part of `check`. Writes
 # docs/bench/results/ per run, then docs/bench/results.md from a complete set.

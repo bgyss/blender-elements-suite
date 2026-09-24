@@ -1,8 +1,9 @@
 // With solids, P renormalises each fluid fine cell's weights over the coarse
 // corners it keeps: solid corners drop out, open-face points (holding 0)
-// stay. This writes 1 / that weight, or 0 for a solid fine cell or one with
-// no corner kept, once per hierarchy, so prolong_add and restrict apply the
-// identical factor and restriction stays exactly Pᵀ.
+// stay. This writes 1 / that weight (exactly 1 when no corner is dropped),
+// or 0 for a solid fine cell or one with no corner kept, once per
+// hierarchy, so prolong_add and restrict apply the identical factor and
+// restriction stays exactly Pᵀ.
 
 @group(0) @binding(0) var out: texture_storage_3d<r32float, write>;
 @group(0) @binding(1) var<uniform> params: Params;
@@ -25,6 +26,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ay = prolong_axis(1u, c.y);
     let az = prolong_axis(2u, c.z);
     var kept = 0.0;
+    var dropped = false;
     for (var b = 0u; b < 8u; b = b + 1u) {
         let px = pick(ax, b & 1u);
         let py = pick(ay, (b >> 1u) & 1u);
@@ -35,9 +37,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
         if (!beyond(q) && textureLoad(coarse_solid, q, 0).x > 0.5) {
+            dropped = true;
             continue;
         }
         kept += w;
     }
-    textureStore(out, c, vec4<f32>(select(0.0, 1.0 / kept, kept > 0.0), 0.0, 0.0, 0.0));
+    // With no corner dropped, P is the plain path's, unrenormalised: exactly
+    // 1, not 1 / a sum that rounds to 1 − ε where open-face ghost weights
+    // enter it. So a domain with no solid cells prolongs and restricts bit
+    // for bit as it would with no mask at all.
+    var weight = select(0.0, 1.0 / kept, kept > 0.0);
+    if (!dropped) {
+        weight = 1.0;
+    }
+    textureStore(out, c, vec4<f32>(weight, 0.0, 0.0, 0.0));
 }

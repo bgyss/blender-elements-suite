@@ -414,6 +414,14 @@ impl Hierarchy {
         self.levels[0].u.open_mask() == 0
     }
 
+    /// With solids, level `l`'s fluid fractions φ (none on level 0) and its
+    /// prolongation weights (none on the coarsest level), for tests: with an
+    /// all-fluid mask the solid path must reduce to the plain one.
+    pub fn solid_weights(&self, l: usize) -> (Option<&Field>, Option<&Field>) {
+        let level = &self.levels[l];
+        (level.phi.as_ref(), level.norm.as_ref())
+    }
+
     /// The fine level's uniforms.
     pub(crate) fn fine(&self) -> &Uniforms {
         &self.levels[0].u
