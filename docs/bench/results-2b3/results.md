@@ -1,5 +1,7 @@
 # Ember against Mantaflow (2b-3)
 
+_Kept for comparison: this is the 2b-3 run, on the Gauss–Seidel solver before 2b-3c. Its run files are the JSON and CSV files beside it. The current results are in `docs/bench/results.md`._
+
 - Machine: Apple M1 Max
 - OS: macOS 27.2
 - Ember commit: 7fe5d9d
