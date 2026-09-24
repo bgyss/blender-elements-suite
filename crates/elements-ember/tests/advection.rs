@@ -723,4 +723,10 @@ fn maccormack_falls_back_to_first_order_where_a_trace_crosses_an_open_face() {
     let (semi, mac) = leave_along_x(&mirrored, 0b01, -1.0);
     assert_eq!(column(&mac, 0), column(&semi, 0), "the −x face's column");
     assert_ne!(column(&mac, 3), column(&semi, 3), "an interior column, −x");
+
+    // Inflow: clean air enters through the open −x face beside the
+    // mirrored blob. The first column's forward trace reaches past that
+    // face, where the correction would otherwise draw on the ambient ghost.
+    let (semi, mac) = leave_along_x(&mirrored, 0b01, 1.0);
+    assert_eq!(column(&mac, 0), column(&semi, 0), "the inflow column");
 }

@@ -6,13 +6,14 @@ use common::*;
 use elements_core::gpu::{
     Axis, ComputeBatch, FieldDims, FieldPool, GpuContext, PipelineCache, ReduceTarget,
 };
-use elements_core::graph::{StateStore, Time};
+use elements_core::graph::{DocEdge, DocNode, Document, StateStore, Time};
 use elements_ember::bench::{SOLVER_NODE, Scene};
 use elements_ember::boundaries::Boundaries;
 use elements_ember::kernels::conserve::{self, M0, M1, OUT, SLOTS};
 use elements_ember::kernels::{Carried, StepConstants, Uniforms};
 use elements_ember::solver;
 use elements_ember::transform::Transform;
+use elements_ember::unions::EMITTER_UNION_KIND;
 
 const H: f32 = 1.0 / 24.0;
 const DX: f32 = 0.125;
@@ -221,8 +222,21 @@ fn the_correction_never_scales_beyond_ten_percent() {
     // Nothing before: nothing to restore, so the field is left as it is.
     let zero = vec![0.0; q.len()];
     assert_eq!(corrected(&zero, &q, 0.0), q, "an empty field before");
-    // Nothing after: no scale can restore it.
-    assert_eq!(corrected(&q, &zero, 0.0), zero, "an empty field after");
+    // Next to nothing after (a sum of 6.4e-14, under 1e-12): left alone,
+    // where the clamp would otherwise scale it by 1.1.
+    let tiny = vec![1e-15; q.len()];
+    assert_eq!(corrected(&q, &tiny, 0.0), tiny, "an empty field after");
+}
+
+/// A field with a negative cell before advection is left uncorrected: a
+/// proportional rescale assumes q ≥ 0.
+#[test]
+fn a_field_with_a_negative_cell_is_not_rescaled() {
+    let cells = FieldDims::new(4, 4, 4);
+    let mut q = positive(cells, 9);
+    q[17] = -0.05;
+    let gained = scaled(&q, 1.05);
+    assert_eq!(corrected(&q, &gained, 0.0), gained, "one negative cell");
 }
 
 /// The advection applies dissipation before the correction runs, so the
@@ -252,9 +266,16 @@ fn plume(boundaries: Boundaries, conserve_mass: bool) -> Scene {
 /// `scene` run to frame `last`. `visit(frame, density, faces)` sees the
 /// solver's state after every frame.
 fn run(scene: &Scene, last: u32, mut visit: impl FnMut(u32, &[f32], &[Vec<f32>; 3])) {
+    run_doc(scene.document(), last, |frame, density, _, faces| {
+        visit(frame, density, faces)
+    });
+}
+
+/// `doc` run to frame `last`; `visit(frame, density, temperature, faces)`
+/// sees the solver's state after every frame.
+fn run_doc(doc: Document, last: u32, mut visit: impl FnMut(u32, &[f32], &[f32], &[Vec<f32>; 3])) {
     let gpu: GpuContext = gpu();
     let registry = elements_ember::registry();
-    let doc = scene.document();
     let config = doc.timeline_config();
     let (graph, dims) = doc.into_graph(&registry).unwrap();
     let mut pool = FieldPool::new();
@@ -266,20 +287,24 @@ fn run(scene: &Scene, last: u32, mut visit: impl FnMut(u32, &[f32], &[Vec<f32>; 
             .eval_frame(&gpu, &mut pool, &mut pipelines, &mut state, time, dims)
             .unwrap();
         evaluated.value.release_to(&mut pool);
-        let density = state
-            .get(SOLVER_NODE, solver::DENSITY)
-            .unwrap()
-            .as_field()
-            .unwrap()
-            .read_back(&gpu)
-            .unwrap();
+        let read = |slot| {
+            state
+                .get(SOLVER_NODE, slot)
+                .unwrap()
+                .as_field()
+                .unwrap()
+                .read_back(&gpu)
+                .unwrap()
+        };
+        let density = read(solver::DENSITY);
+        let temperature = read(solver::TEMPERATURE);
         let velocity = state
             .get(SOLVER_NODE, solver::VELOCITY)
             .unwrap()
             .as_vector_field()
             .unwrap();
         let faces = [Axis::X, Axis::Y, Axis::Z].map(|a| velocity.face(a).read_back(&gpu).unwrap());
-        visit(frame, &density, &faces);
+        visit(frame, &density, &temperature, &faces);
     }
     state.clear(&mut pool);
 }
@@ -347,6 +372,11 @@ fn open_top_accounting(conserve_mass: bool, last: u32) -> Vec<(u32, f64, f64)> {
 
 /// Spec §7: with an open top, mass plus the cumulative outflow through it
 /// stays what it was when emission stopped.
+///
+/// This depends on `open_top_accounting`'s hand-tuned fast plume (emitter
+/// at z = 1.3 m, `buoyancy_temperature` 4): the default plume emitting for
+/// ten frames never reaches the top by frame 120 at 32³, so the outflow
+/// term would go untested. The final assertion guards that.
 #[test]
 fn open_top_mass_plus_outflow_is_constant() {
     let rows = open_top_accounting(true, 60);
@@ -370,4 +400,91 @@ fn open_top_mass_plus_outflow_is_constant() {
         "outflow {last_outflow}, mass {last_mass}"
     );
     assert!(worst <= 1e-3, "mass + outflow drifted {worst:e}");
+}
+
+/// The closed-box plume with a second, cold emitter above the hot one
+/// (negative `temperature_rate`), both on frames 1–10 and merged by an
+/// `ember.emitter_union`, so the temperature field holds both signs.
+fn hot_and_cold(conserve_mass: bool) -> Document {
+    let scene = plume(Boundaries::closed(), conserve_mass);
+    let mut doc = scene.document();
+    let mut cold = scene.emitter.clone();
+    cold.transform = Transform::at([1.0, 1.0, 1.4]);
+    // Half as strong, so ΣT stays positive and the scale is not skipped
+    // for want of a positive target.
+    cold.temperature_rate = -0.5;
+    let (cold_id, union_id) = (3, 4);
+    doc.nodes.push(DocNode {
+        id: cold_id,
+        kind: doc.nodes[0].kind.clone(),
+        params: serde_json::to_value(&cold).unwrap(),
+    });
+    doc.nodes.push(DocNode {
+        id: union_id,
+        kind: EMITTER_UNION_KIND.to_owned(),
+        params: serde_json::json!({}),
+    });
+    let edge = |from_node, from_index, to_node, to_index| DocEdge {
+        from_node,
+        from_index,
+        to_node,
+        to_index,
+    };
+    // The hot emitter's edges into the solver now go through the union.
+    doc.edges.retain(|e| e.from_node != 0);
+    for i in 0..4 {
+        doc.edges.push(edge(0, i, union_id, i));
+        doc.edges.push(edge(cold_id, i, union_id, 4 + i));
+    }
+    doc.edges.push(edge(union_id, 0, 1, 0));
+    doc.edges.push(edge(union_id, 1, 1, 1));
+    doc
+}
+
+/// (Σ density at frame 11, at frame 60, the largest |T| at frame 60, the
+/// smallest and largest T at frame 10) for `hot_and_cold`.
+fn hot_and_cold_run(conserve_mass: bool) -> (f64, f64, f32, f32, f32) {
+    let (mut at_11, mut at_60, mut max_t, mut lo, mut hi) = (0.0, 0.0, 0.0f32, 0.0f32, 0.0f32);
+    run_doc(
+        hot_and_cold(conserve_mass),
+        60,
+        |frame, density, temperature, _| match frame {
+            60 => {
+                at_60 = sum(density);
+                max_t = temperature.iter().fold(0.0, |m: f32, t| m.max(t.abs()));
+            }
+            10 => {
+                lo = temperature.iter().copied().fold(f32::MAX, f32::min);
+                hi = temperature.iter().copied().fold(f32::MIN, f32::max);
+            }
+            11 => at_11 = sum(density),
+            _ => {}
+        },
+    );
+    (at_11, at_60, max_t, lo, hi)
+}
+
+/// Emitters accept negative rates, so temperature can mix hot and cold. A
+/// proportional rescale assumes q ≥ 0: with both signs, Σq is far below
+/// Σ|q| and the scale would sit on its clamp, compounding ×0.9 or ×1.1
+/// every substep. Such a field is left uncorrected. Density, all
+/// nonnegative, is still conserved.
+#[test]
+fn a_field_with_both_signs_is_left_uncorrected() {
+    let (on_11, on_60, on_max, lo, hi) = hot_and_cold_run(true);
+    let (_, _, off_max, _, _) = hot_and_cold_run(false);
+    let drift = (on_60 - on_11) / on_11;
+    eprintln!(
+        "hot and cold, closed 32³: T at frame 10 in [{lo}, {hi}]; max |T| at frame 60 \
+         {on_max} with the correction, {off_max} without; density drift {drift:e}"
+    );
+    assert!(
+        lo < -0.01 && hi > 0.01,
+        "both signs must occur: [{lo}, {hi}]"
+    );
+    assert!(
+        (on_max / off_max - 1.0).abs() <= 0.01,
+        "max |T| {on_max} with the correction, {off_max} without"
+    );
+    assert!(drift.abs() <= 1e-5, "density drift {drift:e}");
 }

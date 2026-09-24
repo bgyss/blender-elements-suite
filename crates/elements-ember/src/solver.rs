@@ -31,7 +31,8 @@ pub const KIND: &str = "ember.smoke_solver";
 pub const VELOCITY: &str = "velocity";
 /// Names the solver's density state slot (a cell-centred field).
 pub const DENSITY: &str = "density";
-const TEMPERATURE: &str = "temperature";
+/// Names the solver's temperature state slot (a cell-centred field).
+pub const TEMPERATURE: &str = "temperature";
 /// Holds p. The warm start stays valid when h changes (spec §4.3).
 const PRESSURE: &str = "pressure";
 const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
