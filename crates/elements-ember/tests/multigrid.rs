@@ -6,9 +6,9 @@ use elements_core::gpu::{
 };
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::kernels::multigrid::{
-    Hierarchy, residual, residual_at, restrict_mask, v_cycles,
+    Hierarchy, residual, residual_at, restrict_mask, v_cycle_from_zero, v_cycles,
 };
-use elements_ember::kernels::{StepConstants, Uniforms, pressure};
+use elements_ember::kernels::{StepConstants, Uniforms, mgpcg, pressure};
 
 const H: f32 = 0.1;
 
@@ -505,7 +505,8 @@ fn v_cycles_converge_steadily_on_every_shape() {
 }
 
 /// MGPCG needs the preconditioner to be symmetric: ⟨Ma, b⟩ = ⟨a, Mb⟩ for
-/// M = one V-cycle from zero.
+/// M = one V-cycle from zero. The real cycle measures 1.5e-10 to 1.1e-8;
+/// post-smoothing in the wrong colour order measured 1.57e-5.
 #[test]
 fn a_v_cycle_is_a_symmetric_operator() {
     let gpu = gpu();
@@ -539,7 +540,8 @@ fn a_v_cycle_is_a_symmetric_operator() {
         let b = fluid_rhs(pattern(cells, 29), solid.as_deref(), closed);
         let mut apply = |v: &[f32]| -> Vec<f32> {
             let div = upload(&gpu, &mut pool, cells, v);
-            let p = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
+            // Whatever e holds beforehand, the cycle starts from zero.
+            let p = upload(&gpu, &mut pool, cells, &pattern(cells, 47));
             let mut batch = ComputeBatch::new();
             let h = Hierarchy::new(
                 &gpu,
@@ -550,7 +552,7 @@ fn a_v_cycle_is_a_symmetric_operator() {
                 solid_field.as_ref(),
             )
             .unwrap();
-            v_cycles(&gpu, &mut cache, &mut batch, &h, &p, &div, 1).unwrap();
+            v_cycle_from_zero(&gpu, &mut cache, &mut batch, &h, &p, &div).unwrap();
             batch.submit(&gpu).unwrap();
             let out = p.read_back(&gpu).unwrap();
             h.release(&mut pool);
@@ -566,7 +568,7 @@ fn a_v_cycle_is_a_symmetric_operator() {
         let (x, y) = (dot(&ma, &b), dot(&a, &mb));
         let rel = (x - y).abs() / x.abs().max(y.abs());
         println!("{name}: <Ma,b> {x:.9e}, <a,Mb> {y:.9e}, relative difference {rel:.3e}");
-        assert!(rel < 1e-5, "{name}: <Ma,b> {x}, <a,Mb> {y}, relative {rel}");
+        assert!(rel < 1e-6, "{name}: <Ma,b> {x}, <a,Mb> {y}, relative {rel}");
     }
 }
 
@@ -737,4 +739,418 @@ fn a_closed_domain_keeps_the_fluid_mean_of_p_at_zero() {
         mean.abs() < 1e-6 * f64::from(peak),
         "fluid mean {mean}, max |p| {peak}"
     );
+}
+
+/// MGPCG and plain V-cycles from p = 0 on the same problem: the reduction
+/// r0/r after `steps` of each.
+#[allow(clippy::too_many_arguments)]
+fn reduction_after(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    cells: FieldDims,
+    mask: u32,
+    solid: Option<&[f32]>,
+    div_values: &[f32],
+    solver: Solver,
+    steps: u32,
+) -> f64 {
+    let r = run(
+        gpu, cache, cells, mask, solid, div_values, None, solver, steps,
+    );
+    r.r0 / r.r
+}
+
+/// What one solve left behind: the initial and final residual RMS over
+/// fluid cells, and p.
+struct Solved {
+    r0: f64,
+    r: f64,
+    p: Vec<f32>,
+}
+
+/// `steps` V-cycles or MGPCG iterations on 64³-style test problems, from
+/// `warm` (or p = 0), with dx = 2/nx as in `residual_history`.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    cells: FieldDims,
+    mask: u32,
+    solid: Option<&[f32]>,
+    div_values: &[f32],
+    warm: Option<&[f32]>,
+    solver: Solver,
+    steps: u32,
+) -> Solved {
+    let mut pool = FieldPool::new();
+    let c = StepConstants {
+        open_mask: mask,
+        has_solids: solid.is_some(),
+        ..StepConstants::new(cells, H, 2.0 / cells.x as f32)
+    };
+    let solid_field = solid.map(|s| upload(gpu, &mut pool, cells, s));
+    let div = upload(gpu, &mut pool, cells, div_values);
+    let zeros = vec![0.0; cells.voxel_count()];
+    let p = upload(gpu, &mut pool, cells, warm.unwrap_or(&zeros));
+    let r0 = residual_rms(gpu, &c, &p, &div, solid_field.as_ref());
+    let mut batch = ComputeBatch::new();
+    let h = Hierarchy::new(gpu, cache, &mut batch, &mut pool, &c, solid_field.as_ref()).unwrap();
+    match solver {
+        Solver::VCycles => v_cycles(gpu, cache, &mut batch, &h, &p, &div, steps).unwrap(),
+        Solver::Mgpcg => mgpcg(gpu, cache, &mut batch, &mut pool, &h, &p, &div, steps).unwrap(),
+    }
+    batch.submit(gpu).unwrap();
+    h.release(&mut pool);
+    let r = residual_rms(gpu, &c, &p, &div, solid_field.as_ref());
+    Solved {
+        r0,
+        r,
+        p: p.read_back(gpu).unwrap(),
+    }
+}
+
+/// On a smooth right-hand side around a sphere, 4 MGPCG iterations beat 4
+/// V-cycles by 34× (5.37e3 against 158). The brief's 6 iterations would
+/// measure the f32 floor instead: MGPCG reaches it, about 1e4, after 5.
+#[test]
+fn mgpcg_converges_faster_than_v_cycles_around_a_sphere() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(64, 64, 64);
+    let solid = sphere_mask(cells, 64.0 / 6.0);
+    let div = fluid_rhs(smooth_rhs(cells), Some(&solid), false);
+    let top = DEFAULT_OPEN_MASK;
+    let mut reduction =
+        |solver| reduction_after(&gpu, &mut cache, cells, top, Some(&solid), &div, solver, 4);
+    let (v, m) = (reduction(Solver::VCycles), reduction(Solver::Mgpcg));
+    println!(
+        "after 4: V-cycles {v:.3e}, MGPCG {m:.3e}, ratio {:.1}",
+        m / v
+    );
+    assert!(m >= 10.0 * v, "V-cycles {v}, MGPCG {m}");
+}
+
+/// A closed box, where the fluid means of r, z and p are removed. The noise
+/// right-hand side's f32 floor is about 4e6 below r0 (a smooth one's is
+/// about 1.5e4, too close to 1e5 to test).
+#[test]
+fn mgpcg_reaches_a_tight_residual_in_a_closed_box() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(64, 64, 64);
+    let div = fluid_rhs(rhs(cells), None, true);
+    let s = run(
+        &gpu,
+        &mut cache,
+        cells,
+        0,
+        None,
+        &div,
+        None,
+        Solver::Mgpcg,
+        10,
+    );
+    println!(
+        "r0 {:.3e} -> r {:.3e}, reduction {:.3e}",
+        s.r0,
+        s.r,
+        s.r0 / s.r
+    );
+    assert!(s.r < 1e-5 * s.r0, "r0 {} -> r {}", s.r0, s.r);
+}
+
+/// A closed box with a collider, as the solver meets it: div has a small
+/// fluid mean, which no p can match, and the warm start is offset. MGPCG
+/// removes the fluid mean of r each time r is formed, so it converges on the
+/// solvable part, and it removes p's at the end.
+#[test]
+fn mgpcg_removes_fluid_means_in_a_closed_box() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(64, 64, 64);
+    let solid = sphere_mask(cells, 64.0 / 6.0);
+    let solvable = fluid_rhs(rhs(cells), Some(&solid), true);
+    // A fluid mean of 0.05, about a tenth of the RMS.
+    let div: Vec<f32> = solvable
+        .iter()
+        .zip(&solid)
+        .map(|(d, s)| if *s > 0.5 { 0.0 } else { d + 0.05 })
+        .collect();
+    // Offset by about max |p|: a larger offset raises the f32 floor, since
+    // the residual then cancels larger values.
+    let warm: Vec<f32> = solid
+        .iter()
+        .map(|&s| if s > 0.5 { 0.0 } else { 0.02 })
+        .collect();
+    let s = run(
+        &gpu,
+        &mut cache,
+        cells,
+        0,
+        Some(&solid),
+        &div,
+        Some(&warm),
+        Solver::Mgpcg,
+        10,
+    );
+    // The residual against the solvable part: the same p, the mean-free div.
+    let mut pool = FieldPool::new();
+    let c = StepConstants {
+        open_mask: 0,
+        has_solids: true,
+        ..StepConstants::new(cells, H, 2.0 / cells.x as f32)
+    };
+    let solid_field = upload(&gpu, &mut pool, cells, &solid);
+    let p = upload(&gpu, &mut pool, cells, &s.p);
+    let zeros = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
+    let solvable_field = upload(&gpu, &mut pool, cells, &solvable);
+    let r0 = residual_rms(&gpu, &c, &zeros, &solvable_field, Some(&solid_field));
+    let r = residual_rms(&gpu, &c, &p, &solvable_field, Some(&solid_field));
+    let (mut sum, mut n, mut peak) = (0.0f64, 0usize, 0.0f32);
+    for (v, m) in s.p.iter().zip(&solid) {
+        if *m <= 0.5 {
+            sum += f64::from(*v);
+            n += 1;
+            peak = peak.max(v.abs());
+        }
+    }
+    let mean = sum / n as f64;
+    println!(
+        "solvable part: r0 {r0:.3e} -> r {r:.3e}; fluid mean of p {mean:.3e}, max |p| {peak:.3e}"
+    );
+    assert!(r < 1e-5 * r0, "solvable part: r0 {r0} -> r {r}");
+    assert!(
+        mean.abs() < 1e-6 * f64::from(peak),
+        "fluid mean {mean}, max |p| {peak}"
+    );
+}
+
+/// MGPCG solves for the correction to the p it is given: from a converged
+/// p, one more iteration stays converged. Starting from zero instead, one
+/// iteration leaves about 1/12 of r0.
+#[test]
+fn mgpcg_keeps_a_warm_start() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(64, 64, 64);
+    let top = DEFAULT_OPEN_MASK;
+    let div = rhs(cells);
+    let solved = run(
+        &gpu,
+        &mut cache,
+        cells,
+        top,
+        None,
+        &div,
+        None,
+        Solver::Mgpcg,
+        8,
+    );
+    let again = run(
+        &gpu,
+        &mut cache,
+        cells,
+        top,
+        None,
+        &div,
+        Some(&solved.p),
+        Solver::Mgpcg,
+        1,
+    );
+    println!(
+        "cold r0 {:.3e}; converged {:.3e}; one more iteration {:.3e}",
+        solved.r0, solved.r, again.r
+    );
+    assert!(
+        again.r < 2.0 * solved.r,
+        "converged {}, one more {}",
+        solved.r,
+        again.r
+    );
+}
+
+/// Two solves from the same inputs give the same bits. They share one pool,
+/// so the second gets back the first's fields, dirty: a solve that read a
+/// field before writing it would differ.
+#[test]
+fn mgpcg_is_bit_identical_across_runs() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let mut pool = FieldPool::new();
+    let cells = FieldDims::new(32, 32, 32);
+    let solid = sphere_mask(cells, 6.0);
+    // Closed with a collider: every reduction, fluid mean included, runs.
+    let div_values = fluid_rhs(smooth_rhs(cells), Some(&solid), true);
+    let c = StepConstants {
+        open_mask: 0,
+        has_solids: true,
+        ..StepConstants::new(cells, H, 1.0 / 16.0)
+    };
+    let mut once = || {
+        let solid_field = upload(&gpu, &mut pool, cells, &solid);
+        let div = upload(&gpu, &mut pool, cells, &div_values);
+        let p = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
+        let mut batch = ComputeBatch::new();
+        let h = Hierarchy::new(
+            &gpu,
+            &mut cache,
+            &mut batch,
+            &mut pool,
+            &c,
+            Some(&solid_field),
+        )
+        .unwrap();
+        mgpcg(&gpu, &mut cache, &mut batch, &mut pool, &h, &p, &div, 5).unwrap();
+        batch.submit(&gpu).unwrap();
+        let out = p.read_back(&gpu).unwrap();
+        h.release(&mut pool);
+        for field in [solid_field, div, p] {
+            pool.release(field);
+        }
+        out
+    };
+    let (a, b) = (once(), once());
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let differ = a
+        .iter()
+        .zip(&b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    println!("{differ} of {} cells differ", a.len());
+    assert!(bits(&a) == bits(&b), "{differ} cells differ");
+    assert!(a.iter().any(|x| *x != 0.0), "the solve did nothing");
+}
+
+/// A one-cell plate across the domain at z = 30, with a 2-cell slit
+/// (x in 31..33) along its whole length in y.
+fn plate_with_slit(cells: FieldDims) -> Vec<f32> {
+    let mut out = vec![0.0; cells.voxel_count()];
+    for j in 0..cells.y {
+        for i in 0..cells.x {
+            if !(31..33).contains(&i) {
+                out[index(cells, i, j, 30)] = 1.0;
+            }
+        }
+    }
+    out
+}
+
+/// A one-cell-thick tube about the z axis, radius 20 to 21 cells, from the
+/// floor up to z = 48, so its inside reaches the rest of the domain only
+/// over its top rim.
+fn thin_tube(cells: FieldDims) -> Vec<f32> {
+    let mut out = vec![0.0; cells.voxel_count()];
+    let (cx, cy) = (cells.x as f32 / 2.0, cells.y as f32 / 2.0);
+    for k in 0..48.min(cells.z) {
+        for j in 0..cells.y {
+            for i in 0..cells.x {
+                let (x, y) = (i as f32 + 0.5 - cx, j as f32 + 0.5 - cy);
+                if (20.0..21.0).contains(&(x * x + y * y).sqrt()) {
+                    out[index(cells, i, j, k)] = 1.0;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Solver {
+    VCycles,
+    Mgpcg,
+}
+
+/// A one-cell wall vanishes on coarse levels (a coarse cell is solid only
+/// when all its children are), so the V-cycle misses the modes that jump
+/// across it: plain V-cycles lose about 2% of the error per cycle. They reach
+/// only 1.3e3 (plate) and 5.7e3 (tube) after 40 cycles on this right-hand
+/// side, and on a smooth one the residual first grows. The V-cycle is still
+/// symmetric positive definite, so CG converges: 1e4 after 14 (plate, open
+/// top or closed) and 15 (tube) iterations. 20 leaves a margin; the f32
+/// floor is about 1e6.
+#[test]
+fn mgpcg_converges_around_thin_colliders() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(64, 64, 64);
+    let top = DEFAULT_OPEN_MASK;
+    let plate = plate_with_slit(cells);
+    let tube = thin_tube(cells);
+    let mut failed = Vec::new();
+    for (name, mask, solid) in [
+        ("plate with a slit, open top", top, &plate),
+        ("plate with a slit, closed", 0u32, &plate),
+        ("thin tube, open top", top, &tube),
+    ] {
+        let div = fluid_rhs(rhs(cells), Some(solid), mask == 0);
+        let mut reduction =
+            |solver| reduction_after(&gpu, &mut cache, cells, mask, Some(solid), &div, solver, 20);
+        let (v, m) = (reduction(Solver::VCycles), reduction(Solver::Mgpcg));
+        println!("{name}: after 20, V-cycles {v:.3e}, MGPCG {m:.3e}");
+        if m < 1e4 {
+            failed.push(format!("{name}: {m:.3e}×"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "MGPCG reduced the residual too little: {failed:?}"
+    );
+}
+
+/// Wall-clock time per V-cycle, per MGPCG iteration and per Gauss–Seidel
+/// sweep, at 128³ and 256³ with an open top and no collider, for the solver
+/// gate (task 5). Each is the difference between a long and a short run,
+/// each recorded, submitted and waited for, divided by the difference in
+/// counts, so setup cancels. Not a pass/fail test: `cargo test -p
+/// elements-ember --test multigrid time_the_solvers -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn time_the_solvers() {
+    use std::time::Instant;
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    for n in [128u32, 256] {
+        let cells = FieldDims::new(n, n, n);
+        let mut pool = FieldPool::new();
+        let c = StepConstants::new(cells, H, 1.0 / n as f32);
+        let div = upload(&gpu, &mut pool, cells, &smooth_rhs(cells));
+        let p = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
+        let u = Uniforms::new(&gpu, &c).unwrap();
+        let mut batch = ComputeBatch::new();
+        let h = Hierarchy::new(&gpu, &mut cache, &mut batch, &mut pool, &c, None).unwrap();
+        batch.submit(&gpu).unwrap();
+        gpu.wait().unwrap();
+        let time = |cache: &mut PipelineCache, pool: &mut FieldPool, what: &str, count: u32| {
+            let start = Instant::now();
+            let mut batch = ComputeBatch::new();
+            match what {
+                "v" => v_cycles(&gpu, cache, &mut batch, &h, &p, &div, count).unwrap(),
+                "pcg" => mgpcg(&gpu, cache, &mut batch, pool, &h, &p, &div, count).unwrap(),
+                _ => pressure(&gpu, cache, &mut batch, &u, &p, &div, count, count, None).unwrap(),
+            }
+            batch.submit(&gpu).unwrap();
+            gpu.wait().unwrap();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        for (what, name, short, long) in [
+            ("v", "V-cycle", 2u32, 12u32),
+            ("pcg", "MGPCG iteration", 2, 12),
+            ("gs", "red-black sweep", 20, 220),
+        ] {
+            time(&mut cache, &mut pool, what, short); // warm up pipelines and pool
+            let mut per = Vec::new();
+            for _ in 0..3 {
+                let a = time(&mut cache, &mut pool, what, short);
+                let b = time(&mut cache, &mut pool, what, long);
+                per.push((b - a) / f64::from(long - short));
+            }
+            per.sort_by(f64::total_cmp);
+            println!(
+                "{n}³ {name}: {:.3} ms (median of 3; runs {per:.3?})",
+                per[1]
+            );
+        }
+        h.release(&mut pool);
+    }
 }

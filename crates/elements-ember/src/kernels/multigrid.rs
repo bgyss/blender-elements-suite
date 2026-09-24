@@ -22,6 +22,8 @@
 //! the mean over fluid cells only. So one V-cycle from zero is a symmetric
 //! operator, as MGPCG needs.
 
+use std::sync::Arc;
+
 use elements_core::gpu::{
     ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache,
     ReduceOp, ReduceTarget, reduce,
@@ -406,6 +408,17 @@ impl Hierarchy {
         self.levels[l].u.cells()
     }
 
+    /// Whether every domain face is a wall, so p is defined only up to a
+    /// constant and means are removed.
+    pub fn closed(&self) -> bool {
+        self.levels[0].u.open_mask() == 0
+    }
+
+    /// The fine level's uniforms.
+    pub(crate) fn fine(&self) -> &Uniforms {
+        &self.levels[0].u
+    }
+
     /// Return every field to `pool`. The batch that used them must have been
     /// submitted.
     pub fn release(self, pool: &mut FieldPool) {
@@ -459,9 +472,9 @@ struct Recorded {
     /// Residual, restriction to the next level, prolongation from it; absent
     /// on the coarsest level.
     transfer: Option<[wgpu::BindGroup; 3]>,
-    /// Removing the fluid mean of this level's right-hand side (or, on
-    /// level 0, of p) in a closed domain.
-    mean: Option<wgpu::BindGroup>,
+    /// Removing the fluid mean of this coarse level's right-hand side in a
+    /// closed domain.
+    mean: Option<FluidMean>,
 }
 
 /// `cycles` V-cycles on `p` for ∇²p = div/h, starting from what `p` holds.
@@ -476,170 +489,316 @@ pub fn v_cycles(
     div: &Field,
     cycles: u32,
 ) -> Result<(), GpuError> {
-    let fine = &h.levels[0].u;
-    expect_dims("v_cycles p", p, fine.cells())?;
-    expect_dims("v_cycles div", div, fine.cells())?;
-    let closed = fine.open_mask() == 0;
-    let depth = h.depth();
+    VCycle::new(gpu, cache, h, p, div)?.record(gpu, cache, batch, h, p, cycles)
+}
 
-    let residual_pipe = cache.get_or_create(gpu, "ember.mg.residual", RESIDUAL, "main")?;
-    let restrict_pipe = cache.get_or_create(gpu, "ember.mg.restrict", RESTRICT, "main")?;
-    let prolong_pipe = cache.get_or_create(gpu, "ember.mg.prolong_add", PROLONG_ADD, "main")?;
-    let mean_pipe = cache.get_or_create(
-        gpu,
-        "ember.mg.subtract_fluid_mean",
-        SUBTRACT_FLUID_MEAN,
-        "main",
-    )?;
+/// One V-cycle from zero: `e` is zeroed, then one cycle solves for it with
+/// `rhs` as the right-hand side. This is the operator MGPCG preconditions
+/// with, and it is symmetric (`a_v_cycle_is_a_symmetric_operator`).
+pub fn v_cycle_from_zero(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    batch: &mut ComputeBatch,
+    h: &Hierarchy,
+    e: &Field,
+    rhs: &Field,
+) -> Result<(), GpuError> {
+    let cycle = VCycle::new(gpu, cache, h, e, rhs)?;
+    let zero = super::mgpcg::Zero::new(gpu, cache, e)?;
+    zero.record(batch);
+    cycle.record(gpu, cache, batch, h, e, 1)
+}
 
-    let x = |l: usize| -> &Field {
-        if l == 0 {
-            p
-        } else {
-            h.levels[l].e.as_ref().expect("coarse levels hold e")
-        }
-    };
-    let b = |l: usize| -> &Field {
-        if l == 0 {
-            div
-        } else {
-            h.levels[l].rhs.as_ref().expect("coarse levels hold rhs")
-        }
-    };
+/// V-cycles on one `p` and `div`, with every bind group built once, so
+/// MGPCG can record one per iteration without rebuilding them.
+pub(crate) struct VCycle {
+    residual: Arc<wgpu::ComputePipeline>,
+    restrict: Arc<wgpu::ComputePipeline>,
+    prolong: Arc<wgpu::ComputePipeline>,
+    recorded: Vec<Recorded>,
+    /// Removing p's fluid mean after the last cycle, in a closed domain.
+    p_mean: Option<FluidMean>,
+}
 
-    let mut recorded = Vec::with_capacity(depth);
-    for (l, level) in h.levels.iter().enumerate() {
-        let smoother = if l == 0 {
-            Smoother::with_view(gpu, cache, &level.u, p, div, h.mask(0))?
-        } else {
-            Smoother::weighted(
-                gpu,
-                cache,
-                &level.u,
-                x(l),
-                b(l),
-                h.mask(l),
-                &level.params,
-                h.phi(l),
-            )?
+impl VCycle {
+    pub(crate) fn new(
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        h: &Hierarchy,
+        p: &Field,
+        div: &Field,
+    ) -> Result<Self, GpuError> {
+        let fine = &h.levels[0].u;
+        expect_dims("v_cycles p", p, fine.cells())?;
+        expect_dims("v_cycles div", div, fine.cells())?;
+        let closed = h.closed();
+        let depth = h.depth();
+
+        let residual_pipe = cache.get_or_create(gpu, "ember.mg.residual", RESIDUAL, "main")?;
+        let restrict_pipe = cache.get_or_create(gpu, "ember.mg.restrict", RESTRICT, "main")?;
+        let prolong_pipe = cache.get_or_create(gpu, "ember.mg.prolong_add", PROLONG_ADD, "main")?;
+
+        let x = |l: usize| -> &Field {
+            if l == 0 {
+                p
+            } else {
+                h.levels[l].e.as_ref().expect("coarse levels hold e")
+            }
         };
-        let transfer = if l + 1 < depth {
-            let next = &h.levels[l + 1];
-            let tmp = level.tmp.as_ref().expect("non-coarsest levels hold tmp");
-            let residual = bind_group(
-                gpu,
-                &residual_pipe,
-                &[
-                    Bind::Tex(x(l)),
-                    Bind::Tex(b(l)),
-                    Bind::Tex(tmp),
-                    Bind::Buf(level.u.any()),
-                    Bind::View(h.mask(l)),
-                    Bind::Buf(&level.params),
-                    Bind::View(h.phi(l)),
-                ],
-            )?;
-            let restrict = bind_group(
-                gpu,
-                &restrict_pipe,
-                &[
-                    Bind::Tex(tmp),
-                    Bind::View(h.mask(l)),
-                    Bind::View(h.norm(l)),
-                    Bind::Tex(b(l + 1)),
-                    Bind::Tex(x(l + 1)),
-                    Bind::Buf(next.u.any()),
-                    Bind::View(h.mask(l + 1)),
-                    Bind::Buf(&level.params),
-                    Bind::Buf(&next.params),
-                ],
-            )?;
-            let prolong = bind_group(
-                gpu,
-                &prolong_pipe,
-                &[
-                    Bind::Tex(x(l)),
-                    Bind::Tex(x(l + 1)),
-                    Bind::Buf(level.u.any()),
-                    Bind::View(h.mask(l)),
-                    Bind::View(h.mask(l + 1)),
-                    Bind::View(h.norm(l)),
-                    Bind::Buf(&level.params),
-                    Bind::Buf(&next.params),
-                ],
-            )?;
-            Some([residual, restrict, prolong])
-        } else {
-            None
-        };
-        let mean = if closed {
-            // Level 0's p after the last cycle; each coarse level's rhs.
-            let field = if l == 0 { p } else { b(l) };
-            Some(bind_group(
-                gpu,
-                &mean_pipe,
-                &[
-                    Bind::Tex(field),
-                    Bind::Buf(h.sum.buffer()),
-                    Bind::Buf(h.solids.buffer()),
-                    Bind::Buf(level.u.any()),
-                    Bind::View(h.mask(l)),
-                    Bind::Buf(&level.params),
-                ],
-            )?)
-        } else {
-            None
-        };
-        recorded.push(Recorded {
-            smoother,
-            transfer,
-            mean,
-        });
-    }
-    let mut remove_mean =
-        |batch: &mut ComputeBatch, l: usize, field: &Field| -> Result<(), GpuError> {
-            let group = recorded[l].mean.as_ref().expect("closed domain");
-            reduce(gpu, cache, batch, field, ReduceOp::Sum, &h.sum, 0)?;
-            batch.dispatch(&mean_pipe, group, h.levels[l].u.cells());
-            Ok(())
+        let b = |l: usize| -> &Field {
+            if l == 0 {
+                div
+            } else {
+                h.levels[l].rhs.as_ref().expect("coarse levels hold rhs")
+            }
         };
 
-    for cycle in 0..cycles {
-        if cycle > 0 {
-            // One V-cycle per submission keeps each well inside GPU
-            // watchdog limits at any resolution.
-            batch.flush(gpu)?;
-        }
-        // Down: pre-smooth, then hand the residual to the next level.
+        let mut recorded = Vec::with_capacity(depth);
         for (l, level) in h.levels.iter().enumerate() {
-            let rec = &recorded[l];
-            let Some([residual, restrict, _]) = &rec.transfer else {
-                rec.smoother.record(batch, COARSEST_SWEEPS, false);
-                rec.smoother.record(batch, COARSEST_SWEEPS, true);
-                break;
+            let smoother = if l == 0 {
+                Smoother::with_view(gpu, cache, &level.u, p, div, h.mask(0))?
+            } else {
+                Smoother::weighted(
+                    gpu,
+                    cache,
+                    &level.u,
+                    x(l),
+                    b(l),
+                    h.mask(l),
+                    &level.params,
+                    h.phi(l),
+                )?
             };
-            rec.smoother.record(batch, SMOOTHING_SWEEPS, false);
-            batch.dispatch(&residual_pipe, residual, level.u.cells());
-            batch.dispatch(&restrict_pipe, restrict, h.levels[l + 1].u.cells());
-            if closed {
-                // The Neumann problem is solvable only for a right-hand side
-                // with zero fluid sum; restriction does not keep it exact.
-                remove_mean(batch, l + 1, b(l + 1))?;
+            let transfer = if l + 1 < depth {
+                let next = &h.levels[l + 1];
+                let tmp = level.tmp.as_ref().expect("non-coarsest levels hold tmp");
+                let residual = bind_group(
+                    gpu,
+                    &residual_pipe,
+                    &[
+                        Bind::Tex(x(l)),
+                        Bind::Tex(b(l)),
+                        Bind::Tex(tmp),
+                        Bind::Buf(level.u.any()),
+                        Bind::View(h.mask(l)),
+                        Bind::Buf(&level.params),
+                        Bind::View(h.phi(l)),
+                    ],
+                )?;
+                let restrict = bind_group(
+                    gpu,
+                    &restrict_pipe,
+                    &[
+                        Bind::Tex(tmp),
+                        Bind::View(h.mask(l)),
+                        Bind::View(h.norm(l)),
+                        Bind::Tex(b(l + 1)),
+                        Bind::Tex(x(l + 1)),
+                        Bind::Buf(next.u.any()),
+                        Bind::View(h.mask(l + 1)),
+                        Bind::Buf(&level.params),
+                        Bind::Buf(&next.params),
+                    ],
+                )?;
+                let prolong = bind_group(
+                    gpu,
+                    &prolong_pipe,
+                    &[
+                        Bind::Tex(x(l)),
+                        Bind::Tex(x(l + 1)),
+                        Bind::Buf(level.u.any()),
+                        Bind::View(h.mask(l)),
+                        Bind::View(h.mask(l + 1)),
+                        Bind::View(h.norm(l)),
+                        Bind::Buf(&level.params),
+                        Bind::Buf(&next.params),
+                    ],
+                )?;
+                Some([residual, restrict, prolong])
+            } else {
+                None
+            };
+            // Each coarse level's rhs, in a closed domain.
+            let mean = if closed && l > 0 {
+                Some(FluidMean::new(gpu, cache, h, l, b(l))?)
+            } else {
+                None
+            };
+            recorded.push(Recorded {
+                smoother,
+                transfer,
+                mean,
+            });
+        }
+        let p_mean = if closed {
+            Some(FluidMean::new(gpu, cache, h, 0, p)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            residual: residual_pipe,
+            restrict: restrict_pipe,
+            prolong: prolong_pipe,
+            recorded,
+            p_mean,
+        })
+    }
+
+    /// Record `cycles` V-cycles on the `p` this was built for.
+    pub(crate) fn record(
+        &self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        batch: &mut ComputeBatch,
+        h: &Hierarchy,
+        p: &Field,
+        cycles: u32,
+    ) -> Result<(), GpuError> {
+        let depth = h.depth();
+        for cycle in 0..cycles {
+            if cycle > 0 {
+                // One V-cycle per submission keeps each well inside GPU
+                // watchdog limits at any resolution.
+                batch.flush(gpu)?;
+            }
+            // Down: pre-smooth, then hand the residual to the next level.
+            for (l, level) in h.levels.iter().enumerate() {
+                let rec = &self.recorded[l];
+                let Some([residual, restrict, _]) = &rec.transfer else {
+                    rec.smoother.record(batch, COARSEST_SWEEPS, false);
+                    rec.smoother.record(batch, COARSEST_SWEEPS, true);
+                    break;
+                };
+                rec.smoother.record(batch, SMOOTHING_SWEEPS, false);
+                batch.dispatch(&self.residual, residual, level.u.cells());
+                batch.dispatch(&self.restrict, restrict, h.levels[l + 1].u.cells());
+                if let Some(mean) = &self.recorded[l + 1].mean {
+                    // The Neumann problem is solvable only for a right-hand
+                    // side with zero fluid sum; restriction does not keep it
+                    // exact.
+                    let rhs = h.levels[l + 1]
+                        .rhs
+                        .as_ref()
+                        .expect("coarse levels hold rhs");
+                    mean.record(gpu, cache, batch, h, rhs)?;
+                }
+            }
+            // Up: add the coarse correction, then post-smooth in the reverse
+            // colour order so the cycle is symmetric.
+            for l in (0..depth.saturating_sub(1)).rev() {
+                let rec = &self.recorded[l];
+                let [_, _, prolong] = rec.transfer.as_ref().expect("not the coarsest level");
+                batch.dispatch(&self.prolong, prolong, h.levels[l].u.cells());
+                rec.smoother.record(batch, SMOOTHING_SWEEPS, true);
             }
         }
-        // Up: add the coarse correction, then post-smooth in the reverse
-        // colour order so the cycle is symmetric.
-        for l in (0..depth.saturating_sub(1)).rev() {
-            let rec = &recorded[l];
-            let [_, _, prolong] = rec.transfer.as_ref().expect("not the coarsest level");
-            batch.dispatch(&prolong_pipe, prolong, h.levels[l].u.cells());
-            rec.smoother.record(batch, SMOOTHING_SWEEPS, true);
+        if let Some(mean) = &self.p_mean {
+            mean.record(gpu, cache, batch, h, p)?;
         }
+        Ok(())
     }
-    if closed {
-        remove_mean(batch, 0, p)?;
+}
+
+/// The fine residual r = div − h·L(p) into `out`, bound once for reuse.
+pub(crate) struct FineResidual {
+    pipe: Arc<wgpu::ComputePipeline>,
+    group: wgpu::BindGroup,
+    cells: FieldDims,
+}
+
+impl FineResidual {
+    pub(crate) fn new(
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        h: &Hierarchy,
+        p: &Field,
+        div: &Field,
+        out: &Field,
+    ) -> Result<Self, GpuError> {
+        let level = &h.levels[0];
+        let cells = level.u.cells();
+        expect_dims("residual p", p, cells)?;
+        expect_dims("residual div", div, cells)?;
+        expect_dims("residual output", out, cells)?;
+        let pipe = cache.get_or_create(gpu, "ember.mg.residual", RESIDUAL, "main")?;
+        let group = bind_group(
+            gpu,
+            &pipe,
+            &[
+                Bind::Tex(p),
+                Bind::Tex(div),
+                Bind::Tex(out),
+                Bind::Buf(level.u.any()),
+                Bind::View(h.mask(0)),
+                Bind::Buf(&level.params),
+                Bind::View(h.phi(0)),
+            ],
+        )?;
+        Ok(Self { pipe, group, cells })
     }
-    Ok(())
+
+    pub(crate) fn record(&self, batch: &mut ComputeBatch) {
+        batch.dispatch(&self.pipe, &self.group, self.cells);
+    }
+}
+
+/// Removing one field's mean over fluid cells on one level: a `Sum`
+/// reduction into the hierarchy's `sum`, then `subtract_fluid_mean`.
+pub(crate) struct FluidMean {
+    pipe: Arc<wgpu::ComputePipeline>,
+    group: wgpu::BindGroup,
+    cells: FieldDims,
+}
+
+impl FluidMean {
+    /// For `field` on level `l` of `h`.
+    pub(crate) fn new(
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        h: &Hierarchy,
+        l: usize,
+        field: &Field,
+    ) -> Result<Self, GpuError> {
+        let level = &h.levels[l];
+        expect_dims("fluid mean field", field, level.u.cells())?;
+        let pipe = cache.get_or_create(
+            gpu,
+            "ember.mg.subtract_fluid_mean",
+            SUBTRACT_FLUID_MEAN,
+            "main",
+        )?;
+        let group = bind_group(
+            gpu,
+            &pipe,
+            &[
+                Bind::Tex(field),
+                Bind::Buf(h.sum.buffer()),
+                Bind::Buf(h.solids.buffer()),
+                Bind::Buf(level.u.any()),
+                Bind::View(h.mask(l)),
+                Bind::Buf(&level.params),
+            ],
+        )?;
+        Ok(Self {
+            pipe,
+            group,
+            cells: level.u.cells(),
+        })
+    }
+
+    /// Record the removal; `field` must be the one this was built for.
+    pub(crate) fn record(
+        &self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        batch: &mut ComputeBatch,
+        h: &Hierarchy,
+        field: &Field,
+    ) -> Result<(), GpuError> {
+        reduce(gpu, cache, batch, field, ReduceOp::Sum, &h.sum, 0)?;
+        batch.dispatch(&self.pipe, &self.group, self.cells);
+        Ok(())
+    }
 }
 
 /// r = div − h·L(p) on the fine grid, in the same units as `div`, so the

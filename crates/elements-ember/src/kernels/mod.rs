@@ -7,6 +7,7 @@
 
 mod advect;
 mod forces;
+pub mod mgpcg;
 pub mod multigrid;
 mod project;
 mod solid;
@@ -14,7 +15,8 @@ mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
 pub use forces::{blend_velocity, buoyancy, emit, wind};
-pub use multigrid::{Hierarchy, v_cycles};
+pub use mgpcg::mgpcg;
+pub use multigrid::{Hierarchy, v_cycle_from_zero, v_cycles};
 pub use project::{
     CELL_SWEEPS_PER_SUBMIT, divergence, iterations_per_submit, pressure, remove_mean,
     solve_pressure, subtract_gradient,
