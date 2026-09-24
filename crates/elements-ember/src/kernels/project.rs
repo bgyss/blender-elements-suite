@@ -18,6 +18,16 @@ const PRESSURE: &str = concat!(
     include_str!("shaders/pressure.wgsl"),
 );
 
+/// The red-black smoother with per-level face weights, for multigrid's
+/// coarse levels (`multigrid.rs`). The fine grid always runs `PRESSURE`.
+const PRESSURE_LEVEL: &str = concat!(
+    include_str!("shaders/common.wgsl"),
+    include_str!("shaders/solid.wgsl"),
+    include_str!("shaders/level_params.wgsl"),
+    include_str!("shaders/stencil.wgsl"),
+    include_str!("shaders/pressure_level.wgsl"),
+);
+
 const GRADIENT: &str = concat!(
     include_str!("shaders/common.wgsl"),
     include_str!("shaders/solid.wgsl"),
@@ -98,7 +108,8 @@ pub fn pressure(
     expect_dims("pressure divergence", div, u.cells())?;
     // Checks the collider's velocity dims too, though only the mask is read.
     solid_views(u, solids, None)?;
-    let mask = solids.map(|s| s.mask);
+    // Bind groups are built once and reused by every chunk.
+    let smoother = Smoother::new(gpu, cache, u, p, div, solids.map(|s| s.mask))?;
     // A long loop is split across submissions, so one submission never runs
     // long enough to trip a GPU watchdog (risk f). Order is unchanged.
     let per_submit = per_submit.max(1);
@@ -108,7 +119,7 @@ pub fn pressure(
             batch.flush(gpu)?;
         }
         let sweeps = per_submit.min(iterations - done);
-        relax(gpu, cache, batch, u, p, div, sweeps, mask, false)?;
+        smoother.record(batch, sweeps, false);
         done += sweeps;
     }
     Ok(())
@@ -194,6 +205,43 @@ impl Smoother {
         })
     }
 
+    /// A smoother for a coarse multigrid level: the same red-black sweep,
+    /// with each face weighted by `level` (a `LevelParams` uniform) and, with
+    /// solids, the cells' fluid fractions `phi`.
+    #[allow(clippy::too_many_arguments)] // every arg is a distinct binding.
+    pub(crate) fn weighted(
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        u: &Uniforms,
+        p: &Field,
+        div: &Field,
+        solid: &wgpu::TextureView,
+        level: &wgpu::Buffer,
+        phi: &wgpu::TextureView,
+    ) -> Result<Self, GpuError> {
+        expect_dims("pressure p", p, u.cells())?;
+        expect_dims("pressure divergence", div, u.cells())?;
+        let red = cache.get_or_create(gpu, "ember.mg.pressure.red", PRESSURE_LEVEL, "red")?;
+        let black = cache.get_or_create(gpu, "ember.mg.pressure.black", PRESSURE_LEVEL, "black")?;
+        let entries = [
+            Bind::Tex(p),
+            Bind::Tex(div),
+            Bind::Buf(u.any()),
+            Bind::View(solid),
+            Bind::Buf(level),
+            Bind::View(phi),
+        ];
+        let red_group = bind_group(gpu, &red, &entries)?;
+        let black_group = bind_group(gpu, &black, &entries)?;
+        Ok(Self {
+            red,
+            black,
+            red_group,
+            black_group,
+            cells: u.cells(),
+        })
+    }
+
     /// Record `sweeps` sweeps. `reverse` runs black before red in each.
     pub(crate) fn record(&self, batch: &mut ComputeBatch, sweeps: u32, reverse: bool) {
         let (first, second) = if reverse {
@@ -212,25 +260,6 @@ impl Smoother {
             batch.dispatch(second.0, second.1, self.cells);
         }
     }
-}
-
-/// `sweeps` red-black sweeps on `p` with `div` as the right-hand side,
-/// reading solids from `mask` alone (the multigrid levels have no collider
-/// velocity). `reverse` runs black before red in each sweep.
-#[allow(clippy::too_many_arguments)] // mirrors `pressure`; every arg is load-bearing.
-pub(crate) fn relax(
-    gpu: &GpuContext,
-    cache: &mut PipelineCache,
-    batch: &mut ComputeBatch,
-    u: &Uniforms,
-    p: &Field,
-    div: &Field,
-    sweeps: u32,
-    mask: Option<&Field>,
-    reverse: bool,
-) -> Result<(), GpuError> {
-    Smoother::new(gpu, cache, u, p, div, mask)?.record(batch, sweeps, reverse);
-    Ok(())
 }
 
 /// Remove `field`'s mean on the GPU, with no readback: a sum reduction into

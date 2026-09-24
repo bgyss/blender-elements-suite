@@ -63,67 +63,108 @@ stays valid.
 
 ### 3.2 Levels
 
-- Each level halves every dimension, rounding up, until the smallest is at
-  most 2: seven levels at 128³, eight at 256³.
-- A coarse cell is solid only if all 8 of its children are solid, so thin
-  fluid gaps never close.
+- Each level halves every axis still longer than 1 cell, rounding up, down
+  to 1×1×1. An axis that reaches 1 stops while the others go on
+  (semi-coarsening). That gives eight levels at 128³, nine at 256³, and nine
+  at 32×32×256.
+  - Axes that still have neighbours always share one spacing, so no level
+    couples anisotropically.
+  - Stopping at 2 per axis left tall domains' coarse levels 2×2×n, with
+    z-cells twice as long. There 32×32×256 stalled at ×1.4 per cycle.
+  - Stopping at 8 left the coarsest solve unconverged: 32 sweeps reduce the
+    slowest open-face mode only to about 0.66.
+- A level's last cell along an axis may be partial, covering only the fine
+  cells before the domain's edge, when a size does not halve evenly.
+- A coarse cell is solid only if all its children are solid, so thin fluid
+  gaps never close.
 - The open-face mask is the same on every level.
-- Each level is re-discretised at spacing 2ˡ·dx with today's kernel, with one
-  change: an open neighbour adds `open_weight` = 2·2ˡ/(2ˡ+1) to the
-  stencil's count instead of 1. That keeps p = 0 where the fine grid has
-  it, 0.5·dx₀ beyond the face, rather than 0.5·dx_l beyond. The weight is
-  exactly 1 on level 0, so the fine grid is today's stencil bit for bit. It
-  uses the former padding word of the 64-byte uniform.
+- Every level is a finite-volume discretisation over the true geometry
+  (`LevelParams`, `stencil.wgsl`):
+  - A face weighs its area over the distance between the centroids it
+    joins. A partial cell's centroid lies inside its fine cells, and its
+    faces along other axes are smaller.
+  - An open face reaches p = 0 where the fine grid puts it, 0.5 fine cells
+    beyond the face. So there is one weight per axis and side:
+    - low: g·s/(0.5·s + 0.5)
+    - high: g·s/(N₀ + 0.5 − c_last), where c_last is the last cell's
+      centroid, ((N_l − 1)·s + N₀)/2.
 
-Why not the original design (halving to 8, the same stencil on every
-level)? Task 1 measured it (`.superpowers/sdd/2b3c/task-1-report.md`). On
-white noise it looked fine: 24× on the first V-cycle. But on a smooth,
-plume-like right-hand side with an open top it stalled at 64³ (×1.0–1.7 per
-cycle) and diverged at 128³ (×0.6–1.0). A closed box converged. There were
-two causes, and fixing either alone still stalled or diverged:
+    The high side needs the centroid. With the nominal centre
+    (N_l − 0.5)·s instead, the distance goes negative, for example at
+    N₀ = 100, s = 16.
+  - The equation is divided by V/s_ref², where V = Πs and s_ref = min s.
+    A full face along axis a then weighs g_a = (s_ref/s_a)², and the
+    smoother's dx² is (s_ref·dx₀)².
+  - With a collider, a coarse face also scales by √(φ_c·φ_q), where φ is
+    each cell's fluid volume fraction. This is a symmetric stand-in for the
+    Galerkin row, which near a solid is about φ times the full stencil, as
+    the restricted right-hand side is. Without it, cases with a sphere ran
+    at ×2.5 per cycle; with it, ×3.8.
+- On the fine grid every weight is exactly 1, and it runs today's
+  `pressure.wgsl` unchanged. Gauss–Seidel frames stay bit-identical.
 
-- 32 sweeps on 8³ reduce the slowest open-face mode, a quarter-wave, only to
-  about 0.66.
-- The re-discretised Dirichlet boundary drifts outward with level: 8 fine
-  cells beyond the domain on the coarsest level at 128³.
+Measured on a smooth, plume-like right-hand side. The steady rate is the
+geometric mean of cycles 2–4; cycle 1 from p = 0 is always about 0.72 of it.
 
-With both fixed, one V-cycle reduces a smooth right-hand side's residual by:
+| shape | open faces | steady | cycle 1 |
+|---|---|---|---|
+| 64³, 80³, 96³, 100³, 128³ | top | 4.19–4.22× | 3.0× |
+| 64³, 100³ | closed | 4.21–4.22× | 3.0× |
+| 64×64×100 | top | 4.18× | 3.0× |
+| 64×64×256 | top | 4.14× | 3.0× |
+| 32×32×256 | top | 4.24× | 3.1× |
+| 64³ with a sphere (radius n/6) | top or closed | 3.80–3.84× | 2.8× |
 
-| scene | cycle 1 | cycles 2–4 |
-|---|---|---|
-| 64³ closed | 4.4× | 5.9–6.1× |
-| 64³ open top | 4.4× | 5.9–6.1× |
-| 128³ open top | 4.4× | 5.6–6.1× |
-| 64³ open top with a sphere collider | 2.8× | 4.2–4.6× |
-
-Each converges to the f32 floor. White noise gives 24× on the first cycle,
-then about 8× per cycle. At 128³ with an open top, 4 V-cycles leave a smooth
-right-hand side's residual 1158× below what 40 red-black iterations leave.
-
-Prolongation matches the open faces too: a coarse sample beyond an open
-face is the linear ghost (1 − open_weight) times its neighbour, not a clamp.
+With the design first specified (stop at 8, today's stencil on every level),
+64×64×100 and 100³ with an open top diverged, and closed 100³ fell to ×1.9.
+Details are in `.superpowers/sdd/2b3c/task-1-report.md`.
 
 ### 3.3 The V-cycle
 
-A correction scheme:
+A correction scheme, built so that one V-cycle from zero is a symmetric
+operator, as MGPCG (§3.5) needs:
 
-1. Fine residual r = b − Ap.
-2. Restrict r by averaging the fluid children.
-3. On each coarser level: 2 red-black sweeps, recurse, 2 sweeps in the
-   reverse colour order (black, then red), so the cycle is symmetric.
-4. Coarsest level: 32 sweeps.
-5. Prolong the correction trilinearly onto fluid cells and add it.
+1. Fine residual r = b − Ap, in the units of `div`.
+2. Restrict with R = κ·Pᵀ, the exact transpose of the prolongation gathered
+   at each coarse cell, with κ = 1/2 per halved axis. With a collider, P
+   renormalises over the coarse corners it keeps. That factor is computed
+   once per hierarchy, so R applies the identical one.
+3. On each coarser level: 2 red-black sweeps, recurse, then 2 sweeps in the
+   reverse colour order (black, then red).
+4. Coarsest level (always 1×1×1): one red-black sweep, then one black-red,
+   a palindrome.
+5. Prolong P: along each axis, interpolate linearly between the coarse
+   centroids around a fine cell's centroid. Beyond an open face, interpolate
+   towards p = 0 at the fine grid's position. Beyond a wall, hold the last
+   value. Add the result to fluid cells.
 
-Closed domains are singular, so each level's residual has its mean removed,
-as the finest level's pressure already does.
+Closed domains are singular. On every level the right-hand side has its
+mean over fluid cells removed, and so does p at the end. Solid cells hold 0
+and are not counted; each level's solid count is reduced once per
+hierarchy.
+
+Measured symmetry: ⟨Ma, b⟩ and ⟨a, Mb⟩ agree to 1.5e-10 – 1.1e-8 relative,
+across open top, closed, uneven sizes and a sphere.
+
+The price of symmetry is rate. The averaging restriction first specified is
+not Pᵀ; it ran at about ×6 per cycle, against ×4.2 now. Scaling the coarse
+correction by 0.8–1.75 only made either version worse.
 
 ### 3.4 Kernels and memory
 
-- The existing smoother (`pressure.wgsl`) gains per-level uniforms: dims,
-  dx², right-hand-side texture, solid texture.
-- New kernels: `residual`, `restrict`, `prolong_add`.
-- Each level holds a pressure, a right-hand side and a solid mask, about 3/7
-  of one field in total, all from the pool.
+- The fine grid runs today's `pressure.wgsl`. Coarse levels run
+  `pressure_level.wgsl`, the same sweep with each face weighted by a
+  128-byte `LevelParams` uniform per level.
+- New kernels:
+  - `residual`, `restrict`, `prolong_add`
+  - per hierarchy: `restrict_mask`, `prolong_norm` and `restrict_fraction`
+  - `subtract_fluid_mean`
+- Each coarse level holds a correction, a right-hand side and a residual.
+  With a collider it also holds a solid mask, a fluid fraction and
+  prolongation weights. Level 0 holds only a residual, plus the prolongation
+  weights with a collider. Coarse levels are 1/8 the size of the one above,
+  so everything together is about 1 fine field, or 2 with a collider, all
+  from the pool.
 - Red-black ordering and fixed-order reductions keep every frame
   bit-identical.
 

@@ -5,7 +5,9 @@ use elements_core::gpu::{
     ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache,
 };
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
-use elements_ember::kernels::multigrid::{Hierarchy, residual, restrict_mask, v_cycles};
+use elements_ember::kernels::multigrid::{
+    Hierarchy, residual, residual_at, restrict_mask, v_cycles,
+};
 use elements_ember::kernels::{StepConstants, Uniforms, pressure};
 
 const H: f32 = 0.1;
@@ -235,9 +237,10 @@ fn a_v_cycle_cuts_the_residual_tenfold_in_every_boundary_setting() {
         );
         assert!(r1 < r0 / 10.0, "{name}: {r0} -> {r1}");
         // On noise the first cycle is mostly the smoother's work, so it would
-        // pass even with a weak coarse correction. Two cycles must still
-        // average 10×, which needs the coarse levels.
-        assert!(r2 < r0 / 100.0, "{name}: {r0} -> {r1} -> {r2}");
+        // pass even with a weak coarse correction; the second needs the coarse
+        // levels. Two cycles measure 92× (16.3 then 5.7); a halved coarse
+        // correction reached 36× in the original design.
+        assert!(r2 < r0 / 60.0, "{name}: {r0} -> {r1} -> {r2}");
     }
 }
 
@@ -277,15 +280,18 @@ fn v_cycles_beat_the_same_cost_of_gauss_seidel() {
 }
 
 #[test]
-fn a_hierarchy_stops_at_two_cells_and_returns_every_field() {
+fn a_hierarchy_halves_every_axis_down_to_one_cell_and_returns_every_field() {
     let gpu = gpu();
     let mut cache = PipelineCache::new();
     for (cells, depth, solids) in [
-        (FieldDims::new(128, 128, 128), 7, false),
-        (FieldDims::new(256, 256, 256), 8, false),
-        // 40×24×16 → 20×12×8 → 10×6×4 → 5×3×2.
-        (FieldDims::new(40, 24, 16), 4, false),
-        (FieldDims::new(64, 64, 64), 6, true),
+        (FieldDims::new(128, 128, 128), 8, false),
+        (FieldDims::new(256, 256, 256), 9, false),
+        // 40 → 20 → 10 → 5 → 3 → 2 → 1 along x; y and z reach 1 sooner and
+        // stop there while x goes on.
+        (FieldDims::new(40, 24, 16), 7, false),
+        // 256 → 1 is 9 levels; x and y reach 1 after 6.
+        (FieldDims::new(32, 32, 256), 9, false),
+        (FieldDims::new(64, 64, 64), 7, true),
     ] {
         // The fine mask comes from its own pool, so `pool` holds only what
         // the hierarchy acquired.
@@ -379,69 +385,356 @@ fn smooth_rhs(cells: FieldDims) -> Vec<f32> {
     v
 }
 
+/// Fluid cells' values, the solid cells zeroed, with the fluid mean removed
+/// when `closed`, so a closed problem is solvable.
+fn fluid_rhs(mut v: Vec<f32>, solid: Option<&[f32]>, closed: bool) -> Vec<f32> {
+    let fluid = |i: usize| solid.is_none_or(|s| s[i] <= 0.5);
+    if closed {
+        let (mut sum, mut n) = (0.0f64, 0usize);
+        for (i, x) in v.iter().enumerate() {
+            if fluid(i) {
+                sum += f64::from(*x);
+                n += 1;
+            }
+        }
+        let mean = (sum / n as f64) as f32;
+        v.iter_mut().for_each(|x| *x -= mean);
+    }
+    for (i, x) in v.iter_mut().enumerate() {
+        if !fluid(i) {
+            *x = 0.0;
+        }
+    }
+    v
+}
+
+/// Residual RMS after each of `cycles` V-cycles from p = 0, with r0 first.
+fn residual_history(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    cells: FieldDims,
+    mask: u32,
+    sphere: bool,
+    cycles: usize,
+) -> Vec<f64> {
+    let mut pool = FieldPool::new();
+    let c = StepConstants {
+        open_mask: mask,
+        has_solids: sphere,
+        ..StepConstants::new(cells, H, 2.0 / cells.x as f32)
+    };
+    let solid = sphere.then(|| sphere_mask(cells, cells.x.min(cells.y).min(cells.z) as f32 / 6.0));
+    let div_values = fluid_rhs(smooth_rhs(cells), solid.as_deref(), mask == 0);
+    let solid_field = solid.map(|s| upload(gpu, &mut pool, cells, &s));
+    let div = upload(gpu, &mut pool, cells, &div_values);
+    let p = upload(gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
+    let mut batch = ComputeBatch::new();
+    let h = Hierarchy::new(gpu, cache, &mut batch, &mut pool, &c, solid_field.as_ref()).unwrap();
+    batch.submit(gpu).unwrap();
+    let mut history = vec![residual_rms(gpu, &c, &p, &div, solid_field.as_ref())];
+    for _ in 0..cycles {
+        let mut batch = ComputeBatch::new();
+        v_cycles(gpu, cache, &mut batch, &h, &p, &div, 1).unwrap();
+        batch.submit(gpu).unwrap();
+        history.push(residual_rms(gpu, &c, &p, &div, solid_field.as_ref()));
+    }
+    h.release(&mut pool);
+    history
+}
+
 /// A smooth right-hand side is what the pressure solve sees, and where the
-/// coarse levels do the work: open faces must sit in the same place on every
-/// level, and the coarsest solve must converge, or the cycle stalls.
+/// coarse levels do the work. Every shape converges at the same steady rate:
+/// sizes that halve unevenly (partial coarse cells), tall domains (axes that
+/// stop halving before others), open faces and walls, with and without a
+/// collider.
+///
+/// The floors are on the steady rate, the geometric mean of cycles 2–4. The
+/// first cycle from p = 0 is always about 0.72× the steady one (3.0× against
+/// 4.2×, 2.8× against 3.8× with a collider), so it gets its own floor. A
+/// symmetric cycle (restriction = κ·Pᵀ, which MGPCG needs) runs at about
+/// 4.2× where the unsymmetric averaging restriction ran at 6×; scaling the
+/// coarse correction either way only made it worse (task 1 report).
 #[test]
-fn v_cycles_converge_steadily_on_a_smooth_right_hand_side() {
+fn v_cycles_converge_steadily_on_every_shape() {
     let gpu = gpu();
     let mut cache = PipelineCache::new();
-    for (name, n, mask, sphere, floor) in [
-        ("closed", 64u32, 0u32, false, 4.0),
-        ("open top", 64, DEFAULT_OPEN_MASK, false, 4.0),
-        ("open top, sphere", 64, DEFAULT_OPEN_MASK, true, 3.0),
-        ("open top, 128³", 128, DEFAULT_OPEN_MASK, false, 4.0),
+    let top = DEFAULT_OPEN_MASK;
+    for (name, cells, mask, sphere) in [
+        ("64³ closed", FieldDims::new(64, 64, 64), 0u32, false),
+        ("64³ open top", FieldDims::new(64, 64, 64), top, false),
+        ("128³ open top", FieldDims::new(128, 128, 128), top, false),
+        (
+            "64×64×100 open top",
+            FieldDims::new(64, 64, 100),
+            top,
+            false,
+        ),
+        ("100³ open top", FieldDims::new(100, 100, 100), top, false),
+        ("80³ open top", FieldDims::new(80, 80, 80), top, false),
+        ("100³ closed", FieldDims::new(100, 100, 100), 0, false),
+        (
+            "64×64×256 open top",
+            FieldDims::new(64, 64, 256),
+            top,
+            false,
+        ),
+        (
+            "32×32×256 open top",
+            FieldDims::new(32, 32, 256),
+            top,
+            false,
+        ),
+        (
+            "64³ open top, sphere",
+            FieldDims::new(64, 64, 64),
+            top,
+            true,
+        ),
+        ("64³ closed, sphere", FieldDims::new(64, 64, 64), 0, true),
     ] {
-        let cells = FieldDims::new(n, n, n);
+        let r = residual_history(&gpu, &mut cache, cells, mask, sphere, 4);
+        let factors: Vec<f64> = r.windows(2).map(|w| w[0] / w[1]).collect();
+        let steady = (r[1] / r[4]).powf(1.0 / 3.0);
+        let (first_floor, steady_floor) = if sphere { (2.5, 3.5) } else { (2.8, 4.0) };
+        println!("{name}: per cycle {factors:.2?}, steady {steady:.2}");
+        assert!(
+            factors[0] >= first_floor && steady >= steady_floor,
+            "{name}: per cycle {factors:.2?}, steady {steady:.2}"
+        );
+    }
+}
+
+/// MGPCG needs the preconditioner to be symmetric: ⟨Ma, b⟩ = ⟨a, Mb⟩ for
+/// M = one V-cycle from zero.
+#[test]
+fn a_v_cycle_is_a_symmetric_operator() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    for (name, cells, mask, sphere) in [
+        (
+            "open top",
+            FieldDims::new(32, 32, 32),
+            DEFAULT_OPEN_MASK,
+            false,
+        ),
+        ("closed, uneven", FieldDims::new(30, 27, 21), 0u32, false),
+        (
+            "open top, sphere, uneven",
+            FieldDims::new(30, 27, 33),
+            DEFAULT_OPEN_MASK,
+            true,
+        ),
+        ("closed, sphere", FieldDims::new(32, 32, 32), 0, true),
+    ] {
         let mut pool = FieldPool::new();
         let c = StepConstants {
             open_mask: mask,
             has_solids: sphere,
-            ..StepConstants::new(cells, H, 2.0 / n as f32)
+            ..StepConstants::new(cells, H, 1.0 / 16.0)
         };
-        let mut div_values = smooth_rhs(cells);
-        let solid_field = sphere.then(|| {
-            let solid = sphere_mask(cells, 10.0);
-            for (d, s) in div_values.iter_mut().zip(&solid) {
-                if *s > 0.5 {
-                    *d = 0.0;
-                }
-            }
-            upload(&gpu, &mut pool, cells, &solid)
-        });
-        let div = upload(&gpu, &mut pool, cells, &div_values);
-        let p = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
-        let mut batch = ComputeBatch::new();
-        let h = Hierarchy::new(
-            &gpu,
-            &mut cache,
-            &mut batch,
-            &mut pool,
-            &c,
-            solid_field.as_ref(),
-        )
-        .unwrap();
-        batch.submit(&gpu).unwrap();
-        let r0 = residual_rms(&gpu, &c, &p, &div, solid_field.as_ref());
-        let mut r = r0;
-        let mut factors = Vec::new();
-        for _ in 0..4 {
+        let solid = sphere.then(|| sphere_mask(cells, 6.0));
+        let solid_field = solid.as_ref().map(|s| upload(&gpu, &mut pool, cells, s));
+        let closed = mask == 0;
+        let a = fluid_rhs(pattern(cells, 11), solid.as_deref(), closed);
+        let b = fluid_rhs(pattern(cells, 29), solid.as_deref(), closed);
+        let mut apply = |v: &[f32]| -> Vec<f32> {
+            let div = upload(&gpu, &mut pool, cells, v);
+            let p = upload(&gpu, &mut pool, cells, &vec![0.0; cells.voxel_count()]);
             let mut batch = ComputeBatch::new();
+            let h = Hierarchy::new(
+                &gpu,
+                &mut cache,
+                &mut batch,
+                &mut pool,
+                &c,
+                solid_field.as_ref(),
+            )
+            .unwrap();
             v_cycles(&gpu, &mut cache, &mut batch, &h, &p, &div, 1).unwrap();
             batch.submit(&gpu).unwrap();
-            let next = residual_rms(&gpu, &c, &p, &div, solid_field.as_ref());
-            factors.push(r / next);
-            r = next;
+            let out = p.read_back(&gpu).unwrap();
+            h.release(&mut pool);
+            out
+        };
+        let (ma, mb) = (apply(&a), apply(&b));
+        let dot = |x: &[f32], y: &[f32]| {
+            x.iter()
+                .zip(y)
+                .map(|(u, v)| f64::from(*u) * f64::from(*v))
+                .sum::<f64>()
+        };
+        let (x, y) = (dot(&ma, &b), dot(&a, &mb));
+        let rel = (x - y).abs() / x.abs().max(y.abs());
+        println!("{name}: <Ma,b> {x:.9e}, <a,Mb> {y:.9e}, relative difference {rel:.3e}");
+        assert!(rel < 1e-5, "{name}: <Ma,b> {x}, <a,Mb> {y}, relative {rel}");
+    }
+}
+
+/// The residual on coarse levels against a CPU finite-volume stencil built
+/// from the geometry alone: each level cell spans [i·s, min((i+1)·s, N₀))
+/// fine cells along each axis, a face weighs its area over the distance
+/// between the centroids it joins (or to p = 0, 0.5 beyond an open face),
+/// and the equation is divided by V/s_ref² (V = Πs, s_ref = min s). This
+/// covers the partial last cells, the per-side open weights and the
+/// per-axis weights of a level whose axes stopped halving at different
+/// times.
+#[test]
+fn coarse_level_residuals_match_a_finite_volume_stencil() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    // −x, +y, +z open; 10×12×9 halves unevenly in x and z. 3×3×20 has
+    // x and y reach 1 while z goes on (open top and bottom).
+    for (fine, mask) in [
+        (FieldDims::new(10, 12, 9), 0b101001u32),
+        (FieldDims::new(3, 3, 20), 0b110000),
+    ] {
+        let mut pool = FieldPool::new();
+        let dx0 = 0.25f32;
+        let c = StepConstants {
+            open_mask: mask,
+            ..StepConstants::new(fine, H, dx0)
+        };
+        let mut batch = ComputeBatch::new();
+        let h = Hierarchy::new(&gpu, &mut cache, &mut batch, &mut pool, &c, None).unwrap();
+        batch.submit(&gpu).unwrap();
+        let n0 = [fine.x, fine.y, fine.z];
+        let mut scale = [1u32; 3];
+        for l in 1..h.depth() {
+            let prev = h.dims(l - 1);
+            let dims = h.dims(l);
+            let (pa, da) = ([prev.x, prev.y, prev.z], [dims.x, dims.y, dims.z]);
+            for a in 0..3 {
+                if da[a] != pa[a] {
+                    scale[a] *= 2;
+                }
+            }
+            let p_values = pattern(dims, 5);
+            let div_values = pattern(dims, 6);
+            let p = upload(&gpu, &mut pool, dims, &p_values);
+            let div = upload(&gpu, &mut pool, dims, &div_values);
+            let out = pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap();
+            let mut batch = ComputeBatch::new();
+            residual_at(&gpu, &mut cache, &mut batch, &h, l, &p, &div, &out).unwrap();
+            batch.submit(&gpu).unwrap();
+            let got = out.read_back(&gpu).unwrap();
+
+            // The geometry, in fine cells.
+            let extent = |a: usize, i: u32| {
+                let lo = f64::from(i * scale[a]);
+                let hi = f64::from(((i + 1) * scale[a]).min(n0[a]));
+                (lo, hi)
+            };
+            let centroid = |a: usize, i: u32| {
+                let (lo, hi) = extent(a, i);
+                (lo + hi) / 2.0
+            };
+            let s_ref = f64::from(*scale.iter().min().unwrap());
+            let k = f64::from(scale[0] * scale[1] * scale[2]) / (s_ref * s_ref);
+            let dx2 = f64::from(dx0) * s_ref * f64::from(dx0) * s_ref;
+            let mut want = vec![0.0f32; dims.voxel_count()];
+            for kz in 0..dims.z {
+                for jy in 0..dims.y {
+                    for ix in 0..dims.x {
+                        let cell = [ix, jy, kz];
+                        let at = |q: [u32; 3]| p_values[index(dims, q[0], q[1], q[2])] as f64;
+                        let mut sum = 0.0f64;
+                        for a in 0..3 {
+                            let area: f64 = (0..3)
+                                .filter(|&b| b != a)
+                                .map(|b| {
+                                    let (lo, hi) = extent(b, cell[b]);
+                                    hi - lo
+                                })
+                                .product();
+                            for side in 0..2 {
+                                let i = cell[a];
+                                let inside = if side == 0 { i > 0 } else { i + 1 < da[a] };
+                                if inside {
+                                    let mut q = cell;
+                                    q[a] = if side == 0 { i - 1 } else { i + 1 };
+                                    let d = (centroid(a, q[a]) - centroid(a, i)).abs();
+                                    sum += area / d / k * (at(q) - at(cell));
+                                } else if is_open(mask, a, side) {
+                                    let d = if side == 0 {
+                                        centroid(a, i) + 0.5
+                                    } else {
+                                        f64::from(n0[a]) + 0.5 - centroid(a, i)
+                                    };
+                                    sum += area / d / k * (0.0 - at(cell));
+                                }
+                            }
+                        }
+                        let at_div = f64::from(div_values[index(dims, ix, jy, kz)]);
+                        want[index(dims, ix, jy, kz)] = (at_div - f64::from(H) * sum / dx2) as f32;
+                    }
+                }
+            }
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs() / w.abs().max(1.0))
+                .fold(0.0f32, f32::max);
+            println!(
+                "{fine:?} level {l} {dims:?} scale {scale:?}: worst relative error {worst:.2e}"
+            );
+            assert!(
+                worst < 1e-4,
+                "{fine:?} level {l}: worst relative error {worst}"
+            );
         }
         h.release(&mut pool);
-        // The mean over four cycles: the first cycle on a smooth rhs has
-        // little high-frequency error for the smoother to remove, so it is
-        // the slowest (2.8× with the sphere).
-        let mean = (r0 / r).powf(0.25);
-        println!("{name}: r0 {r0:.4e} -> {r:.4e}, per cycle {factors:.2?}, mean {mean:.2}");
-        assert!(
-            mean >= floor,
-            "{name}: per cycle {factors:.2?}, mean {mean:.2}"
-        );
     }
+}
+
+/// A closed domain defines p only up to a constant; the V-cycle removes p's
+/// mean over fluid cells, where the solid cells (held at 0) do not count.
+#[test]
+fn a_closed_domain_keeps_the_fluid_mean_of_p_at_zero() {
+    let gpu = gpu();
+    let mut cache = PipelineCache::new();
+    let mut pool = FieldPool::new();
+    let cells = FieldDims::new(32, 32, 32);
+    let c = StepConstants {
+        open_mask: 0,
+        has_solids: true,
+        ..StepConstants::new(cells, H, 1.0 / 16.0)
+    };
+    let solid = sphere_mask(cells, 8.0);
+    let div_values = fluid_rhs(smooth_rhs(cells), Some(&solid), true);
+    // A warm start offset by 1 in the fluid, as a previous frame might leave.
+    let p0: Vec<f32> = solid
+        .iter()
+        .map(|&s| if s > 0.5 { 0.0 } else { 1.0 })
+        .collect();
+    let solid_field = upload(&gpu, &mut pool, cells, &solid);
+    let div = upload(&gpu, &mut pool, cells, &div_values);
+    let p = upload(&gpu, &mut pool, cells, &p0);
+    let mut batch = ComputeBatch::new();
+    let h = Hierarchy::new(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &mut pool,
+        &c,
+        Some(&solid_field),
+    )
+    .unwrap();
+    v_cycles(&gpu, &mut cache, &mut batch, &h, &p, &div, 2).unwrap();
+    batch.submit(&gpu).unwrap();
+    h.release(&mut pool);
+    let got = p.read_back(&gpu).unwrap();
+    let (mut sum, mut n, mut peak) = (0.0f64, 0usize, 0.0f32);
+    for (v, s) in got.iter().zip(&solid) {
+        if *s <= 0.5 {
+            sum += f64::from(*v);
+            n += 1;
+            peak = peak.max(v.abs());
+        }
+    }
+    let mean = sum / n as f64;
+    println!("fluid mean {mean:.3e}, max |p| {peak:.3e}");
+    assert!(
+        mean.abs() < 1e-6 * f64::from(peak),
+        "fluid mean {mean}, max |p| {peak}"
+    );
 }

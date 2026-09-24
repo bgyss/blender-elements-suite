@@ -96,9 +96,7 @@ struct KernelParams {
     confinement: f32,
     face_accel: f32,
     has_solids: u32,
-    /// Added to the pressure stencil's count for an open neighbour: 1 on the
-    /// fine grid, more on multigrid levels.
-    open_weight: f32,
+    _pad: u32,
 }
 
 // `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
@@ -134,17 +132,6 @@ pub struct Uniforms {
 
 impl Uniforms {
     pub fn new(gpu: &GpuContext, c: &StepConstants) -> Result<Self, GpuError> {
-        Self::with_open_weight(gpu, c, 1.0)
-    }
-
-    /// As `new`, with `open_weight` in place of 1: what an open neighbour
-    /// adds to the pressure stencil's count on a multigrid level (see
-    /// `multigrid::open_weight`).
-    pub(crate) fn with_open_weight(
-        gpu: &GpuContext,
-        c: &StepConstants,
-        open_weight: f32,
-    ) -> Result<Self, GpuError> {
         let make = |axis: u32, decay: f32| {
             let params = KernelParams {
                 dims: [c.cells.x, c.cells.y, c.cells.z],
@@ -160,7 +147,7 @@ impl Uniforms {
                 confinement: c.vorticity * c.dx,
                 face_accel: if axis < 3 { c.wind[axis as usize] } else { 0.0 },
                 has_solids: u32::from(c.has_solids),
-                open_weight,
+                _pad: 0,
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {

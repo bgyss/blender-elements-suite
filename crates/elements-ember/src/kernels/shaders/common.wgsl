@@ -16,7 +16,7 @@ struct Params {
     confinement: f32,    // ε·dx, the vorticity confinement strength scaled to this grid
     face_accel: f32,     // wind along this uniform's axis, m/s²; 0 for cell grids
     has_solids: u32,     // 1 when a collider's solid mask is bound (2b-2 spec §3.2)
-    open_weight: f32,    // an open neighbour's weight in the pressure stencil: 1, or more on a multigrid level
+    _pad2: u32,
 };
 
 // `axis` for a cell-centred grid.
