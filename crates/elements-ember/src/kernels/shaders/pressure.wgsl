@@ -22,7 +22,8 @@ fn relax(gid: vec3<u32>, colour: u32) {
     var sum = 0.0;
     var count = 0.0;
     // A neighbour inside counts with its value. Beyond an open face p = 0
-    // (Dirichlet), so it counts with nothing added. Beyond a wall (Neumann)
+    // (Dirichlet), so it counts with nothing added, weighted by open_weight
+    // (1 on the fine grid; a multigrid level keeps p = 0 where the fine grid has it). Beyond a wall (Neumann)
     // it is left out, and so is a solid neighbour (spec §3.2). Written out per side on purpose: as a loop over axes
     // with dynamic vector indexing, this kernel ran about 40% slower through
     // naga's Metal backend (0.28 against 0.20 ms per iteration at 128³).
@@ -33,7 +34,7 @@ fn relax(gid: vec3<u32>, colour: u32) {
             count += 1.0;
         }
     } else if (is_open(0u, 0u)) {
-        count += 1.0;
+        count += params.open_weight;
     }
     if (c.x < n.x - 1) {
         let q = c + vec3<i32>(1, 0, 0);
@@ -42,7 +43,7 @@ fn relax(gid: vec3<u32>, colour: u32) {
             count += 1.0;
         }
     } else if (is_open(0u, 1u)) {
-        count += 1.0;
+        count += params.open_weight;
     }
     if (c.y > 0) {
         let q = c - vec3<i32>(0, 1, 0);
@@ -51,7 +52,7 @@ fn relax(gid: vec3<u32>, colour: u32) {
             count += 1.0;
         }
     } else if (is_open(1u, 0u)) {
-        count += 1.0;
+        count += params.open_weight;
     }
     if (c.y < n.y - 1) {
         let q = c + vec3<i32>(0, 1, 0);
@@ -60,7 +61,7 @@ fn relax(gid: vec3<u32>, colour: u32) {
             count += 1.0;
         }
     } else if (is_open(1u, 1u)) {
-        count += 1.0;
+        count += params.open_weight;
     }
     if (c.z > 0) {
         let q = c - vec3<i32>(0, 0, 1);
@@ -69,7 +70,7 @@ fn relax(gid: vec3<u32>, colour: u32) {
             count += 1.0;
         }
     } else if (is_open(2u, 0u)) {
-        count += 1.0;
+        count += params.open_weight;
     }
     if (c.z < n.z - 1) {
         let q = c + vec3<i32>(0, 0, 1);
@@ -78,7 +79,7 @@ fn relax(gid: vec3<u32>, colour: u32) {
             count += 1.0;
         }
     } else if (is_open(2u, 1u)) {
-        count += 1.0;
+        count += params.open_weight;
     }
     // Only a closed 1×1×1 domain has no neighbours, and nothing to solve.
     if (count == 0.0) {

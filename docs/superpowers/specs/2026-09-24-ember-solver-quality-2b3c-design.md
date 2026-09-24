@@ -64,12 +64,44 @@ stays valid.
 ### 3.2 Levels
 
 - Each level halves every dimension, rounding up, until the smallest is at
-  most 8: five levels at 128³, six at 256³.
+  most 2: seven levels at 128³, eight at 256³.
 - A coarse cell is solid only if all 8 of its children are solid, so thin
   fluid gaps never close.
 - The open-face mask is the same on every level.
-- Each level is re-discretised at spacing 2ˡ·dx, so its stencil is exactly
-  today's kernel.
+- Each level is re-discretised at spacing 2ˡ·dx with today's kernel, with one
+  change: an open neighbour adds `open_weight` = 2·2ˡ/(2ˡ+1) to the
+  stencil's count instead of 1. That keeps p = 0 where the fine grid has
+  it, 0.5·dx₀ beyond the face, rather than 0.5·dx_l beyond. The weight is
+  exactly 1 on level 0, so the fine grid is today's stencil bit for bit. It
+  uses the former padding word of the 64-byte uniform.
+
+Why not the original design (halving to 8, the same stencil on every
+level)? Task 1 measured it (`.superpowers/sdd/2b3c/task-1-report.md`). On
+white noise it looked fine: 24× on the first V-cycle. But on a smooth,
+plume-like right-hand side with an open top it stalled at 64³ (×1.0–1.7 per
+cycle) and diverged at 128³ (×0.6–1.0). A closed box converged. There were
+two causes, and fixing either alone still stalled or diverged:
+
+- 32 sweeps on 8³ reduce the slowest open-face mode, a quarter-wave, only to
+  about 0.66.
+- The re-discretised Dirichlet boundary drifts outward with level: 8 fine
+  cells beyond the domain on the coarsest level at 128³.
+
+With both fixed, one V-cycle reduces a smooth right-hand side's residual by:
+
+| scene | cycle 1 | cycles 2–4 |
+|---|---|---|
+| 64³ closed | 4.4× | 5.9–6.1× |
+| 64³ open top | 4.4× | 5.9–6.1× |
+| 128³ open top | 4.4× | 5.6–6.1× |
+| 64³ open top with a sphere collider | 2.8× | 4.2–4.6× |
+
+Each converges to the f32 floor. White noise gives 24× on the first cycle,
+then about 8× per cycle. At 128³ with an open top, 4 V-cycles leave a smooth
+right-hand side's residual 1158× below what 40 red-black iterations leave.
+
+Prolongation matches the open faces too: a coarse sample beyond an open
+face is the linear ghost (1 − open_weight) times its neighbour, not a clamp.
 
 ### 3.3 The V-cycle
 
