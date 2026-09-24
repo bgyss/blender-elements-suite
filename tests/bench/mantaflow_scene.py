@@ -124,7 +124,7 @@ def build_wind(sc: dict) -> None:
         return
     size = sc["domain_size"]
     strength, flow, direction = mapping.wind(
-        tuple(sc.get("wind_velocity", (0.0, 0.0, 0.0))), rate, sc["fps"], size
+        tuple(sc["wind_velocity"]), rate, sc["fps"], size
     )
     bpy.ops.object.effector_add(type="WIND", location=(size / 2,) * 3)
     wind = bpy.context.active_object

@@ -492,7 +492,9 @@ prediction is u(f) = 1 − (1 − k)^{f−1}.
   32³ it reaches 0.683 m/s by frame 96, at 64³ 0.700 by frame 72.
 - **Why it levels off below 1 m/s: the open inlet, not the field.** The same
   domain with `flow` 0 (`wind=0.204054` alone, a constant force) should
-  gain 0.0388 m/s a frame for ever. Its gain instead falls as u²: the
+  gain 0.2 · S = 0.0408 m/s a frame for ever (0.0388 is measured in the
+  first frame, the resolution shortfall below). Its gain instead falls as
+  u²: the
   shortfall is 0.0213 · u² a frame at 32³ and 0.0227 · u² at 64³, for u
   above 0.5, against h / L = 0.0208. That is still air entering through the
   open −x face: the smoke-free inlet layer gets no force, and
@@ -530,7 +532,8 @@ minus the no-wind `plume`'s, which is 1.0000 m in both solvers:
 | 48 | +0.564 | 0.0475 | +0.448 | 0.0696 |
 | **60** | **+0.517** | 0.0385 | **+0.564** | 0.0799 |
 
-Both drift +x at similar sizes. Ember's smoke moves sooner, because its
+Both drift +x. The drifts differ early (Ember's is 1.6× Mantaflow's at
+frame 30) and meet by frames 48–60. Ember's smoke moves sooner, because its
 whole domain of air is set moving, while Mantaflow drags only the smoke and
 the smoke must push the still air around it. From frame 36 Ember's smoke
 leaves through the +x face (its mass falls while it is still emitting), so

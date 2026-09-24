@@ -56,8 +56,9 @@ def test_wind_matches_plume_winds_baked_pair() -> None:
     blend = 1.0 - math.exp(-1.0 / 24.0)
     assert close(flow, 12.5 * blend * 2.0 / 24.0), flow
     assert close(strength, 5.0 * blend), strength
-    # The values the bake used, rounded to six places.
-    assert close(strength, 0.204054, 2e-6) and close(flow, 0.042511, 2e-6), (strength, flow)
+    # The values mantaflow-notes.md gives, rounded to six places. (The fill
+    # bakes there were passed wind=0.204054, one in the sixth place high.)
+    assert close(strength, 0.204053, 1e-6) and close(flow, 0.042511, 1e-6), (strength, flow)
     assert direction == (1.0, 0.0, 0.0), direction
 
 
