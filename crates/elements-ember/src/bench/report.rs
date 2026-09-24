@@ -209,8 +209,8 @@ pub fn results_markdown(summaries: &[RunSummary], ctx: &Context) -> Result<Strin
             "## `{scene}`\n\n\
              | solver | cells | frame ms (median, min–max) | peak MiB \
              | div. RMS 1/s (60 / 120) | measured cells (60 / 120) \
-             | kinetic energy m⁵/s² (60 / 120) | kinetic energy per measured cell (60 / 120) \
-             | vorticity m³/s (60 / 120) | vorticity per measured cell (60 / 120) \
+             | kinetic energy m⁵/s² (60 / 120) | KE per cell m⁵/s² (60 / 120) \
+             | vorticity m³/s (60 / 120) | vorticity per cell m³/s (60 / 120) \
              | centroid m (60 / 120) | top m (60 / 120) \
              | drift at 80 (% of mass at 60) | drift at 120 (% of mass at 60) |\n\
              |---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"

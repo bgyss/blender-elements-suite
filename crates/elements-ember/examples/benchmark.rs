@@ -26,9 +26,19 @@ use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
 use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
 use elements_ember::solver;
 
-use common::{commit_label, median, shell};
+use common::{commit_label_excluding, median, shell};
 
 type Res<T> = Result<T, Box<dyn Error>>;
+
+/// The benchmark's own output, relative to the repository root. Writing it
+/// must not make later runs' commit label dirty (see `bench_commit`).
+const OUTPUTS: [&str; 2] = ["docs/bench/results", "docs/bench/results.md"];
+
+/// The commit label recorded in every summary: `commit_label`, ignoring the
+/// benchmark's own output, so one `just bench` records one label throughout.
+fn bench_commit() -> String {
+    commit_label_excluding(&OUTPUTS)
+}
 
 fn results_dir() -> PathBuf {
     workspace().join("docs/bench/results")
@@ -154,7 +164,7 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
         load_before,
         load_after,
         blender: None,
-        commit: commit_label(),
+        commit: bench_commit(),
         drift: drift_from_cut_off(&frames, scene.fps),
         frames,
     };
@@ -227,7 +237,12 @@ fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<(u64, String
         .find(|l| l.contains("maximum resident set size"))
         .and_then(|l| l.split_whitespace().next())
         .and_then(|n| n.parse().ok())
-        .ok_or("no \"maximum resident set size\" in /usr/bin/time -l output")?;
+        .ok_or_else(|| {
+            with_stderr(
+                "no \"maximum resident set size\" in /usr/bin/time -l output",
+                &tail,
+            )
+        })?;
     Ok((rss, tail))
 }
 
@@ -350,7 +365,7 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
         load_before,
         load_after,
         blender: Some(version),
-        commit: commit_label(),
+        commit: bench_commit(),
         drift: drift_from_cut_off(&frames, scene.fps),
         frames,
     };
