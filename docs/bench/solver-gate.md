@@ -6,17 +6,18 @@
 - Date: 2026-09-24 15:02 UTC
 - Load average (1, 5, 15 min) before: { 18.03 13.46 12.04 } — **above 2: the machine was loaded**
 - Load average after: { 1.79 3.02 4.76 }
-- Kernel path check: `plume_plate` 128³ with `mgpcg ×4` through frame 65 (frame 60 instrumented), against `eval_frame`: 0 faces differ, max |Δ| 0e0.
+- Kernel path check: `plume_plate` 128³ with `mgpcg ×10` through frame 65 (frame 60 instrumented), against `eval_frame`: 0 faces differ, max |Δ| 0e0.
+- Timing phase rerun per solve (spec §4): commit 4615095, 2026-09-24 17:01 UTC
 
 ## The rule (spec §4, fixed before any numbers)
 
-A configuration passes when, at 128³ and 256³ and in `plume`, `plume_collider` and `plume_wind`, its median frame time over frames 25–48 is at most the Gauss–Seidel ×160 median in the same process, and its masked divergence RMS at frames 60 and 120 is at most Mantaflow's for that scene and resolution (`docs/bench/results.md`, the 7fe5d9d run; `plume_wind` uses `plume`'s until the rerun). It must also pass `plume_plate` at 128³: RMS divergence after projection over before it, at frames 60 and 120, through the kernel API, at most 1e-3. The chosen configuration must be stable past the floor: in `plume_collider` at 128³ the masked divergence after 40 iterations is at most 4× that after the chosen count. Plain V-cycles (`multigrid`) are measured but cannot be the default. The fastest passing configuration becomes the default; if none passes, work stops.
+A configuration passes when, at 128³ and 256³ and in `plume`, `plume_collider` and `plume_wind`, its pressure-solve time per substep (the median over frames 25–48 of the time from before the solve to a blocking wait after it; the median of the runs' medians) is at most Gauss–Seidel ×160's in the same process, and its masked divergence RMS at frames 60 and 120 is at most Mantaflow's for that scene and resolution (`docs/bench/results.md`, the 7fe5d9d run; `plume_wind` uses `plume`'s until the rerun). It must also pass `plume_plate` at 128³: RMS divergence after projection over before it, at frames 60 and 120, through the kernel API, at most 1e-3. The chosen configuration must be stable past the floor: in `plume_collider` at 128³ the masked divergence after 40 iterations is at most 4× that after the chosen count. Plain V-cycles (`multigrid`) are measured but cannot be the default. The fastest passing configuration becomes the default; if none passes, work stops.
 
 Mantaflow references (masked RMS, f60 / f120): `plume` and `plume_wind` 1.49e-4 / 1.07e-4 at 128³, 7.41e-5 / 4.51e-5 at 256³; `plume_collider` 2.84e-4 / 1.09e-4 at 128³, 9.12e-5 / 5.25e-5 at 256³.
 
 ## Procedure
 
-Staged sweep: at 128³, counts rise from 1 (`multigrid` to 8, `mgpcg` to 24) until the three scenes and `plume_plate` all pass; that count is checked at 256³ and stepped up until it passes there too (and still at 128³). A 256³ count stops at its first failing scene (— below). Divergence runs read back only at frames 60 and 120. Then each candidate and Gauss–Seidel ×160 are timed: 3 runs of frames 1–48, each run's median over frames 25–48, interleaved (Gauss–Seidel, multigrid, mgpcg, Gauss–Seidel, …) so drifting load hits all of them. Timing is per frame (`eval_frame` plus a blocking wait), not per solve: runs of one scene differ only in the solver, so it is the same comparison without instrumenting inside the solver.
+Staged sweep: at 128³, counts rise from 1 (`multigrid` to 8, `mgpcg` to 24) until the three scenes and `plume_plate` all pass; that count is checked at 256³ and stepped up until it passes there too (and still at 128³). A 256³ count stops at its first failing scene (— below). Divergence runs read back only at frames 60 and 120. Then each candidate and Gauss–Seidel ×160 are timed per solve, with MGPCG ×4 and ×20 for information only: 5 runs of frames 1–48 each, through the kernel API path the plate uses (checked bit-identical to `eval_frame`), each run's median over frames 25–48. The runs rotate the order of the configurations (run r starts with the r-th), so every configuration takes every position. The timed interval starts from an idle GPU, with stages 1–3 submitted and waited for and the substep's uniforms built, and ends at a blocking wait after the projection. It covers recording and running the divergence, the multigrid hierarchy build (multigrid and MGPCG), the solve and the gradient subtraction, for the frame's first (here only) substep. Frame time, from before the emitter fill to a blocking wait after the last substep, is kept as a secondary column. It includes the split's extra waits, so it is a little above `eval_frame`'s.
 
 ## Divergence sweep
 
@@ -53,16 +54,58 @@ Candidates:
 
 ## Timing
 
-Median frame ms over the 3 runs' medians (min–max of the run medians). ✓: at most Gauss–Seidel's.
+Timing phase load average: { 20.72 14.37 10.38 } — **above 2: the machine was loaded** at the start; { 8.40 9.96 10.52 } — **above 2: the machine was loaded** when timing began (after waiting 600 s); { 40.01 39.36 26.89 } — **above 2: the machine was loaded** after.
 
-| res | scene | `gauss_seidel ×160` ms | `mgpcg ×10` ms |
+Per-solve time, ms: the median of the 5 runs' medians (min–max of the run medians). ✓ / ✗: at most / above Gauss–Seidel's, the rule's timing clause. "(info)" columns are not part of the rule.
+
+| res | scene | `gauss_seidel ×160` solve ms | `mgpcg ×10` solve ms | `mgpcg ×4` (info) solve ms | `mgpcg ×20` (info) solve ms |
+|---|---|---|---|---|---|
+| 128³ | plume | 38.25 (37.99–39.71) | 42.83 (42.55–53.94) ✗ | 18.53 (18.00–19.41) | 83.39 (82.43–86.25) |
+| 128³ | plume_collider | 73.84 (72.03–96.69) | 104.52 (103.05–106.06) ✗ | 43.50 (43.28–47.71) | 205.19 (201.87–213.03) |
+| 128³ | plume_wind | 60.33 (58.68–61.46) | 60.94 (46.92–65.25) ✗ | 25.13 (21.84–26.28) | 108.53 (89.51–127.27) |
+| 256³ | plume | 434.82 (425.13–456.25) | 359.56 (343.98–375.78) ✓ | 145.71 (141.78–152.56) | 701.52 (695.62–810.31) |
+| 256³ | plume_collider | 843.81 (819.45–885.89) | 839.18 (809.37–856.82) ✓ | 343.38 (332.64–359.38) | 1662.61 (1648.17–1701.41) |
+| 256³ | plume_wind | 510.24 (495.08–547.64) | 488.11 (441.99–510.64) ✓ | 190.71 (180.14–201.93) | 905.11 (818.04–931.98) |
+
+Every run's per-solve median, in run order:
+
+| res | scene | configuration | solve ms, each run's median (run 1 … run n) |
 |---|---|---|---|
-| 128³ | plume | 93.0 (92.5–93.4) | 92.9 (80.7–93.0) ✓ |
-| 128³ | plume_collider | 140.4 (138.1–141.2) | 139.4 (105.8–142.3) ✓ |
-| 128³ | plume_wind | 93.3 (92.7–94.1) | 73.4 (73.1–93.8) ✓ |
-| 256³ | plume | 720.7 (720.4–746.3) | 694.9 (679.0–736.2) ✓ |
-| 256³ | plume_collider | 1149.3 (1147.7–1155.1) | 1115.0 (889.9–1120.1) ✓ |
-| 256³ | plume_wind | 759.7 (757.1–761.6) | 712.7 (711.9–719.1) ✓ |
+| 128³ | plume | `gauss_seidel ×160` | 38.16, 38.25, 37.99, 39.45, 39.71 |
+| 128³ | plume | `mgpcg ×10` | 42.55, 42.83, 42.58, 44.23, 53.94 |
+| 128³ | plume | `mgpcg ×4` | 18.53, 18.20, 18.00, 18.77, 19.41 |
+| 128³ | plume | `mgpcg ×20` | 86.25, 82.43, 83.10, 83.43, 83.39 |
+| 128³ | plume_collider | `gauss_seidel ×160` | 73.84, 75.12, 73.35, 72.03, 96.69 |
+| 128³ | plume_collider | `mgpcg ×10` | 105.75, 103.06, 103.05, 106.06, 104.52 |
+| 128³ | plume_collider | `mgpcg ×4` | 43.28, 43.31, 43.50, 47.71, 45.18 |
+| 128³ | plume_collider | `mgpcg ×20` | 205.19, 201.87, 201.93, 213.03, 205.90 |
+| 128³ | plume_wind | `gauss_seidel ×160` | 58.74, 61.46, 60.33, 60.41, 58.68 |
+| 128³ | plume_wind | `mgpcg ×10` | 46.92, 65.25, 60.94, 59.03, 61.99 |
+| 128³ | plume_wind | `mgpcg ×4` | 24.88, 26.08, 26.28, 25.13, 21.84 |
+| 128³ | plume_wind | `mgpcg ×20` | 108.53, 113.09, 127.27, 107.86, 89.51 |
+| 256³ | plume | `gauss_seidel ×160` | 456.25, 433.65, 434.82, 425.13, 439.40 |
+| 256³ | plume | `mgpcg ×10` | 375.78, 359.56, 355.03, 343.98, 363.14 |
+| 256³ | plume | `mgpcg ×4` | 145.81, 145.07, 145.71, 141.78, 152.56 |
+| 256³ | plume | `mgpcg ×20` | 713.40, 695.62, 701.52, 698.48, 810.31 |
+| 256³ | plume_collider | `gauss_seidel ×160` | 848.36, 843.81, 885.89, 819.45, 827.05 |
+| 256³ | plume_collider | `mgpcg ×10` | 831.12, 839.18, 856.82, 809.37, 843.72 |
+| 256³ | plume_collider | `mgpcg ×4` | 344.85, 343.38, 341.88, 332.64, 359.38 |
+| 256³ | plume_collider | `mgpcg ×20` | 1660.27, 1648.17, 1682.28, 1662.61, 1701.41 |
+| 256³ | plume_wind | `gauss_seidel ×160` | 495.08, 509.46, 538.15, 547.64, 510.24 |
+| 256³ | plume_wind | `mgpcg ×10` | 448.58, 441.99, 490.23, 488.11, 510.64 |
+| 256³ | plume_wind | `mgpcg ×4` | 180.14, 183.41, 190.71, 201.93, 191.51 |
+| 256³ | plume_wind | `mgpcg ×20` | 818.04, 859.30, 905.11, 931.98, 909.57 |
+
+Frame time, ms (secondary, not the rule), the same statistic:
+
+| res | scene | `gauss_seidel ×160` frame ms | `mgpcg ×10` frame ms | `mgpcg ×4` (info) frame ms | `mgpcg ×20` (info) frame ms |
+|---|---|---|---|---|---|
+| 128³ | plume | 72.55 (71.86–75.48) | 77.10 (76.43–96.77) | 52.48 (51.40–56.07) | 117.72 (116.69–121.99) |
+| 128³ | plume_collider | 111.17 (108.41–142.54) | 150.29 (148.50–153.16) | 89.26 (88.57–99.77) | 252.06 (247.23–259.59) |
+| 128³ | plume_wind | 109.94 (107.29–112.80) | 109.52 (85.17–116.33) | 71.62 (61.74–76.82) | 151.41 (125.16–179.54) |
+| 256³ | plume | 749.74 (733.47–792.71) | 672.38 (642.65–701.44) | 453.79 (442.29–472.45) | 1009.44 (1004.88–1181.58) |
+| 256³ | plume_collider | 1205.90 (1171.30–1266.95) | 1254.98 (1198.13–1291.13) | 749.80 (718.24–783.20) | 2096.72 (2069.05–2150.72) |
+| 256³ | plume_wind | 925.43 (892.50–985.58) | 935.38 (841.69–977.08) | 616.70 (581.96–658.10) | 1333.41 (1183.08–1384.19) |
 
 ## Past-floor stability (`plume_collider`, 128³)
 
@@ -70,8 +113,8 @@ Median frame ms over the 3 runs' medians (min–max of the run medians). ✓: at
 
 ## Rule applied
 
-- `mgpcg ×10`: divergence and thin plate pass; frame time at most Gauss–Seidel's in every scene at both resolutions; past-floor stable
+- `mgpcg ×10`: divergence and thin plate pass; per-solve time ABOVE Gauss–Seidel's in `plume` at 128³, `plume_collider` at 128³, `plume_wind` at 128³; past-floor stable
 
-Rule applied: **fastest passing: `mgpcg ×10`**.
+Rule applied: **none passes**: no candidate meets the per-solve timing clause (and the other clauses) in every scene at both resolutions. `plume_wind` constrained only frame 60: at frame 120 its smoke mask had no measured cells, so its RMS of 0 passed vacuously.
 
 Decision (recorded by the user): _pending_
