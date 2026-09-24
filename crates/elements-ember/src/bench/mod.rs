@@ -7,6 +7,7 @@ use crate::collider::{self, ColliderParams};
 use crate::shape_emitter::{self, EmitterParams};
 use crate::solver::{self, SolverParams};
 use crate::transform::{Shape, Transform};
+use crate::unions;
 
 pub mod report;
 
@@ -35,8 +36,9 @@ pub struct Scene {
     pub frames: u32,
     pub emitter: EmitterParams,
     pub solver: SolverParams,
-    /// A static collider wired to the solver's inputs 4 and 5, if any.
-    pub collider: Option<ColliderParams>,
+    /// Static colliders. One is wired to the solver's inputs 4 and 5; more
+    /// are merged through a chain of `ember.collider_union` nodes first.
+    pub colliders: Vec<ColliderParams>,
 }
 
 impl Scene {
@@ -63,7 +65,7 @@ impl Scene {
                 buoyancy_temperature: 1.0,
                 ..SolverParams::default()
             },
-            collider: None,
+            colliders: Vec::new(),
         }
     }
 
@@ -73,11 +75,52 @@ impl Scene {
     pub fn plume_collider(resolution: u32) -> Self {
         Self {
             name: "plume_collider",
-            collider: Some(ColliderParams {
+            colliders: vec![ColliderParams {
                 shape: Shape::Sphere { radius: 0.25 },
                 transform: Transform::at([1.0, 1.0, 0.8]),
-            }),
+            }],
             ..Self::plume(resolution)
+        }
+    }
+
+    /// `plume` under a one-cell plate across the whole domain at z = 0.8 m,
+    /// split by a slit two cells wide in x, along all of y, centred above
+    /// the emitter: two static boxes. A gate scene only, not a benchmark
+    /// scene (2b-3c spec §4): around a one-cell wall MGPCG needs several
+    /// times the iterations it needs in the benchmark scenes.
+    ///
+    /// The plate is centred on the cell layer containing 0.8 m and every box
+    /// face lies on a cell face, so no cell centre sits on a surface and the
+    /// mask is the same on the CPU and the GPU.
+    ///
+    /// # Panics
+    ///
+    /// If the domain is not cubic with an even resolution, which centring a
+    /// two-cell slit on x = 1 m needs.
+    pub fn plume_plate(resolution: u32) -> Self {
+        let scene = Self::plume(resolution);
+        let [nx, ny, nz] = scene.cells;
+        assert!(
+            nx == ny && ny == nz && nx % 2 == 0,
+            "plume_plate needs an even cubic domain, not {nx}×{ny}×{nz}"
+        );
+        let dx = scene.domain_size / f64::from(nx);
+        let layer = (0.8 / dx).floor();
+        let z = (layer + 0.5) * dx;
+        let centre_x = f64::from(nx / 2) * dx;
+        // Each side runs from its wall to one cell short of the centre.
+        let half_x = 0.5 * (centre_x - dx);
+        let half_y = 0.5 * scene.domain_size;
+        let side = |x: f64| ColliderParams {
+            shape: Shape::Box {
+                half_extents: [half_x as f32, half_y as f32, (0.5 * dx) as f32],
+            },
+            transform: Transform::at([x as f32, half_y as f32, z as f32]),
+        };
+        Self {
+            name: "plume_plate",
+            colliders: vec![side(half_x), side(scene.domain_size - half_x)],
+            ..scene
         }
     }
 
@@ -108,14 +151,25 @@ impl Scene {
         self
     }
 
-    /// True for each cell (x-fastest) whose centre lies inside the collider.
+    /// True for each cell (x-fastest) whose centre lies inside any collider.
     /// The metrics use it for both solvers, so it is computed on the CPU from
     /// the scene rather than read from either solver. Empty when there is no
     /// collider.
     pub fn solid_mask(&self) -> Vec<bool> {
-        let Some(collider) = &self.collider else {
+        let mut colliders = self.colliders.iter();
+        let Some(first) = colliders.next() else {
             return Vec::new();
         };
+        colliders.fold(self.collider_mask(first), |mut mask, collider| {
+            for (m, c) in mask.iter_mut().zip(self.collider_mask(collider)) {
+                *m |= c;
+            }
+            mask
+        })
+    }
+
+    /// `solid_mask` for one collider.
+    fn collider_mask(&self, collider: &ColliderParams) -> Vec<bool> {
         let keys = &collider.transform.keys;
         // Checked in release too: the benchmark runs optimised, and a moving
         // collider would give a mask that matches neither solver.
@@ -172,7 +226,11 @@ impl Scene {
             (transform.keys[0].translate.map(decimal), decimal(radius))
         };
         let (center, radius) = sphere(&self.emitter.shape, &self.emitter.transform, "emitter");
-        let collider = self.collider.as_ref().map(|c| {
+        assert!(
+            self.colliders.len() <= 1,
+            "the Mantaflow twin supports at most one collider"
+        );
+        let collider = self.colliders.first().map(|c| {
             let (center, radius) = sphere(&c.shape, &c.transform, "collider");
             serde_json::json!({ "center": center, "radius": radius })
         });
@@ -243,13 +301,40 @@ impl Scene {
             },
         ];
         let mut edges = vec![edge(0, 0, 1, 0), edge(0, 1, 1, 1), edge(1, 0, 2, 0)];
-        if let Some(collider) = &self.collider {
+        // Colliders take ids 3, 4, …; each union after them merges the
+        // running result with the next collider.
+        let mut merged = None;
+        let mut next_id = 3;
+        for collider in &self.colliders {
+            let id = next_id;
+            next_id += 1;
             nodes.push(DocNode {
-                id: 3,
+                id,
                 kind: collider::KIND.to_owned(),
                 params: to_value(serde_json::to_value(collider)),
             });
-            edges.extend([edge(3, 0, 1, 4), edge(3, 1, 1, 5)]);
+            merged = Some(match merged {
+                None => id,
+                Some(acc) => {
+                    let union = next_id;
+                    next_id += 1;
+                    nodes.push(DocNode {
+                        id: union,
+                        kind: unions::COLLIDER_UNION_KIND.to_owned(),
+                        params: serde_json::json!({}),
+                    });
+                    edges.extend([
+                        edge(acc, 0, union, 0),
+                        edge(acc, 1, union, 1),
+                        edge(id, 0, union, 2),
+                        edge(id, 1, union, 3),
+                    ]);
+                    union
+                }
+            });
+        }
+        if let Some(id) = merged {
+            edges.extend([edge(id, 0, 1, 4), edge(id, 1, 1, 5)]);
         }
         Document {
             version: ELEMENTS_DOC_VERSION,

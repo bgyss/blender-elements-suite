@@ -302,6 +302,41 @@ fn the_collider_mask_marks_cells_inside_the_sphere() {
     assert!(Scene::plume(32).solid_mask().is_empty());
 }
 
+/// 2b-3c spec §4: one layer of solid across the domain at z = 0.8 m, open
+/// only in a slit two cells wide in x, along all of y, above the emitter.
+#[test]
+fn the_plate_mask_leaves_only_the_slit_open() {
+    let n = 64u32;
+    let mask = Scene::plume_plate(n).solid_mask();
+    assert_eq!(mask.len(), (n * n * n) as usize);
+    // dx = 1/32 m, so 0.8 m lies in layer 25 and x = 1 m between cells 31
+    // and 32.
+    let (layer, slit) = (25, [31, 32]);
+    let mut open_in_layer = Vec::new();
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let solid = mask[(i + n * (j + n * k)) as usize];
+                if k != layer {
+                    assert!(!solid, "({i}, {j}, {k}) is outside the plate");
+                } else if !solid {
+                    open_in_layer.push((i, j));
+                }
+            }
+        }
+    }
+    let expected: Vec<(u32, u32)> = (0..n).flat_map(|j| slit.map(|i| (i, j))).collect();
+    assert_eq!(
+        open_in_layer, expected,
+        "only the slit is open in the plate"
+    );
+}
+
+#[test]
+fn the_plume_plate_scene_loads_and_steps() {
+    loads_and_steps(&Scene::plume_plate(16));
+}
+
 #[test]
 fn a_summary_round_trips_through_its_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -596,7 +631,7 @@ fn the_mantaflow_twin_refuses_a_non_cubic_domain() {
 #[should_panic(expected = "bench colliders are static")]
 fn the_bench_mask_refuses_a_keyframed_collider() {
     let mut s = Scene::plume_collider(16);
-    let c = s.collider.as_mut().unwrap();
+    let c = &mut s.colliders[0];
     let mut key = c.transform.keys[0];
     key.frame += 10.0;
     c.transform.keys.push(key);
