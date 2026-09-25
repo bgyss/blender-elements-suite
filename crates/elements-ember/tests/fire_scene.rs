@@ -154,5 +154,17 @@ fn connecting_fuel_changes_the_state_shape() {
             Err(NodeError::StateShape { slot: s, .. }) => assert_eq!(s, slot),
             other => panic!("{first:?} → {then:?}: {other:?}"),
         }
+        // Frame 1 left its state fields (density, temperature, pressure,
+        // velocity's three faces) out of the pool, held in the state store.
+        // `take_state`'s mismatch path takes them all out of the state store
+        // before finding the mismatch, so it must release every one of them
+        // before returning the error, following
+        // `a_failed_step_with_mgpcg_returns_every_field_to_the_pool` in
+        // tests/solver.rs.
+        assert_eq!(
+            a.pool.pooled_count() as u64,
+            a.pool.allocation_count(),
+            "{first:?} → {then:?}: the failed frame must return every taken field to the pool"
+        );
     }
 }

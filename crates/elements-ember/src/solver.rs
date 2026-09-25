@@ -1507,7 +1507,7 @@ fn copy_outputs(
     Ok(outputs)
 }
 
-/// The flame output: sqrt(react) with fire on, zero without (spec §4.3).
+/// The flame output: sqrt(clamp(react, 0, 1)) with fire on, zero without (spec §4.3).
 fn flame_output(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
