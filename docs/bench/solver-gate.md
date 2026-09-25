@@ -139,11 +139,19 @@ today's preview, misses Mantaflow's reference in every scene with smoke to measu
 `plume_collider` at frames 60 and 120 (1.09e-4 against 9.12e-5, 7.68e-5 against 5.25e-5). `plume_wind`'s
 frame 120 has no measured cells for either solver.
 
-*Provenance.* Every number above was measured before 63a7c7e, which makes
-the multigrid prolongation normaliser exactly 1 where no corner is dropped
-(it was 1.0000001 in f32 next to open faces). That changes results with a
-collider at rounding level only, so the figures are not bit-reproducible
-from later commits; the conclusions stand.
+*Provenance.* Every number in this record was measured on an older solver
+than the one that ships. They predate 63a7c7e, which makes the multigrid
+prolongation normaliser exactly 1 where no corner is dropped (it was
+1.0000001 in f32 next to open faces), a rounding-level change. They also
+predate 9940e8c, MacCormack's first-order fallback where a trace crosses an
+open face, and afe6e8f and 4345f9a, the mass correction, all of which change
+the scalars and so the divergence the solve sees. The figures are therefore
+not reproducible from later commits. The comparison above was run at
+"2b9acab-dirty": 2b9acab plus the then-uncommitted `SOLVER_GATE_COMPARE`
+mode and preset change, which f2d9188 committed (task 5 report); the exact
+tree was not recorded. The benchmark rerun (`results.md`) measured
+preview's ×4 again on the shipped solver, in the three benchmark scenes.
+Final's ×10, and so its pass on the thin plate, was not re-measured.
 
 Decision (recorded by the user, 2026-09-24): the registered rule failed. MGPCG ×10's solve is 1–42% slower
 than Gauss–Seidel's at 128³ (12% in `plume`, 42% in `plume_collider`, 1% in `plume_wind`). Preview uses

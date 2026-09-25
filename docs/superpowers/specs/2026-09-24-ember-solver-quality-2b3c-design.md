@@ -178,8 +178,11 @@ preconditioner, as Mantaflow does (McAdams et al., 2010).
 - Four extra fields: r, z, d, q.
 - Per iteration: q = Ad through the residual kernel's operator; two dot
   products, each a multiply pass and a `Sum` reduction into `ReduceTarget`
-  slots; a one-thread kernel computes α and β from the slots, so nothing is
-  read back to the CPU; update p and r; z = V-cycle(r); d = z + βd.
+  slots; update p and r; z = V-cycle(r); d = z + βd. Nothing is read back to
+  the CPU.
+- *As built* (an accepted plan deviation): there is no one-thread kernel.
+  Each update kernel that needs α or β reads the slots and computes it
+  itself, the same arithmetic in every thread (`shaders/pcg.wgsl`).
 - It warm-starts from the previous frame's pressure by solving for the
   correction.
 
@@ -240,7 +243,9 @@ happened earlier in the substep and is not corrected), for each of the two:
    the advection used. Inflow brings ambient 0 and counts nothing.
 3. After advection, reduce M₁.
 4. A one-thread kernel computes s = (M₀ − outflow) / M₁, and a scaling pass
-   multiplies the advected field by s.
+   multiplies the advected field by s. *As built* (an accepted plan
+   deviation), the scaling kernel reads the slots and computes s in every
+   thread instead; there is no one-thread kernel.
 
 - **Guards:** no change when M₁ ≤ 1e-12 or the target is ≤ 0; s is limited
   to [0.9, 1.1] as a documented safeguard.
@@ -251,6 +256,32 @@ happened earlier in the substep and is not corrected), for each of the two:
   removed error over the field in proportion to each cell's value; and the
   outflow is a first-order estimate per substep, which the correction then
   enforces.
+
+**As built** (Task 6, `kernels/conserve.rs`), the correction differs from the
+steps above in four ways. The first two were the implementer's choices,
+accepted in Task 6's review; the third is the fix that review asked for; the
+fourth is the user's decision. The ledger (`.superpowers/sdd/progress.md`)
+records each.
+
+- **The target includes decay** (afe6e8f): s = decay·(M₀ − OUT) / M₁, with
+  decay = e^{−rate·h} for the scalar's dissipation, which the advection has
+  already applied. Without it the correction would undo dissipation.
+- **Solid contents count as removed** (afe6e8f): OUT adds what sits in solid
+  cells, which advection zeroes as Mantaflow's `resetInObstacle` does.
+  Spreading it over the fluid would make a collider a source.
+- **Mixed-sign fields are skipped** (4345f9a, from Task 6's review): a
+  proportional rescale assumes q ≥ 0, and with hot and cold temperature at
+  once the scale sat on its clamp, compounding ×0.9 or ×1.1 every substep.
+  A field with any negative cell before advection is left as the advection
+  made it; density, which is never negative, is still corrected.
+- **MacCormack falls back to first order at open faces** (9940e8c, the
+  user's decision, option A in `.superpowers/sdd/2b3c/task-6-report.md`):
+  where a MacCormack trace crosses an open face, the cell takes the
+  first-order forward value. Before this, MacCormack put back up to about a
+  third of what had flowed out, so the first-order outflow the correction
+  charges removed smoke that was still inside. The fallback changes
+  MacCormack's output near open faces whether `conserve_mass` is on or
+  off.
 
 ## 6. Wind as ambient airflow
 
@@ -280,6 +311,12 @@ happened earlier in the substep and is not corrected), for each of the two:
 - **V-cycle:** analytic Poisson problems with known solutions, in an
   all-wall box, with one open face, and around a solid sphere. The residual
   falls by at least 10× per cycle, and the measured rate is recorded.
+  *As measured* (Task 1): 10× holds for one cycle on a noise right-hand
+  side (about 16×), but the steady rate on a smooth one, which is what the
+  pressure solve sees, is about 4.2× per cycle, and 3.8× with a sphere. The
+  symmetric restriction MGPCG needs costs rate against the averaging one's
+  6×. The tests assert those measured floors, not 10× per cycle
+  (`tests/multigrid.rs`).
   Gauss–Seidel is the reference.
 - **MGPCG:** converges on the same problems in fewer iterations than plain
   V-cycles.

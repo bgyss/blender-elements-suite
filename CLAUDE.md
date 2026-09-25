@@ -20,7 +20,10 @@ three for the solver and its benchmark, then flame. **2b-1**, solver
 correctness, is complete: CFL substeps, RK2 + MacCormack advection, vorticity
 confinement, dissipation, per-face boundaries, and the `preview` and `final`
 presets (`docs/bench/presets.md`). Preview runs one CFL-clamped substep, now
-about 71 ms a 128³ frame (open risks (j) and (k) in §6 of the piece 2 spec).
+about 71 ms a 128³ frame. Open risks in §6 of the piece 2 spec: the open
+part of (g), GPU out-of-memory on unified memory; (j), preview's frame cost;
+(k), preview's budget after 2b-2's solids; and (m), preview's ×4
+under-converging around thin colliders.
 **2b-2**, scene content, is complete: keyframed box and
 sphere emitters (with noise and velocity emission) and colliders, unions of
 each, and wind
@@ -30,8 +33,10 @@ each, and wind
 divergence and conservation, and its wind broken. **2b-3c**, solver
 quality, is complete. It added MGPCG pressure (preview ×4, final ×10), a
 global mass correction, and wind as an ambient airflow. In the rerun
-(`docs/bench/results.md`), Ember is 5.8–8.4× faster than Mantaflow, keeps
-mass drift under 1e-6 until smoke leaves, and leaves less divergence everywhere
+(`docs/bench/results.md`), Ember is 5.8–8.4× faster than Mantaflow. In
+`plume` and `plume_collider` its mass drift is under 1e-6 of the frame-60
+mass at frame 80, and in `plume_collider`, where almost no smoke leaves, it
+stays under 1.5e-6 through frame 120. It leaves less divergence everywhere
 except `plume_collider` and `plume`'s frame 120 at 256³. All timings were
 measured under load. **2b-3b**, the side-by-side render and the latency
 measurement, is next. Flame is its own later cycle, 2b-4.

@@ -22,7 +22,7 @@ Early. The engine, its smoke solver and the solver's scene content work; fire, a
   - keyframed sphere and box emitters that add density and temperature, modulated by seeded noise measured in metres, and can pull the fluid toward a target velocity;
   - keyframed sphere and box colliders, moving or still, whose surfaces carry their own velocity;
   - unions of emitters and of colliders;
-  - a global mass correction on density and temperature after each advection, on in both presets;
+  - a global mass correction on density and temperature after each advection, on in both presets. It rescales the whole field, so it fixes the total but not where mass sits, and it skips any field that holds a negative value before advection (temperature with hot and cold emitters), since a proportional rescale assumes one sign;
   - wind as an ambient airflow that the air relaxes towards (`wind_velocity`, `wind_rate`).
 
   Emitters and colliders are node kinds in an `.elements` document; the Blender add-on does not expose them yet. A frame is bit-identical however you reach it: playing forward, scrubbing back, or restoring from the cache, including with animated emitters and colliders.
@@ -37,7 +37,7 @@ Early. The engine, its smoke solver and the solver's scene content work; fire, a
 
 The full tables and conditions are in [`docs/bench/speed-gate.md`](docs/bench/speed-gate.md) and [`docs/bench/iteration-sweep.md`](docs/bench/iteration-sweep.md). With MacCormack, RK2 and the per-frame CFL measurement, a default `preview` frame, with MGPCG ×4 and the mass correction, takes about 71 ms at 128³, measured under load ([`docs/bench/presets.md`](docs/bench/presets.md); risks (j) and (k) in §6 of [the solver spec](docs/superpowers/specs/2026-09-21-ember-solver-design.md)). The images above are a 256³ run: 120 frames simulated in 93 seconds, including writing every frame to OpenVDB, then rendered offline in Cycles.
 
-**Against Mantaflow.** [`docs/bench/results.md`](docs/bench/results.md) compares Ember with Blender's built-in Mantaflow solver in three matched scenes at 64³, 128³ and 256³. Ember's frames are 5.8–8.4× faster, and it uses 0.36–0.62× the memory. Until smoke leaves the domain, its mass drift stays under 1e-6. It leaves less divergence than Mantaflow everywhere except in two scenes at 256³, which the report names along with the other places Mantaflow still wins. Every run was measured under load.
+**Against Mantaflow.** [`docs/bench/results.md`](docs/bench/results.md) compares Ember with Blender's built-in Mantaflow solver in three matched scenes at 64³, 128³ and 256³. Ember's frames are 5.8–8.4× faster, and it uses 0.36–0.62× the memory. In `plume` and `plume_collider`, its mass drift at frame 80 is under 1e-6 of the frame-60 mass, and in `plume_collider`, where almost no smoke leaves, it stays under 1.5e-6 through frame 120. It leaves less divergence than Mantaflow everywhere except in two scenes at 256³, which the report names along with the other places Mantaflow still wins. Every run was measured under load.
 
 **Not yet**
 

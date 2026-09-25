@@ -1,5 +1,15 @@
 # Ember Piece 2b-3c — Solver Quality Implementation Plan
 
+> **Superseded in parts.** Where this plan and the spec, `docs/bench/solver-gate.md`
+> or the task reports (`.superpowers/sdd/2b3c/task-*-report.md`) disagree, those
+> win; the plan is kept as written. Two parts in particular were replaced:
+> the gate's per-frame timing (median frame times), reversed in 4615095 to
+> time the pressure solve itself as spec §4 asks; and Task 1's original
+> multigrid design (coarsening until a level is ≤ 8 cells, 32 coarsest-level
+> sweeps, averaging restriction), replaced by a symmetric restriction
+> (κ·Pᵀ, which MGPCG needs) coarsened to a single cell with one red-black and
+> one black-red sweep there.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make Ember beat Mantaflow on divergence and mass conservation

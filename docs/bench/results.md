@@ -21,8 +21,9 @@ metrics do not depend on load.
 **Speed.** An Ember frame is 5.8–8.4× faster than Mantaflow's in every scene
 and at every resolution. At 256³ it went from 811 to 516 ms for `plume` and
 from 1,126 to 695 ms for `plume_collider`. The benchmark times whole frames:
-per solve, MGPCG ×4 takes 42–59% of Gauss–Seidel's time at 128³ and 34–41% at
-256³ (`solver-gate.md`). `plume_collider` at 128³ takes 97.3 ms, close to
+per solve, MGPCG ×4 took 42–59% of Gauss–Seidel's time at 128³ and 34–41% at
+256³ in the solver gate (`solver-gate.md`), measured before the MacCormack
+fallback and the mass correction. `plume_collider` at 128³ takes 97.3 ms, close to
 preview's 100 ms budget.
 
 **Memory.** The multigrid levels add 14–17% (at 256³, `plume` went from 1,539
@@ -31,15 +32,22 @@ and 0.58–0.62× at 256³.
 
 **Divergence.** At frame 60, `plume` has 113× less than in 2b-3 at 64³, 822×
 less at 128³ and 3,750× less at 256³. Ember is below Mantaflow in every scene
-and resolution except `plume_collider` at 256³. In `plume_wind` it is 30–74×
-below.
+and resolution except at 256³, where Mantaflow is lower in `plume_collider`
+at frames 60 and 120 and in `plume` at frame 120 (below). In `plume_wind` it
+is 30–74× below at frame 60; by 120 Ember's smoke has all left.
 
-**Conservation.** Drift at 80 is 0.0% (at most 8e-8 of the mass) in `plume`
-and `plume_collider` at every resolution. In 2b-3 it was +1.2% to +10.6%.
-Mantaflow's is −9.5% to +8.7%. At 120, `plume_collider` is still 0.0%. For
-`plume`, drift at 120 is +0.7%, −1.1% and −2.0%, which is the error of the
-frame-resolution outflow estimate once smoke has left. Mantaflow's is +24.5%,
-+10.6% and +2.0%.
+**Conservation.** Drift at 80 is 0.0% in `plume` and `plume_collider` at
+every resolution: at most 7.8e-8 in absolute terms (`plume` at 64³), which
+is 9.2e-7 of that run's frame-60 mass, so under 1e-6 of it everywhere. In
+2b-3 it was +1.2% to +10.6%. Mantaflow's is −9.5% to +8.7%. At 120,
+`plume_collider`, whose smoke barely reaches the top, is still 0.0%: under
+1.5e-6 of its frame-60 mass at every frame through 120 (at most 1.45e-6, at
+128³ in frame 119). For `plume`, drift at 120 is +0.7%, −1.1% and −2.0%.
+That is most likely the error of the frame-resolution outflow estimate once
+smoke has left, not mass the solver lost: the correction enforces a
+first-order outflow each substep at the domain faces themselves, while the
+metric estimates outflow once a frame through planes two cells in, so the
+two count different flux. Mantaflow's is +24.5%, +10.6% and +2.0%.
 
 **Wind no longer fails.** Mass follows the emitter exactly until smoke
 reaches an open face. From then on, mass inside plus the estimated outflow
@@ -51,12 +59,16 @@ Ember's smoke leaves through +x from frames 23–34, against Mantaflow's
 **Where Mantaflow still wins.**
 - **Divergence at 256³:** `plume_collider` at frames 60 and 120 (1.16× and
   1.49× lower than Ember), and `plume` at 120 (1.28×). Preview's 4 iterations
-  are the limit here; final's 10 pass (`solver-gate.md`).
+  are the limit here. Final's 10 passed the solver gate (`solver-gate.md`),
+  but that was measured before the MacCormack fallback and the mass
+  correction, and final has not been re-measured on the shipped solver.
 - **Energy and height:** at frame 60, Mantaflow's `plume` has 1.3–1.9× the
-  kinetic energy per cell and rises 0.15–0.18 m higher. At 128³ and 256³ it
-  also has more vorticity per cell at 60: up to 15% more in `plume` and up
-  to 42% more in `plume_collider`. Part of this comes from
-  the heat mapping (see Heat).
+  kinetic energy per cell, its centroid is 0.14–0.18 m higher and its top
+  0.19–0.27 m higher. Its `plume_collider` has 1.08× the kinetic energy per
+  cell at 64³, 1.43× at 128³ and 2.12× at 256³, and its centroid is
+  0.03–0.11 m higher. At 128³ and 256³ it also has more vorticity per cell
+  at 60: up to 15% more in `plume` and up to 42% more in `plume_collider`.
+  Part of this comes from the heat mapping (see Heat).
 
 **Known limits.**
 - Preview's 4 iterations miss the thin-plate target of 1e-3 (4.7e-3).
