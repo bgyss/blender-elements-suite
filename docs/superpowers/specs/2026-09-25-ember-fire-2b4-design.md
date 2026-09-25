@@ -66,9 +66,10 @@ match the document (fuel connected or disconnected since) is a
 
 New work is in bold.
 
-1. Emit density, temperature and **fuel, and blend `react` towards 1 by
+1. Emit density, temperature and **fuel, clamped to [0, 10] per cell as
+   Mantaflow's inflow does, and blend `react` towards 1 by
    the fresh fuel's share**, marking fresh fuel as unburnt. With
-   `Δ = fuel_rate · h` and `fuel' = fuel + Δ`: where `fuel' > 1e-6`,
+   `Δ = fuel_rate · h` and `fuel' = min(fuel + Δ, 10)`: where `fuel' > 1e-6`,
    `react' = react + (Δ / fuel') · (1 − react)`, clamped to [0, 1]. The
    §6.1 probe found that Mantaflow blends rather than adds (revised
    2026-09-25; an additive react would exceed 1 and push the flame's heat
@@ -88,7 +89,17 @@ New work is in bold.
 4. **Vorticity confinement with a per-cell strength**
    `ε + flame_vorticity · fuel`. Confinement runs when `vorticity > 0` or
    (fire on and `flame_vorticity > 0`).
-5. Advect velocity and project, unchanged.
+5. Advect velocity and project. **With fire on, velocity faces are traced
+   back with one Euler step** instead of the RK2 midpoint (2b-1 spec §4.1),
+   as Mantaflow's `advectSemiLagrange(order=2)` does by default
+   (`orderTrace=1`). User decision, 2026-09-26, after Task 9 found the
+   `fire` scene diverging at preview's single substep: at CFL 5–30 in the
+   fire's core the RK2 midpoint misses a spike at the emitter's corner,
+   which flame vorticity then amplifies (×2.5 a frame, NaN by frame 40 at
+   32³). Euler velocity plus the fuel clamp ran 120 frames at 32³, 64³ and
+   128³ with peak |u| 9.5, 10.8 and 12.9 m/s (Mantaflow: 15.3 and 11.7 at
+   32³ and 64³). Scalars keep RK2, and fire-off scenes keep RK2 everywhere,
+   so smoke output is unchanged (`.superpowers/sdd/fire-diagnosis.md`).
 6. Advect density, temperature, **fuel and react**, with the same scheme
    (MacCormack by default) and collider handling. With `conserve_mass`, fuel
    and react each get the 2b-3c global correction; both are non-negative,
@@ -102,7 +113,6 @@ Recorded in `docs/bench/mantaflow-notes.md` and the results:
 
 - **No density clamp.** `processBurn` clamps density to [0, 1] in every
   cell. Ember keeps mass, as it already does for smoke.
-- **No fuel clamp.** Mantaflow clamps a cell's fuel to [0, 10] at emission.
 - **React blends towards 1**, not towards Mantaflow's
   `1 − (1 − occupancy)²` (§3.2 step 1): only cells on an emitter's surface
   ramp differ.
@@ -110,6 +120,14 @@ Recorded in `docs/bench/mantaflow-notes.md` and the results:
   advection and confines on the advected fuel; Ember confines before
   advecting velocity, on the fuel after the burn.
 - **No colour grids.**
+- **Velocity backtrace with fire on is Euler, scalars stay RK2.**
+  Mantaflow traces every grid with one Euler step; Ember matches it only
+  for velocity, and only while fire is on (§3.2 step 5).
+- **Mantaflow's advection gains fuel; Ember's conserves it.** Measured in
+  2b-4 Task 9's diagnosis: emission (139.7 vs 140 a frame at 32³) and the
+  burn law match, but Mantaflow's fuel advection adds +26% of the emitted
+  fuel by frame 30 and +103% by frame 60 at 32³. Ember's fuel totals are
+  expected to sit below Mantaflow's for that reason, not a mapping error.
 - **Units.** `h` is Ember's substep in seconds. `burning_rate` and
   `flame_vorticity` are per second in Ember; `mapping.fire` (§6.1) converts
   Mantaflow's frame-scaled values.
