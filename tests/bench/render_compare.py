@@ -3,23 +3,27 @@
 
 Run (headless):
   Blender --background --factory-startup --python-exit-code 1 \
-      --python tests/bench/render_compare.py -- EMBER_DIR MANTAFLOW_CACHE SCENE RES OUT_DIR
+      --python tests/bench/render_compare.py -- EMBER_DIR MANTAFLOW_CACHE SCENE RES SIZE OUT_DIR
   Blender ... --python tests/bench/render_compare.py -- --readme OUT_DIR BAKE_DIR SCENE:RES...
 
 EMBER_DIR holds `elements-cli bake`'s `density.NNNN.vdb`; MANTAFLOW_CACHE is
-the cache directory of `mantaflow_scene.py`, with `data/fluid_data_NNNN.vdb`.
+the cache directory of `mantaflow_scene.py`, with `data/fluid_data_NNNN.vdb`;
+SIZE is the scene's domain size in metres (its JSON's `domain_size`).
 For frames 30, 60 and 90 it builds a scene from factory settings and writes
 OUT_DIR/{scene}-{res}-f{frame:03}.png: Ember on the left, Mantaflow on the
 right, each Volume object reading its file's `density` grid through the same
 Principled Volume material, placed by placement.py (2b-3b spec §3).
 
-`just bench-render` runs the bakes and this script, then the --readme mode,
-which writes OUT_DIR/README.md from BAKE_DIR's records.
+The Cycles device is written to EMBER_DIR/render-device, next to the bake it
+rendered. `just bench-render` runs the bakes and this script, then the
+--readme mode, which writes OUT_DIR/README.md from BAKE_DIR's records: each
+bake's `commit`, the render device, and the scene JSON's domain size.
 
 The images are for a person to judge by eye; nothing here measures them.
 """
 
 import datetime
+import json
 import math
 import os
 import subprocess
@@ -235,10 +239,12 @@ def build(files: tuple[str, str], size: float, dx: float, caption: str) -> str:
     return device
 
 
-def render(ember_dir: str, manta_cache: str, scene_name: str, res: int, out_dir: str) -> None:
-    size = 2.0  # every bench scene's domain; checked by the recipe
+def render(
+    ember_dir: str, manta_cache: str, scene_name: str, res: int, size: float, out_dir: str
+) -> None:
     dx = size / res
     os.makedirs(out_dir, exist_ok=True)
+    devices = set()
     for frame in FRAMES:
         files = frame_files(ember_dir, manta_cache, frame)
         device = build(files, size, dx, f"{scene_name}   {res}³   frame {frame}")
@@ -250,48 +256,90 @@ def render(ember_dir: str, manta_cache: str, scene_name: str, res: int, out_dir:
         if not os.path.isfile(out) or os.path.getsize(out) == 0:
             sys.exit(f"render wrote no {out}")
         print(f"render_compare: {out} on {device} in {took:.1f} s", flush=True)
+        devices.add(device)
+    with open(os.path.join(ember_dir, "render-device"), "w") as fh:
+        fh.write(", ".join(sorted(devices)) + "\n")
 
 
 def shell(*cmd: str) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
 
 
+# Per-scene notes, printed under the scene's heading. They describe what the
+# solvers do, from the benchmark's records; keep them to what those show.
+NOTES = {
+    "plume_collider": (
+        "The collider sphere is not drawn; it shows only as the faint outline "
+        "the smoke leaves around it."
+    ),
+    "plume_wind": (
+        "Both panels show solver behaviour, not the render. Ember's smoke leaves "
+        "through the open +x side from about frames 23–34 and is gone by frame 90 "
+        "(`docs/bench/results.md`), which is why its frame-90 panel is empty. "
+        "Mantaflow's smoke stays in the domain against +x: at frame 60 its mass "
+        "is 0.0842 against Ember's 0.0382 (sum of density × dx³ in these bakes). "
+        "Mantaflow's wind acts only on cells that hold smoke, while Ember's moves "
+        "all the air (`docs/bench/mantaflow-notes.md`, Wind as ambient airflow)."
+    ),
+}
+
+
+def record(path: str) -> str:
+    """One line a bake or render left, or a note that it left none."""
+    if not os.path.isfile(path):
+        return "not recorded"
+    with open(path) as fh:
+        return fh.read().strip()
+
+
 def readme(out_dir: str, bake_dir: str, cases: list[str]) -> None:
-    commits = set()
+    ember_commits, manta_commits, devices, sizes = set(), set(), set(), set()
     sections = []
     for case in cases:
         scene_name, res = case.split(":")
-        with open(os.path.join(bake_dir, "ember", f"{scene_name}-{res}", "commit")) as fh:
-            commits.add(fh.read().strip())
+        ember_commits.add(record(os.path.join(bake_dir, "ember", f"{scene_name}-{res}", "commit")))
+        manta_commits.add(
+            record(os.path.join(bake_dir, "mantaflow", f"{scene_name}-{res}", "commit"))
+        )
+        devices.add(record(os.path.join(bake_dir, "ember", f"{scene_name}-{res}", "render-device")))
+        with open(os.path.join(bake_dir, f"{scene_name}-{res}.json")) as fh:
+            sizes.add(json.load(fh)["domain_size"])
         images = []
         for frame in FRAMES:
             name = f"{scene_name}-{res}-f{frame:03d}.png"
             if not os.path.isfile(os.path.join(out_dir, name)):
                 sys.exit(f"missing {name}: render before writing the README")
             images.append(f"![{scene_name} {res}³ frame {frame}]({name})")
-        sections.append(f"## `{scene_name}` ({res}³)\n\n" + "\n\n".join(images) + "\n")
+        note = f"{NOTES[scene_name]}\n\n" if scene_name in NOTES else ""
+        sections.append(f"## `{scene_name}` ({res}³)\n\n{note}" + "\n\n".join(images) + "\n")
     today = datetime.date.today().isoformat()
+    domain = " or ".join(f"{v:g}" for v in sorted(sizes))
     text = f"""# Ember and Mantaflow side by side
 
 - Machine: {shell("sysctl", "-n", "machdep.cpu.brand_string")}
 - OS: macOS {shell("sw_vers", "-productVersion")}
-- Ember commit: {", ".join(sorted(commits))}
+- Ember bakes' commit: {", ".join(sorted(ember_commits))}
+- Mantaflow bakes' commit: {", ".join(sorted(manta_commits))}
 - Blender: {bpy.app.version_string}
 - Date: {today}
 
 Written by `just bench-render` (`tests/bench/render_compare.py`), 2b-3b spec §3.
 Each image shows one frame of one scene: Ember's density on the left and
-Mantaflow's on the right, each in its 2 m domain drawn as a thin box. Both are
-baked from the same scene definition (`Scene` in `crates/elements-ember/src/bench`,
-through `benchmark document` and `benchmark scene-json`), Ember by
-`elements-cli bake` and Mantaflow by `tests/bench/mantaflow_scene.py`, simulated
-from frame 1. The images are for judging by eye; nothing here measures them.
+Mantaflow's on the right, each in its {domain} m domain drawn as a thin box.
+Both are baked from the same scene definition
+(`Scene` in `crates/elements-ember/src/bench`, through `benchmark document`
+and `benchmark scene-json`), Ember by `elements-cli bake` and Mantaflow by
+`tests/bench/mantaflow_scene.py`. Mantaflow bakes frames 1–90 once. Ember is
+baked once for each of frames 30, 60 and 90, and each bake simulates from
+frame 1 and writes only that frame; the simulation is deterministic, and a
+rebake gives byte-identical files. The images are for judging by eye;
+nothing here measures them.
 
 ## Render settings
 
 - Cycles, {SAMPLES} samples a pixel (adaptive sampling off), seed {SEED}, denoiser
-  off, {WIDTH}×{HEIGHT}, Standard view transform, rendered on the GPU (Metal)
-  when there is one.
+  off, {WIDTH}×{HEIGHT}, Standard view transform. Device:
+  {", ".join(sorted(devices))}.
 - One orthographic camera looking along +y, so both domains are seen through
   the same projection: no perspective, and depth along y is not visible.
 - Both Volume objects read their file's `density` grid at full precision and
@@ -311,11 +359,15 @@ and the plumes have not yet diverged, the emitted masses match: over frames
 12–24, Ember's mass is 0.99–1.04× Mantaflow's across every benchmark run
 (`docs/bench/results.md`, Notes, Heat). The scale is not normalised per
 solver, so a difference in brightness or opacity is a difference in density.
+At density {DENSITY:g}, though, a plume's core is optically thick (τ ≈ 6: the
+multiplier times grid values near 1 over a core about 0.3 m across), so the
+images compare shape and extent rather than peak density.
 Known differences carry through (`results.md`, `mantaflow-notes.md`):
 Mantaflow's emitter heat is held at Ember's frame-24 value rather than added
 at Ember's rate, so its plume rises faster; Mantaflow's open top boundary layer
 is a density sink; and Mantaflow clamps density to [0, 1] at the emitter while
-Ember does not, so Ember's densest cells can exceed 1.
+Ember does not, so Ember's densest cells can exceed 1 (behind an optically
+thick core, that changes little in the image).
 
 Verdict (recorded by the user): _pending_
 
@@ -329,8 +381,8 @@ def main() -> None:
     if args[0] == "--readme":
         readme(args[1], args[2], args[3:])
         return
-    ember_dir, manta_cache, scene_name, res, out_dir = args
-    render(ember_dir, manta_cache, scene_name, int(res), out_dir)
+    ember_dir, manta_cache, scene_name, res, size, out_dir = args
+    render(ember_dir, manta_cache, scene_name, int(res), float(size), out_dir)
 
 
 main()

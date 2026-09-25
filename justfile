@@ -143,12 +143,14 @@ bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256":
     R=target/bench/render
     OUT=docs/bench/render
     mkdir -p "$R" "$OUT"
-    # The Ember commit, marked dirty if the engine differs from it.
+    # The commit the bakes come from, marked dirty if the engine or the bench
+    # scripts differ from it, untracked files included.
     commit="$(git rev-parse --short HEAD)"
-    git diff --quiet HEAD -- crates Cargo.toml Cargo.lock || commit="$commit-dirty"
+    [ -z "$(git status --porcelain -- crates Cargo.toml Cargo.lock tests/bench)" ] || commit="$commit-dirty"
     for case in {{cases}}; do
       scene="${case%%:*}"; res="${case##*:}"
       "$B" scene-json "$scene" "$res" > "$R/$scene-$res.json"
+      size="$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['domain_size'])" "$R/$scene-$res.json")"
       dx="$(python3 -c "import json, sys; d = json.load(open(sys.argv[1])); print(d['domain_size'] / d['resolution'])" "$R/$scene-$res.json")"
       ember="$R/ember/$scene-$res"
       if [ -f "$ember/commit" ]; then
@@ -181,10 +183,11 @@ bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256":
         "$BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
             --python tests/bench/mantaflow_scene.py -- "$manta/scene.json" "$manta" \
             > "$manta/blender.log" 2>&1 || { tail -30 "$manta/blender.log"; exit 1; }
+        echo "$commit" > "$manta/commit"
       fi
       echo "render $scene ${res}³; load $(sysctl -n vm.loadavg)"
       "$BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
-          --python tests/bench/render_compare.py -- "$ember" "$manta/cache" "$scene" "$res" "$OUT" \
+          --python tests/bench/render_compare.py -- "$ember" "$manta/cache" "$scene" "$res" "$size" "$OUT" \
           > "$R/render-$scene-$res.log" 2>&1 || { tail -30 "$R/render-$scene-$res.log"; exit 1; }
     done
     echo "load after: $(sysctl -n vm.loadavg)"
