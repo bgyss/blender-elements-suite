@@ -17,6 +17,51 @@ use elements_ember::solver::{
 };
 use std::sync::{Arc, Mutex};
 
+/// FNV-1a over the bits, for recording a field compactly.
+fn fnv1a(bits: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bits {
+        for byte in b.to_le_bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// 2b-4 spec §3.4: with fuel unconnected the solver is exactly the one
+/// before fire. Frame 40's density hashes, recorded from ac62baf (before
+/// any 2b-4 solver change (f77d38f)) on this adapter. Other adapters print
+/// and skip: bit patterns are only comparable within one backend on one
+/// machine.
+#[test]
+fn without_fuel_frame_40_matches_the_solver_before_fire() {
+    const RECORDED_ON: &str = "Apple M1 Max";
+    const RECORDED: [(&str, u64); 2] = [
+        ("mgpcg", 0x7fd4_5178_bbd3_5c70),
+        ("gauss_seidel", 0xfaf6_ca02_96d5_d74a),
+    ];
+    let ctx = gpu();
+    let adapter = ctx.adapter_name();
+    if adapter != RECORDED_ON {
+        eprintln!("skipped: hashes were recorded on {RECORDED_ON}, this is {adapter}");
+        return;
+    }
+    for (name, want) in RECORDED {
+        let doc = match name {
+            "mgpcg" => plume_16(PREVIEW),
+            _ => plume_16(&gauss_seidel(PREVIEW)),
+        };
+        let mut s = Session::new(&doc);
+        let mut t = timeline(0);
+        let mut bits = Vec::new();
+        for frame in 1..=40 {
+            bits = s.density_bits(&mut t, frame);
+        }
+        assert_eq!(fnv1a(&bits), want, "{name}: frame 40 density changed");
+    }
+}
+
 fn rejected(params: serde_json::Value) -> bool {
     matches!(
         elements_ember::registry().build(KIND, &params),
