@@ -296,3 +296,242 @@ fn fuel_is_conserved_while_it_does_not_burn() {
         "fuel drift {drift:e} (cutoff {cutoff}, end {end})"
     );
 }
+
+use elements_core::gpu::ComputeBatch;
+use elements_ember::kernels::{Uniforms, burn, flame};
+
+fn burning() -> StepConstants {
+    StepConstants {
+        fire: true,
+        burning_rate: 1.2, // × h 0.25 = 0.3 a substep
+        flame_smoke: 1.5,
+        ignition_temperature: 1.5,
+        max_temperature: 3.0,
+        ..StepConstants::new(CELLS, 0.25, 0.125)
+    }
+}
+
+/// The burn of 2b-4 spec §3.2 on the CPU: (fuel, react, density, temperature).
+/// The flame reads react clamped to [0, 1] (the global mass correction can
+/// push react slightly above 1); react itself is left unclamped.
+fn cpu_burn(c: &StepConstants, f0: f32, r0: f32, d: f32, t: f32) -> (f32, f32, f32, f32) {
+    let burn = c.burning_rate * c.h;
+    let f1 = (f0 - burn).max(0.0);
+    // See burn.wgsl: react passes through untouched when burn is 0 (rather
+    // than dividing by f0, which need not round to exactly 1), and
+    // otherwise divides by a hard zero check, not an epsilon.
+    let r1 = if burn == 0.0 {
+        r0
+    } else if f0 != 0.0 {
+        r0 * (f1 / f0)
+    } else {
+        0.0
+    };
+    let smoke = (0.5 + 0.5 * (1.0 - f0).max(0.0)) * (f0 - f1) * 0.1 * c.flame_smoke;
+    let f = r1.clamp(0.0, 1.0).sqrt();
+    let t1 = if f > 0.0 {
+        (1.0 - f) * c.ignition_temperature + f * c.max_temperature
+    } else {
+        t
+    };
+    (f1, r1, d + smoke, t1)
+}
+
+#[test]
+fn the_burn_matches_the_cpu_reference() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    // Fuel in [0, 2] with zeros; react in [0, 1].
+    let f0: Vec<f32> = pattern(CELLS, 11)
+        .iter()
+        .map(|v| v.max(0.0) * 2.0)
+        .collect();
+    let r0 = abs_pattern(12);
+    let d0 = pattern(CELLS, 13);
+    let t0 = pattern(CELLS, 14);
+    let fields = [&f0, &r0, &d0, &t0].map(|v| upload(&gpu, &mut pool, CELLS, v));
+    let c = burning();
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let mut batch = ComputeBatch::new();
+    burn(
+        &gpu, &mut cache, &mut batch, &u, &fields[0], &fields[1], &fields[2], &fields[3],
+    )
+    .unwrap();
+    batch.submit(&gpu).unwrap();
+    let want: Vec<_> = (0..f0.len())
+        .map(|n| cpu_burn(&c, f0[n], r0[n], d0[n], t0[n]))
+        .collect();
+    let got = fields.each_ref().map(|f| f.read_back(&gpu).unwrap());
+    assert_close(
+        &got[0],
+        &want.iter().map(|w| w.0).collect::<Vec<_>>(),
+        1e-6,
+        "fuel",
+    );
+    assert_close(
+        &got[1],
+        &want.iter().map(|w| w.1).collect::<Vec<_>>(),
+        1e-6,
+        "react",
+    );
+    assert_close(
+        &got[2],
+        &want.iter().map(|w| w.2).collect::<Vec<_>>(),
+        1e-6,
+        "density",
+    );
+    assert_close(
+        &got[3],
+        &want.iter().map(|w| w.3).collect::<Vec<_>>(),
+        1e-5,
+        "temperature",
+    );
+    // Where there was no fuel, temperature is untouched, bit for bit.
+    for n in 0..f0.len() {
+        if f0[n] == 0.0 {
+            assert_eq!(got[3][n].to_bits(), t0[n].to_bits(), "cell {n} had no fuel");
+        }
+    }
+}
+
+/// A cell whose react is pushed above 1 by the mass correction still clamps
+/// to max_temperature rather than exceeding it.
+#[test]
+fn temperature_clamps_react_above_one_to_max_temperature() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let n = CELLS.voxel_count();
+    // burn = 0 here so f1 == f0 and react passes through unchanged, letting
+    // us isolate the clamp in the temperature profile.
+    let c = StepConstants {
+        fire: true,
+        flame_smoke: 1.5,
+        ignition_temperature: 1.5,
+        max_temperature: 3.0,
+        ..StepConstants::new(CELLS, 0.25, 0.125)
+    };
+    let fuel = upload(&gpu, &mut pool, CELLS, &vec![1.0; n]);
+    let mut react_v = vec![0.5; n];
+    react_v[0] = 1.4; // above 1, as the mass correction can produce
+    let react = upload(&gpu, &mut pool, CELLS, &react_v);
+    let density = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let temperature = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let mut batch = ComputeBatch::new();
+    burn(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &u,
+        &fuel,
+        &react,
+        &density,
+        &temperature,
+    )
+    .unwrap();
+    batch.submit(&gpu).unwrap();
+    let got_temperature = temperature.read_back(&gpu).unwrap();
+    let got_react = react.read_back(&gpu).unwrap();
+    // React itself stays unclamped...
+    assert_close(&got_react[0..1], &[1.4], 1e-6, "react cell 0");
+    // ...but the temperature it drives is clamped to max_temperature, not
+    // pushed above it.
+    assert_close(
+        &got_temperature[0..1],
+        &[c.max_temperature],
+        1e-5,
+        "temperature cell 0",
+    );
+    // flame() reads react through the same [0, 1] clamp, so its output at
+    // this cell is sqrt(1.0) = 1.0, not sqrt(1.4).
+    let out = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let mut flame_batch = ComputeBatch::new();
+    flame(&gpu, &mut cache, &mut flame_batch, &u, &react, &out).unwrap();
+    flame_batch.submit(&gpu).unwrap();
+    let got_flame = out.read_back(&gpu).unwrap();
+    assert_close(&got_flame[0..1], &[1.0], 1e-6, "flame cell 0");
+}
+
+#[test]
+fn fuel_burns_out_on_the_closed_form() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let n = CELLS.voxel_count();
+    let fuel = upload(&gpu, &mut pool, CELLS, &vec![1.0; n]);
+    let react = upload(&gpu, &mut pool, CELLS, &vec![1.0; n]);
+    let density = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let temperature = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let u = Uniforms::new(&gpu, &burning()).unwrap();
+    let out = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    for step in 1..=4 {
+        let mut batch = ComputeBatch::new();
+        burn(
+            &gpu,
+            &mut cache,
+            &mut batch,
+            &u,
+            &fuel,
+            &react,
+            &density,
+            &temperature,
+        )
+        .unwrap();
+        flame(&gpu, &mut cache, &mut batch, &u, &react, &out).unwrap();
+        batch.submit(&gpu).unwrap();
+        let want_fuel = (1.0 - 0.3 * step as f32).max(0.0);
+        assert_close(
+            &fuel.read_back(&gpu).unwrap(),
+            &vec![want_fuel; n],
+            1e-6,
+            "fuel",
+        );
+        // react = fuel / F₀ with F₀ = 1.
+        assert_close(
+            &react.read_back(&gpu).unwrap(),
+            &vec![want_fuel; n],
+            1e-6,
+            "react",
+        );
+        assert_close(
+            &out.read_back(&gpu).unwrap(),
+            &vec![want_fuel.sqrt(); n],
+            1e-6,
+            "flame",
+        );
+    }
+}
+
+#[test]
+fn a_substep_burns_after_it_emits() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let n = CELLS.voxel_count();
+    let zero = vec![0.0; n];
+    let src = upload(&gpu, &mut pool, CELLS, &zero);
+    // 4 fuel/s × h 0.25 = 1 unit emitted; burning then takes 0.3.
+    let fuel_src = upload(&gpu, &mut pool, CELLS, &vec![4.0; n]);
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, CELLS).unwrap();
+    state.add_fire(&gpu, &mut cache, &mut pool).unwrap();
+    let sources = Sources::new(&src, &src).with_fuel(&fuel_src);
+    substep(
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &mut state,
+        sources,
+        &burning(),
+        SOLVE,
+    )
+    .unwrap();
+    let fire = state.fire.as_ref().unwrap();
+    assert_close(
+        &fire.fuel.read_back(&gpu).unwrap(),
+        &vec![0.7; n],
+        1e-6,
+        "fuel",
+    );
+}

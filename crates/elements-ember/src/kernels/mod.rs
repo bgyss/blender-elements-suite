@@ -16,7 +16,7 @@ mod solid;
 mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
-pub use fire::emit_fuel;
+pub use fire::{burn, emit_fuel, flame};
 pub use forces::{blend_velocity, buoyancy, emit, wind};
 pub use mgpcg::mgpcg;
 pub use multigrid::{Hierarchy, v_cycle_from_zero, v_cycles};

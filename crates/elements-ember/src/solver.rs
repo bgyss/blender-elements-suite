@@ -663,6 +663,16 @@ impl Substep {
                 &fire.react,
                 fuel,
             )?;
+            kernels::burn(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &fire.fuel,
+                &fire.react,
+                &state.density,
+                &state.temperature,
+            )?;
         }
         if let Some(e) = sources.emission {
             kernels::blend_velocity(
