@@ -83,6 +83,19 @@ def test_camera_stands_in_front_and_looks_along_plus_y() -> None:
     assert all(close(g, e, 1e-12) for g, e in zip(got, (0.0, 1.0, 0.0), strict=True)), got
 
 
+def test_a_recorded_verdict_survives_regeneration() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "README.md")
+        assert placement.kept_verdict(path) == placement.PENDING
+        with open(path, "w") as fh:
+            fh.write("# X\n\nVerdict (recorded by the user, today): fine.\nMore.\n\n## `plume`\n")
+        assert placement.kept_verdict(path) == (
+            "Verdict (recorded by the user, today): fine.\nMore."
+        ), placement.kept_verdict(path)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

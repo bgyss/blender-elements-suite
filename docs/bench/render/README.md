@@ -53,7 +53,21 @@ is a density sink; and Mantaflow clamps density to [0, 1] at the emitter while
 Ember does not, so Ember's densest cells can exceed 1 (behind an optically
 thick core, that changes little in the image).
 
-Verdict (recorded by the user): _pending_
+Verdict (recorded by the user, 2026-09-25): at matched emitted mass, Ember
+reproduces Mantaflow's large-scale behaviour in every scene: the rise, the
+mushroom cap, and the flow over and around the collider, where the two match
+most closely. Ember is visibly smoother. Mantaflow keeps finer turbulent detail
+in the stem (streaks and ripples by frame 60, wisps and bulges by 90) and a
+larger cap about 0.1 of the domain higher, which agrees with its 1.3–2.1× kinetic
+energy per measured cell in `docs/bench/results.md`; part of that extra height
+is the heat mapping (its emitter is hotter early), not the solver. The wind
+scene differs by design: Ember's ambient airflow bends the plume into a low band
+and carries it out through +x, while Mantaflow's wind pushes only the smoke,
+which rises diagonally and piles against +x. The remaining gap is Ember's
+small-scale detail. The levers are less numerical dissipation in advection,
+vorticity confinement (0 in both solvers' bench settings today), and the ML
+upresolution seam; a heat mapping that matches Ember's rate would make the
+heights comparable.
 
 ## `plume` (128³)
 

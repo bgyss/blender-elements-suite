@@ -90,3 +90,23 @@ def caption_location(domain_size: float, gap_frac: float = 0.25) -> tuple:
     size = domain_size
     mid = 0.5 * (slot_x(1, size, gap_frac) + size)
     return (mid, -0.05 * size, size + 0.05 * size)
+
+
+# The contact sheet's verdict survives regeneration (render_compare --readme).
+VERDICT_MARK = "@@VERDICT@@"
+PENDING = "Verdict (recorded by the user): _pending_"
+
+
+def kept_verdict(path: str) -> str:
+    """The verdict paragraph already in `path`, so regenerating the README
+    never erases a recorded verdict; `PENDING` when there is none."""
+    try:
+        with open(path) as fh:
+            old = fh.read()
+    except FileNotFoundError:
+        return PENDING
+    start = old.find("Verdict (recorded by the user")
+    if start < 0:
+        return PENDING
+    end = old.find("\n## ", start)
+    return old[start:end].rstrip() if end >= 0 else old[start:].rstrip()

@@ -298,6 +298,10 @@ metrics in §5.4, never voxel for voxel.
 **Interactivity** (Ember's actual claim):
 - Latency from a parameter change to the first updated frame visible, at 128³.
 - For Mantaflow, this is the time to re-bake up to the current frame.
+- *Done in 2b-3b (2026-09-25):* `docs/bench/latency.md`. At 128³ Ember reaches
+  frame N 6.8–10.5× sooner than Mantaflow re-bakes (for example 8.2 s against
+  56 s to frame 120 in `plume`), measured under load that probably favours
+  Ember; an idle rerun is owed.
 
 **Physical quality.** These are computed by the same code on both solvers'
 output, after resampling velocity to cell centres:
@@ -308,7 +312,9 @@ output, after resampling velocity to cell centres:
 
 **Visual.** Both VDB sequences are rendered with one Cycles setup (same camera, lights
 and volume shader) and shown side by side. This is judged by eye and recorded
-as a note, not a number.
+as a note, not a number. *Done in 2b-3b (2026-09-25):* `docs/bench/render/README.md`,
+with the verdict: Ember matches Mantaflow's large-scale shape in every scene and
+is visibly smoother; Mantaflow keeps finer turbulent detail.
 
 ### 5.5 The speed gate
 

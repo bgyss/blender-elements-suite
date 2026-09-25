@@ -1,7 +1,7 @@
 # Ember Piece 2b-3b — Render Comparison and Latency Design
 
 **Date:** 2026-09-25
-**Status:** Design approved; plan not yet written.
+**Status:** Complete. Results in `docs/bench/latency.md` and `docs/bench/render/`.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2), §5.4, whose
 visual and interactivity items 2b-3 deferred. Follows 2b-3c
 (`2026-09-24-ember-solver-quality-2b3c-design.md`).

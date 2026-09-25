@@ -369,10 +369,12 @@ is a density sink; and Mantaflow clamps density to [0, 1] at the emitter while
 Ember does not, so Ember's densest cells can exceed 1 (behind an optically
 thick core, that changes little in the image).
 
-Verdict (recorded by the user): _pending_
+{placement.VERDICT_MARK}
 
 {chr(10).join(sections)}"""
-    with open(os.path.join(out_dir, "README.md"), "w") as fh:
+    path = os.path.join(out_dir, "README.md")
+    text = text.replace(placement.VERDICT_MARK, placement.kept_verdict(path))
+    with open(path, "w") as fh:
         fh.write(text)
 
 

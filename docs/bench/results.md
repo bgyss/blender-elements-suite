@@ -10,6 +10,9 @@ Timings from a run whose 1-minute load average was above 2 before or after its t
 
 ## Summary
 
+Latency from a parameter change and a side-by-side Cycles render are in
+`docs/bench/latency.md` and `docs/bench/render/README.md` (2b-3b).
+
 This is 2b-3c's rerun. Ember now uses the preview preset: MGPCG ×4 and the
 global mass correction. The 2b-3 run, on Gauss–Seidel ×160, is kept with its
 Summary and tables in `docs/bench/results-2b3/`. Mantaflow's `plume` and
