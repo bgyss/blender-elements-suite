@@ -4,6 +4,9 @@
 //!   benchmark ember SCENE RES      time and measure Ember
 //!   benchmark scene-json SCENE RES print the scene's Mantaflow twin as JSON,
 //!                                  for tests/bench/mantaflow_scene.py
+//!   benchmark document SCENE RES   print the scene's `.elements` document,
+//!                                  for `elements-cli bake` (the render
+//!                                  comparison, 2b-3b §3)
 //!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow in
 //!                                  Blender ($BLENDER_BIN, or the macOS app)
 //!   benchmark latency SCENE RES    time Ember from a parameter change to
@@ -729,13 +732,18 @@ fn run() -> Res<()> {
         ["report"] => report(),
         ["latency-report"] => latency_report(None),
         ["latency-report", load] => latency_report(Some(load)),
+        ["document", name, res] => {
+            println!("{}", scene(name, res.parse()?)?.document().to_json()?);
+            Ok(())
+        }
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
             println!("{}", serde_json::to_string_pretty(&json)?);
             Ok(())
         }
         _ => Err(
-            "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES \
+            "usage: benchmark ember SCENE RES | scene-json SCENE RES | document SCENE RES \
+             | mantaflow SCENE RES \
              | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report [LOADAVG]"
                 .into(),
         ),
