@@ -1,11 +1,12 @@
 // The burn (2b-4 spec §3.2, the fuel-and-reaction model Blender's Mantaflow
 // fire uses), per cell: fuel falls by `burn`, react falls in proportion
-// (divided first: `r1 = r0 * (f1 / f0)`), burning makes smoke, and where
-// there is flame the temperature follows its profile from ignition (edge)
-// to max (core). With burn 0, react instead passes through untouched
-// (see below) so it is unchanged bit-for-bit. The flame here reads react
-// clamped to [0, 1]: the global mass correction can push react slightly
-// above 1, which would otherwise push the temperature above
+// (divided first: `r1 = r0 * (f1 / f0)`) but is 0 where fuel is at or below
+// 1e-6 (spec §3.2: react' = 0 where fuel ≤ 1e-6), burning makes smoke, and
+// where there is flame the temperature follows its profile from ignition
+// (edge) to max (core). See the `select` below for why `f1 == f0` (not
+// `params.burn == 0.0`) is the exactness shortcut. The flame here reads
+// react clamped to [0, 1]: the global mass correction can push react
+// slightly above 1, which would otherwise push the temperature above
 // `max_temperature`; react itself is stored unclamped. Reimplemented from
 // the published model; four read_write storage textures, the per-stage
 // limit.
@@ -25,20 +26,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let f0 = textureLoad(fuel, p).x;
     let r0 = textureLoad(react, p).x;
     let f1 = max(f0 - params.burn, 0.0);
-    // With burn 0 (fire on, not burning), f1 == f0 exactly, so react passes
-    // through untouched rather than through the division: `f1 / f0` is not
-    // guaranteed to round to exactly 1.0 on every GPU (division here is not
-    // required to be correctly rounded), which would perturb react by up to
-    // a ULP even though nothing burned. `params.burn` is uniform across the
-    // dispatch, so this branch is uniform too.
-    var r1 = r0;
-    if (params.burn != 0.0) {
-        // A hard zero check, not an epsilon: any nonzero f0, however small,
-        // divides exactly by itself once burn actually moves it.
-        r1 = 0.0;
-        if (f0 != 0.0) {
-            r1 = r0 * (f1 / f0);
-        }
+    // Below 1e-6, a cell holds no fuel and react ends (spec §3.2): react' =
+    // 0 there. Above it, react divides by the fuel's own share `f1 / f0`,
+    // except when `f1 == f0` exactly (nothing burned this cell, whether
+    // because `burn` is 0 or the cell just wasn't touched): then react
+    // passes through as `r0` untouched rather than going through the
+    // division. `f1 / f0` is mathematically 1 there, but division is not
+    // guaranteed to round to exactly 1.0 on every GPU, and that would
+    // perturb react by a ULP even though nothing burned.
+    var r1 = 0.0;
+    if (f0 > 1e-6) {
+        r1 = select(r0 * (f1 / f0), r0, f1 == f0);
     }
     let smoke = (0.5 + 0.5 * max(1.0 - f0, 0.0)) * (f0 - f1) * 0.1 * params.flame_smoke;
     textureStore(fuel, p, vec4<f32>(f1, 0.0, 0.0, 0.0));

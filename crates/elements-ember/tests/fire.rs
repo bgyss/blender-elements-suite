@@ -317,13 +317,12 @@ fn burning() -> StepConstants {
 fn cpu_burn(c: &StepConstants, f0: f32, r0: f32, d: f32, t: f32) -> (f32, f32, f32, f32) {
     let burn = c.burning_rate * c.h;
     let f1 = (f0 - burn).max(0.0);
-    // See burn.wgsl: react passes through untouched when burn is 0 (rather
-    // than dividing by f0, which need not round to exactly 1), and
-    // otherwise divides by a hard zero check, not an epsilon.
-    let r1 = if burn == 0.0 {
-        r0
-    } else if f0 != 0.0 {
-        r0 * (f1 / f0)
+    // Spec §3.2: react' = 0 where fuel is at or below 1e-6. Above that,
+    // react divides by the fuel's own share, except when f1 == f0 exactly
+    // (nothing burned this cell): see burn.wgsl for why that shortcut
+    // exists (dividing by f0 there need not round to exactly 1).
+    let r1 = if f0 > 1e-6 {
+        if f1 == f0 { r0 } else { r0 * (f1 / f0) }
     } else {
         0.0
     };
@@ -452,6 +451,71 @@ fn temperature_clamps_react_above_one_to_max_temperature() {
     flame_batch.submit(&gpu).unwrap();
     let got_flame = out.read_back(&gpu).unwrap();
     assert_close(&got_flame[0..1], &[1.0], 1e-6, "flame cell 0");
+}
+
+/// Spec §3.2: react' = 0 where fuel is at or below 1e-6, even with burning
+/// off (`burn` 0, so `f1 == f0` and the fuel itself is untouched). Cell 0
+/// has fuel just below the threshold (5e-7) with react 0.5; cell 1 has no
+/// fuel at all. Both must have their react zeroed, and since react starts
+/// at 0.5 (no flame) or 0 already, temperature must stay bit-unchanged in
+/// both cells.
+#[test]
+fn react_is_zeroed_at_or_below_the_fuel_epsilon_even_without_burning() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let n = CELLS.voxel_count();
+    let c = StepConstants {
+        fire: true,
+        ignition_temperature: 1.5,
+        max_temperature: 3.0,
+        ..StepConstants::new(CELLS, 0.25, 0.125)
+    };
+    let mut fuel_v = vec![1.0; n];
+    fuel_v[0] = 5e-7; // below the 1e-6 epsilon, but not exactly 0
+    fuel_v[1] = 0.0;
+    let mut react_v = vec![0.9; n];
+    react_v[0] = 0.5;
+    react_v[1] = 0.5;
+    let t0 = vec![0.7_f32; n];
+    let fuel = upload(&gpu, &mut pool, CELLS, &fuel_v);
+    let react = upload(&gpu, &mut pool, CELLS, &react_v);
+    let density = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let temperature = upload(&gpu, &mut pool, CELLS, &t0);
+    let u = Uniforms::new(&gpu, &c).unwrap();
+    let mut batch = ComputeBatch::new();
+    burn(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &u,
+        &fuel,
+        &react,
+        &density,
+        &temperature,
+    )
+    .unwrap();
+    batch.submit(&gpu).unwrap();
+    let got_react = react.read_back(&gpu).unwrap();
+    let got_temperature = temperature.read_back(&gpu).unwrap();
+    assert_close(
+        &got_react[0..2],
+        &[0.0, 0.0],
+        1e-6,
+        "react at/below epsilon",
+    );
+    // No flame at either cell (react is now 0), so temperature is untouched
+    // bit-for-bit.
+    assert_eq!(
+        got_temperature[0].to_bits(),
+        t0[0].to_bits(),
+        "cell 0 temperature"
+    );
+    assert_eq!(
+        got_temperature[1].to_bits(),
+        t0[1].to_bits(),
+        "cell 1 temperature"
+    );
 }
 
 #[test]

@@ -50,19 +50,15 @@ const FLAME: &str = concat!(
 
 /// Burn one substep's fuel in place: fuel, react, and the smoke and heat
 /// the burning adds to density and temperature. React updates as
-/// `r1 = r0 * (f1 / f0)` (divided first, guarded by a hard zero check on
-/// `f0` rather than an epsilon). With `burn` 0 (uniform across the
-/// dispatch), react instead passes through as `r0` untouched rather than
-/// going through the division: `f1 / f0` is exactly `f0 / f0`, which is 1
-/// mathematically but is not guaranteed to round to exactly 1.0 on every
-/// GPU, and that would perturb react by a ULP even though nothing burned.
-/// The shortcut keeps react unchanged bit-for-bit when `burn` is 0. The
-/// temperature profile reads react clamped to [0, 1] (the global mass
-/// correction can push react slightly above 1, which would otherwise put
-/// the temperature above `max_temperature`); react itself is stored
-/// unclamped. With fire off the uniform's `burn` is 0 and this would still
-/// rewrite temperature where react > 0, so the solver records it only with
-/// fire on.
+/// `r1 = r0 * (f1 / f0)` (divided first) but is 0 where fuel is at or below
+/// 1e-6 (spec §3.2), with an exactness shortcut when `f1 == f0` (nothing
+/// burned this cell); see `burn.wgsl` for why that shortcut exists and why
+/// it is keyed on `f1 == f0` rather than `burn == 0`. The temperature
+/// profile reads react clamped to [0, 1] (the global mass correction can
+/// push react slightly above 1, which would otherwise put the temperature
+/// above `max_temperature`); react itself is stored unclamped. With fire
+/// off the uniform's `burn` is 0 and this would still rewrite temperature
+/// where react > 0, so the solver records it only with fire on.
 #[allow(clippy::too_many_arguments)]
 pub fn burn(
     gpu: &GpuContext,
