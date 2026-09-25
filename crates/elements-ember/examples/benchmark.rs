@@ -6,9 +6,12 @@
 //!                                  for tests/bench/mantaflow_scene.py
 //!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow in
 //!                                  Blender ($BLENDER_BIN, or the macOS app)
+//!   benchmark latency SCENE RES    time Ember from a parameter change to
+//!                                  frame N, in a warm process (2b-3b §2)
 //!   benchmark report               build docs/bench/results.md
 //!
-//! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv.
+//! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv;
+//! `latency` writes docs/bench/results/latency-ember-{scene}-{res}.json.
 
 mod common;
 
@@ -170,6 +173,113 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
         frames,
     };
     write_summary(&results_dir(), &summary)?;
+    Ok(())
+}
+
+/// The frames each latency point evaluates up to (2b-3b spec §2).
+const LATENCY_FRAMES: [u32; 4] = [1, 24, 60, 120];
+/// Timed runs per latency point.
+const LATENCY_RUNS: u32 = 5;
+/// The warm-up evaluates the unchanged scene this far, once, untimed.
+const WARM_UP_FRAMES: u32 = 24;
+
+/// One latency point: frames 1..=`frame`, 5 runs.
+#[derive(serde::Serialize)]
+struct LatencyPoint {
+    frame: u32,
+    runs_s: Vec<f64>,
+    median_s: f64,
+    /// Seconds to frame 1 (graph construction included); only on N = 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_frame_s: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+struct LatencySummary {
+    solver: &'static str,
+    scene: String,
+    resolution: u32,
+    commit: String,
+    load_before: f64,
+    load_after: f64,
+    points: Vec<LatencyPoint>,
+}
+
+/// Evaluate `scene` from frame 1 to `frames` in a fresh graph, pool and
+/// state, as a daemon does after a parameter change, ending with a blocking
+/// wait. Returns the seconds from before graph construction to frame N
+/// ready. The pipeline cache is the caller's and stays warm.
+fn latency_run(
+    gpu: &GpuContext,
+    registry: &NodeRegistry,
+    pipelines: &mut PipelineCache,
+    scene: &Scene,
+    frames: u32,
+) -> Res<f64> {
+    let doc = scene.document();
+    let config = doc.timeline_config();
+    let first = config.start_frame;
+    let start = Instant::now();
+    let (graph, dims) = doc.into_graph(registry)?;
+    let mut pool = FieldPool::new();
+    let mut state = StateStore::new();
+    for frame in first..first + frames {
+        let time = Time::at(frame, first, config.fps);
+        let evaluated = graph.eval_frame(gpu, &mut pool, pipelines, &mut state, time, dims)?;
+        evaluated.value.release_to(&mut pool);
+    }
+    gpu.wait()?;
+    let seconds = start.elapsed().as_secs_f64();
+    state.clear(&mut pool);
+    Ok(seconds)
+}
+
+/// Spec §2: one process, device, pipeline cache and registry throughout;
+/// each run changes the emitter's density rate so no two runs share a
+/// document, then times graph construction plus frames 1..=N.
+fn run_latency(name: &str, res: u32) -> Res<()> {
+    let gpu = GpuContext::new_headless()?;
+    let registry = elements_ember::registry();
+    let mut pipelines = PipelineCache::new();
+    let scene = scene(name, res)?;
+    eprintln!("latency {name} {res}³: warm-up to frame {WARM_UP_FRAMES}");
+    latency_run(&gpu, &registry, &mut pipelines, &scene, WARM_UP_FRAMES)?;
+    let load_before = load_average();
+    let mut points = Vec::new();
+    for n in LATENCY_FRAMES {
+        let mut runs_s = Vec::new();
+        for run in 0..LATENCY_RUNS {
+            let rate = 1.0 + 0.01 * (run + 1) as f32;
+            let changed = scene.clone().with_density_rate(rate);
+            let s = latency_run(&gpu, &registry, &mut pipelines, &changed, n)?;
+            eprintln!(
+                "latency {name} {res}³: N = {n}, run {} of {LATENCY_RUNS}: {s:.3} s",
+                run + 1
+            );
+            runs_s.push(s);
+        }
+        points.push(LatencyPoint {
+            frame: n,
+            median_s: median(&runs_s),
+            first_frame_s: (n == 1).then(|| median(&runs_s)),
+            runs_s,
+        });
+    }
+    let load_after = load_average();
+    let summary = LatencySummary {
+        solver: "ember",
+        scene: name.into(),
+        resolution: res,
+        commit: bench_commit(),
+        load_before,
+        load_after,
+        points,
+    };
+    let dir = results_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("latency-ember-{name}-{res}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&summary)? + "\n")?;
+    eprintln!("wrote {}", path.display());
     Ok(())
 }
 
@@ -394,7 +504,11 @@ fn report() -> Res<()> {
     if dir.exists() {
         for entry in std::fs::read_dir(&dir)? {
             let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "json") {
+            // Latency files have their own shape and their own report.
+            let latency = path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with("latency-"));
+            if path.extension().is_some_and(|e| e == "json") && !latency {
                 let text = std::fs::read_to_string(&path)?;
                 let s: RunSummary =
                     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -459,6 +573,7 @@ fn run() -> Res<()> {
     {
         ["ember", name, res] => run_ember(name, res.parse()?),
         ["mantaflow", name, res] => run_mantaflow(name, res.parse()?),
+        ["latency", name, res] => run_latency(name, res.parse()?),
         ["report"] => report(),
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
@@ -466,7 +581,8 @@ fn run() -> Res<()> {
             Ok(())
         }
         _ => Err(
-            "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES | report"
+            "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES \
+             | latency SCENE RES | report"
                 .into(),
         ),
     }

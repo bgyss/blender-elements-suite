@@ -705,3 +705,27 @@ fn the_bench_mask_refuses_a_keyframed_collider() {
     c.transform.keys.push(key);
     let _ = s.solid_mask();
 }
+
+/// The latency run's document must differ from the scene's only in the
+/// emitter's density rate, so nothing the engine caches can be reused and
+/// nothing else about the scene changes.
+#[test]
+fn the_latency_document_changes_only_the_density_rate() {
+    for scene in [
+        Scene::plume(32),
+        Scene::plume_collider(32),
+        Scene::plume_wind(32),
+    ] {
+        let base = serde_json::to_value(scene.document()).unwrap();
+        let changed =
+            serde_json::to_value(scene.clone().with_density_rate(1.1).document()).unwrap();
+        assert_ne!(base, changed);
+        let mut patched = base.clone();
+        assert_eq!(
+            patched["nodes"][0]["kind"],
+            elements_ember::shape_emitter::KIND
+        );
+        patched["nodes"][0]["params"]["density_rate"] = serde_json::json!(1.1f32);
+        assert_eq!(patched, changed, "{}", scene.name);
+    }
+}
