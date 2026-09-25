@@ -99,24 +99,59 @@ fn fresh_fuel_blends_react_towards_one_by_its_share() {
     assert_close(&react.read_back(&gpu).unwrap(), &want_react, 1e-6, "react");
 }
 
+/// Cells i in 1..4, j in 1..3, k in 1..3 of `CELLS` (12 cells, well inside
+/// the domain on every side) at `rate`, 0 elsewhere.
+fn block_source(cells: FieldDims, rate: f32) -> Vec<f32> {
+    let mut out = vec![0.0; cells.voxel_count()];
+    for k in 1..3 {
+        for j in 1..3 {
+            for i in 1..4 {
+                out[index(cells, i, j, k)] = rate;
+            }
+        }
+    }
+    out
+}
+
+/// Fuel and react track density bit-for-bit through advection and the mass
+/// correction: they start identical to density (one substep at rate 1/h,
+/// still air, puts density = fuel = react = 1.0 in the block and 0
+/// elsewhere exactly, spec §3.2 step 1), then all three see the same
+/// velocity, the same zero sources, and the same `conserve_mass` for three
+/// more substeps. Nothing but their own field distinguishes them from
+/// density in this setup, so any divergence is a bug in how fuel or react
+/// is carried, not a property of the test data.
 #[test]
-fn fuel_and_react_are_advected_as_density_is() {
+fn fuel_and_react_are_advected_and_mass_corrected_as_density_is() {
     let gpu = gpu();
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
     let zero = vec![0.0; CELLS.voxel_count()];
-    let rate = abs_pattern(5);
-    let density_src = upload(&gpu, &mut pool, CELLS, &rate);
-    let temperature_src = upload(&gpu, &mut pool, CELLS, &zero);
-    let fuel_src = upload(&gpu, &mut pool, CELLS, &rate);
+    let rate = block_source(CELLS, 1.0 / 0.25);
+    let on = upload(&gpu, &mut pool, CELLS, &rate);
+    let off = upload(&gpu, &mut pool, CELLS, &zero);
     let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, CELLS).unwrap();
     state.add_fire(&gpu, &mut cache, &mut pool).unwrap();
+    // One substep, still air: density = fuel = react = 1.0 in the block, 0
+    // elsewhere, exactly.
+    let seed = Sources::new(&on, &off).with_fuel(&on);
+    substep(
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &mut state,
+        seed,
+        &transport_only(),
+        SOLVE,
+    )
+    .unwrap();
+    // Now move it: sources off, velocity on, with the mass correction.
     let moving = upload_staggered(&gpu, &mut pool, CELLS, &walled_velocity_pattern(CELLS));
     let old = std::mem::replace(&mut state.velocity, moving);
     for face in old.into_faces() {
         pool.release(face);
     }
-    let sources = Sources::new(&density_src, &temperature_src).with_fuel(&fuel_src);
+    let sources = Sources::new(&off, &off).with_fuel(&off);
     let c = StepConstants {
         conserve_mass: true,
         ..transport_only()
@@ -127,38 +162,34 @@ fn fuel_and_react_are_advected_as_density_is() {
     let density = state.density.read_back(&gpu).unwrap();
     let fire = state.fire.as_ref().unwrap();
     let fuel = fire.fuel.read_back(&gpu).unwrap();
-    assert!(density.iter().any(|&d| d > 0.0), "something was emitted");
-    assert!(
-        fuel.iter()
-            .zip(&density)
-            .all(|(f, d)| f.to_bits() == d.to_bits()),
-        "fuel took the same path as density"
-    );
-    // React is a fraction: advection and the correction keep it in [0, 1]
-    // up to MacCormack's clamp, and it has spread with the fuel.
     let react = fire.react.read_back(&gpu).unwrap();
+    let spread = fuel
+        .iter()
+        .zip(&rate)
+        .filter(|&(&f, &r)| r == 0.0 && f > 1e-3)
+        .count();
     assert!(
-        react.iter().all(|&r| (-1e-6..=1.0 + 1e-6).contains(&r)),
-        "react out of [0, 1]"
+        spread > 0,
+        "fuel must have spread beyond the block by transport"
     );
-    // `rate` (like any hash-based pattern) lands on an exact 0 at at least
-    // one cell: that cell's fuel and react start, and stay, at 0 unless
-    // advection carries content in from a neighbour. It is the one place
-    // in this grid where "react present" can only mean "react travelled",
-    // rather than "this cell's own emission set it near 1 already" (every
-    // other cell's rate is nonzero, so its own local emission alone would
-    // keep react high with or without react's own advection). 0.1 (not the
-    // 0.5 a saturated cell would reach) is enough to tell "travelled" from
-    // "never touched"; a mutation that skips react's advection leaves such
-    // a cell's react at exactly 0 forever.
-    for (n, (&f, &r)) in fuel.iter().zip(&react).enumerate() {
-        if f > 1e-3 && rate[n] <= 1e-6 {
-            assert!(
-                r > 0.1,
-                "cell {n}: fuel {f} arrived without its react ({r})"
-            );
-        }
-    }
+    let fuel_diffs = fuel
+        .iter()
+        .zip(&density)
+        .filter(|(f, d)| f.to_bits() != d.to_bits())
+        .count();
+    assert_eq!(
+        fuel_diffs, 0,
+        "fuel differs from density at {fuel_diffs} cells"
+    );
+    let react_diffs = react
+        .iter()
+        .zip(&density)
+        .filter(|(r, d)| r.to_bits() != d.to_bits())
+        .count();
+    assert_eq!(
+        react_diffs, 0,
+        "react differs from density at {react_diffs} cells"
+    );
 }
 
 #[test]
@@ -259,7 +290,9 @@ fn fuel_is_conserved_while_it_does_not_burn() {
     }
     let end = sum_f64(&state.fire.as_ref().unwrap().fuel.read_back(&gpu).unwrap());
     let drift = (end - cutoff) / cutoff;
-    eprintln!("fuel conservation: cutoff {cutoff}, end {end}, drift {drift:e}");
     assert!(cutoff > 0.1, "fuel must have been emitted: {cutoff}");
-    assert!(drift.abs() <= 1e-5, "fuel drift {drift:e}");
+    assert!(
+        drift.abs() <= 1e-5,
+        "fuel drift {drift:e} (cutoff {cutoff}, end {end})"
+    );
 }
