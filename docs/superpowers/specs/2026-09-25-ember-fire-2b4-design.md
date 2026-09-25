@@ -63,11 +63,16 @@ match the document (fuel connected or disconnected since) is a
 
 New work is in bold.
 
-1. Emit density, temperature and **fuel. Each cell's fuel emission is also
-   added to `react`**, marking fresh fuel as unburnt (Mantaflow emits
-   `reactIn` alongside `fuelIn`). The probe of §6.1 checks this relation; if
-   Mantaflow's differs, Ember follows Mantaflow and the difference is
-   recorded in `docs/bench/mantaflow-notes.md`.
+1. Emit density, temperature and **fuel, and blend `react` towards 1 by
+   the fresh fuel's share**, marking fresh fuel as unburnt. With
+   `Δ = fuel_rate · h` and `fuel' = fuel + Δ`: where `fuel' > 1e-6`,
+   `react' = react + (Δ / fuel') · (1 − react)`, clamped to [0, 1]. The
+   §6.1 probe found that Mantaflow blends rather than adds (revised
+   2026-09-25; an additive react would exceed 1 and push the flame's heat
+   above `max_temperature`). Mantaflow blends towards
+   `1 − (1 − occupancy)²`, and Ember towards 1, because the solver receives
+   rates and not the emitter's occupancy. The two agree in fully occupied
+   cells and differ at an emitter's one-voxel surface ramp (§3.3).
 2. **Burn**, one cell-local kernel with substep length `h` (seconds):
    - `fuel' = max(fuel − burning_rate · h, 0)`
    - `react' = react · fuel' / fuel` where `fuel > 1e-6`, else `react' = 0`
@@ -94,6 +99,13 @@ Recorded in `docs/bench/mantaflow-notes.md` and the results:
 
 - **No density clamp.** `processBurn` clamps density to [0, 1] in every
   cell. Ember keeps mass, as it already does for smoke.
+- **No fuel clamp.** Mantaflow clamps a cell's fuel to [0, 10] at emission.
+- **React blends towards 1**, not towards Mantaflow's
+  `1 − (1 − occupancy)²` (§3.2 step 1): only cells on an emitter's surface
+  ramp differ.
+- **Confinement reads fuel before advection.** Mantaflow burns before
+  advection and confines on the advected fuel; Ember confines before
+  advecting velocity, on the fuel after the burn.
 - **No colour grids.**
 - **Units.** `h` is Ember's substep in seconds. `burning_rate` and
   `flame_vorticity` are per second in Ember; `mapping.fire` (§6.1) converts
@@ -200,8 +212,10 @@ as wind's mapping had.
 A sphere fuel emitter at the floor of an open-top domain, Blender's default
 fire settings mapped to Ember. It joins `just bench` at 64³, 128³ and 256³
 with the existing timing, divergence and mass tables, plus fuel mass and
-flame volume (cells with flame > 0.01). Mantaflow's cache writes `flame` and
-`fuel`, so both are compared directly. `docs/bench/results.md` is
+flame volume (cells with flame > 0.01). With `cache_resumable` on,
+Mantaflow's cache writes `flame` and `fuel` (the probe found `fuel` and
+`react` only in a resumable cache, and that resumable does not change the
+simulation), so both are compared directly. `docs/bench/results.md` is
 regenerated with the new rows.
 
 ### 6.3 Render
