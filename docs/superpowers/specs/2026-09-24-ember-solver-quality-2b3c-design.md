@@ -273,7 +273,7 @@ records each.
   proportional rescale assumes q ≥ 0, and with hot and cold temperature at
   once the scale sat on its clamp, compounding ×0.9 or ×1.1 every substep.
   A field with any negative cell before advection is left as the advection
-  made it; density, which is never negative, is still corrected.
+  made it; density, which the benchmark scenes never make negative, is still corrected (a negative `density_rate` would switch it off for that field too).
 - **MacCormack falls back to first order at open faces** (9940e8c, the
   user's decision, option A in `.superpowers/sdd/2b3c/task-6-report.md`):
   where a MacCormack trace crosses an open face, the cell takes the
