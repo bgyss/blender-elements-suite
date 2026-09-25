@@ -1,9 +1,105 @@
 #![allow(dead_code)]
 
-use elements_core::gpu::{Field, FieldDims, FieldFormat, FieldPool, GpuContext};
+use elements_core::gpu::{Field, FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache};
+use elements_core::graph::{Document, Graph, Timeline, TimelineConfig};
 
 pub fn gpu() -> GpuContext {
     GpuContext::new_headless().expect("no GPU adapter available")
+}
+
+/// A document loaded once, stepped through a `Timeline` as many times as a
+/// test needs. Every integration test that must build a graph, step it
+/// frame by frame and read the output field back shares this session rather
+/// than duplicating `Document::from_json` + `into_graph` + a `FieldPool`.
+pub struct Session {
+    pub gpu: GpuContext,
+    pub pool: FieldPool,
+    pub pipelines: PipelineCache,
+    pub graph: Graph,
+    pub dims: FieldDims,
+}
+
+impl Session {
+    pub fn new(doc: &str) -> Self {
+        let (graph, dims) = Document::from_json(doc)
+            .unwrap()
+            .into_graph(&elements_ember::registry())
+            .unwrap();
+        Self {
+            gpu: gpu(),
+            pool: FieldPool::new(),
+            pipelines: PipelineCache::new(),
+            graph,
+            dims,
+        }
+    }
+
+    /// Evaluate `frame` on `timeline` and read the output field back as bits,
+    /// so callers can hash or compare it bit-exactly.
+    pub fn density_bits(&mut self, timeline: &mut Timeline, frame: u32) -> Vec<u32> {
+        let evaluated = timeline
+            .goto(
+                &self.graph,
+                &self.gpu,
+                &mut self.pool,
+                &mut self.pipelines,
+                self.dims,
+                frame,
+            )
+            .unwrap();
+        let bits = evaluated
+            .value
+            .as_field()
+            .unwrap()
+            .read_back(&self.gpu)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        evaluated.value.release_to(&mut self.pool);
+        bits
+    }
+}
+
+pub fn timeline(budget_bytes: u64) -> Timeline {
+    Timeline::new(TimelineConfig {
+        fps: 24.0,
+        start_frame: 1,
+        cache_budget_bytes: budget_bytes,
+    })
+}
+
+/// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
+/// back and forth, and after eviction forced a recompute.
+pub fn assert_doc_frame_40_is_bit_identical(doc: &str) {
+    let mut s = Session::new(doc);
+
+    let mut in_order = timeline(0);
+    let mut reference = Vec::new();
+    for frame in 1..=40 {
+        reference = s.density_bits(&mut in_order, frame);
+    }
+    assert!(
+        reference.iter().any(|&b| f32::from_bits(b) != 0.0),
+        "the plume must exist"
+    );
+
+    let mut scrubbed = timeline(512 * 1024 * 1024);
+    s.density_bits(&mut scrubbed, 40);
+    s.density_bits(&mut scrubbed, 10);
+    assert!(
+        s.density_bits(&mut scrubbed, 40) == reference,
+        "after scrubbing"
+    );
+
+    // About ten 16³ snapshots fit, so reaching 40 evicts most of them.
+    let mut evicting = timeline(1024 * 1024);
+    s.density_bits(&mut evicting, 40);
+    s.density_bits(&mut evicting, 5);
+    assert!(
+        s.density_bits(&mut evicting, 40) == reference,
+        "after eviction"
+    );
 }
 
 /// Index of voxel `(i, j, k)` in an x-fastest array of `dims`.

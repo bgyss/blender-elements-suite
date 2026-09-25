@@ -1,12 +1,10 @@
 mod common;
 
 use common::*;
-use elements_core::gpu::{
-    Axis, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache,
-};
+use elements_core::gpu::{Axis, FieldDims, FieldFormat, FieldPool, GpuError, PipelineCache};
 use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
-    StateStore, Time, Timeline, TimelineConfig, Value,
+    StateStore, Time, Value,
 };
 use elements_ember::cfl;
 use elements_ember::kernels::Advection;
@@ -356,97 +354,10 @@ fn gauss_seidel(solver: &str) -> String {
     doc
 }
 
-struct Session {
-    gpu: GpuContext,
-    pool: FieldPool,
-    pipelines: PipelineCache,
-    graph: Graph,
-    dims: FieldDims,
-}
-
-impl Session {
-    fn new(doc: &str) -> Self {
-        let (graph, dims) = Document::from_json(doc)
-            .unwrap()
-            .into_graph(&elements_ember::registry())
-            .unwrap();
-        Self {
-            gpu: gpu(),
-            pool: FieldPool::new(),
-            pipelines: PipelineCache::new(),
-            graph,
-            dims,
-        }
-    }
-
-    fn density_bits(&mut self, timeline: &mut Timeline, frame: u32) -> Vec<u32> {
-        let evaluated = timeline
-            .goto(
-                &self.graph,
-                &self.gpu,
-                &mut self.pool,
-                &mut self.pipelines,
-                self.dims,
-                frame,
-            )
-            .unwrap();
-        let bits = evaluated
-            .value
-            .as_field()
-            .unwrap()
-            .read_back(&self.gpu)
-            .unwrap()
-            .iter()
-            .map(|v| v.to_bits())
-            .collect();
-        evaluated.value.release_to(&mut self.pool);
-        bits
-    }
-}
-
-fn timeline(budget_bytes: u64) -> Timeline {
-    Timeline::new(TimelineConfig {
-        fps: 24.0,
-        start_frame: 1,
-        cache_budget_bytes: budget_bytes,
-    })
-}
-
 /// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
 /// back and forth, and after eviction forced a recompute.
 fn assert_frame_40_is_bit_identical(solver: &str) {
     assert_doc_frame_40_is_bit_identical(&plume_16(solver));
-}
-
-fn assert_doc_frame_40_is_bit_identical(doc: &str) {
-    let mut s = Session::new(doc);
-
-    let mut in_order = timeline(0);
-    let mut reference = Vec::new();
-    for frame in 1..=40 {
-        reference = s.density_bits(&mut in_order, frame);
-    }
-    assert!(
-        reference.iter().any(|&b| f32::from_bits(b) != 0.0),
-        "the plume must exist"
-    );
-
-    let mut scrubbed = timeline(512 * 1024 * 1024);
-    s.density_bits(&mut scrubbed, 40);
-    s.density_bits(&mut scrubbed, 10);
-    assert!(
-        s.density_bits(&mut scrubbed, 40) == reference,
-        "after scrubbing"
-    );
-
-    // About ten 16³ snapshots fit, so reaching 40 evicts most of them.
-    let mut evicting = timeline(1024 * 1024);
-    s.density_bits(&mut evicting, 40);
-    s.density_bits(&mut evicting, 5);
-    assert!(
-        s.density_bits(&mut evicting, 40) == reference,
-        "after eviction"
-    );
 }
 
 #[test]

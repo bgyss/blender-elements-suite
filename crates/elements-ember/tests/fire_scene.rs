@@ -5,7 +5,11 @@ mod common;
 use common::*;
 use elements_core::gpu::{FieldDims, FieldPool, PipelineCache};
 use elements_core::graph::{Document, Graph, NodeError, NodeId, StateStore, Time};
+use elements_ember::bench::{FIRE_FUEL_RATE, Scene};
+use elements_ember::collider::ColliderParams;
+use elements_ember::metrics::centroid_z;
 use elements_ember::solver::{FUEL, REACT};
+use elements_ember::transform::{Shape, Transform};
 
 const SOLVER: NodeId = NodeId(1);
 
@@ -166,5 +170,84 @@ fn connecting_fuel_changes_the_state_shape() {
             a.pool.allocation_count(),
             "{first:?} → {then:?}: the failed frame must return every taken field to the pool"
         );
+    }
+}
+
+fn scene_run(scene: &Scene, socket: u32) -> Run {
+    Run::new(&scene.document_with_output(socket).to_json().unwrap())
+}
+
+#[test]
+fn the_fire_scene_wires_fuel_to_the_solver() {
+    let doc = Scene::fire(16).document();
+    assert!(
+        doc.edges
+            .iter()
+            .any(|e| (e.from_node, e.from_index, e.to_node, e.to_index) == (0, 4, 1, 6))
+    );
+    assert!(
+        !Scene::plume(16)
+            .document()
+            .edges
+            .iter()
+            .any(|e| e.to_index == 6)
+    );
+    let j = Scene::fire(64).mantaflow_json();
+    assert_eq!(
+        j["emitter"]["fuel_rate"],
+        serde_json::json!(FIRE_FUEL_RATE as f64)
+    );
+    assert_eq!(j["fire"]["burning_rate"], serde_json::json!(1.875));
+    assert!(Scene::plume(64).mantaflow_json()["fire"].is_null());
+}
+
+#[test]
+fn the_flame_rises() {
+    let scene = Scene::fire(32);
+    let mut r = scene_run(&scene, 3);
+    let cells = FieldDims::new(32, 32, 32);
+    let mut heights = Vec::new();
+    for f in 1..=24 {
+        let flame = r.frame(f).unwrap();
+        if [4, 12, 24].contains(&f) {
+            heights.push(centroid_z(&flame, cells).expect("there is flame"));
+        }
+    }
+    assert!(
+        heights[0] < heights[1] && heights[1] < heights[2],
+        "flame centroid {heights:?}"
+    );
+}
+
+#[test]
+fn fire_frame_40_is_bit_identical_however_it_is_reached() {
+    // Density carries the burn's smoke; frame 40 in order, after a scrub,
+    // and after eviction (the same checks as the smoke scenes).
+    let doc = Scene::fire(16).document().to_json().unwrap();
+    assert_doc_frame_40_is_bit_identical(&doc);
+}
+
+#[test]
+fn no_fuel_or_flame_enters_a_collider() {
+    let mut scene = Scene::fire(32);
+    scene.colliders = vec![ColliderParams {
+        shape: Shape::Sphere { radius: 0.25 },
+        transform: Transform::at([1.0, 1.0, 0.8]),
+    }];
+    let solid = scene.solid_mask();
+    let mut r = scene_run(&scene, 3);
+    for f in 1..=40 {
+        let flame = r.frame(f).unwrap();
+        if f >= 10 {
+            let fuel = r.slot(FUEL);
+            for (n, &s) in solid.iter().enumerate() {
+                if s {
+                    assert!(
+                        fuel[n].abs() <= 1e-6 && flame[n] <= 1e-3,
+                        "cell {n} frame {f}"
+                    );
+                }
+            }
+        }
     }
 }
