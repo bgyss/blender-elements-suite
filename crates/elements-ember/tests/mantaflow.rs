@@ -7,7 +7,7 @@ mod mantaflow;
 use std::path::PathBuf;
 
 use elements_core::gpu::FieldDims;
-use mantaflow::{CacheError, read_frame, read_frame_with};
+use mantaflow::{CacheError, read_float_grid, read_frame, read_frame_with};
 
 const N: u32 = 16;
 const DX: f64 = 0.125;
@@ -150,5 +150,26 @@ fn a_cell_with_density_but_no_velocity_is_listed() {
     assert!(
         !f.missing_velocity.iter().any(smoky),
         "a smoky cell is listed"
+    );
+}
+
+#[test]
+fn any_float_grid_reads_into_the_domain_layout() {
+    let cells = FieldDims::new(N, N, N);
+    let t = read_float_grid(&fixture(), cells, "temperature")
+        .unwrap()
+        .expect("the fixture has a temperature grid");
+    let sum: f64 = t.iter().map(|&v| f64::from(v)).sum();
+    // The README's reference value.
+    assert!((sum - 62.6631).abs() < 1e-3, "temperature sum {sum}");
+    let flame = read_float_grid(&fixture(), cells, "flame")
+        .unwrap()
+        .expect("the fixture has an empty flame grid");
+    assert!(flame.iter().all(|&v| v == 0.0), "flame is empty");
+    assert!(
+        read_float_grid(&fixture(), cells, "fuel")
+            .unwrap()
+            .is_none(),
+        "a smoke-only cache has no fuel grid"
     );
 }
