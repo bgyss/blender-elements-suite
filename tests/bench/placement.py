@@ -105,7 +105,7 @@ def kept_verdict(path: str) -> str:
             old = fh.read()
     except FileNotFoundError:
         return PENDING
-    start = old.find("Verdict (recorded by the user")
+    start = old.find("Verdict (recorded")
     if start < 0:
         return PENDING
     end = old.find("\n## ", start)

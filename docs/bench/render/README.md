@@ -3,7 +3,7 @@
 - Machine: Apple M1 Max
 - OS: macOS 27.2
 - Ember bakes' commit: eb6b1c1
-- Mantaflow bakes' commit: 2e1f9a9-dirty
+- Mantaflow bakes' commit: 2e1f9a9-dirty (the uncommitted change was the render scripts; `git diff 2e1f9a9..eb6b1c1` touches no scene or solver code)
 - Blender: 5.2.2 LTS
 - Date: 2026-09-25
 
@@ -53,19 +53,27 @@ is a density sink; and Mantaflow clamps density to [0, 1] at the emitter while
 Ember does not, so Ember's densest cells can exceed 1 (behind an optically
 thick core, that changes little in the image).
 
-Verdict (recorded by the user, 2026-09-25): at matched emitted mass, Ember
-reproduces Mantaflow's large-scale behaviour in every scene: the rise, the
-mushroom cap, and the flow over and around the collider, where the two match
-most closely. Ember is visibly smoother. Mantaflow keeps finer turbulent detail
-in the stem (streaks and ripples by frame 60, wisps and bulges by 90) and a
-larger cap about 0.1 of the domain higher, which agrees with its 1.3–2.1× kinetic
-energy per measured cell in `docs/bench/results.md`; part of that extra height
-is the heat mapping (its emitter is hotter early), not the solver. The wind
-scene differs by design: Ember's ambient airflow bends the plume into a low band
-and carries it out through +x, while Mantaflow's wind pushes only the smoke,
-which rises diagonally and piles against +x. The remaining gap is Ember's
-small-scale detail. The levers are less numerical dissipation in advection,
-vorticity confinement (0 in both solvers' bench settings today), and the ML
+Verdict (recorded for the user by Claude at their request, 2026-09-25): at
+matched emitted mass, Ember reproduces Mantaflow's large-scale behaviour in
+`plume` and `plume_collider`: the rise, the mushroom cap, and the flow over and
+around the collider, where the two match most closely. `plume_wind` differs by
+construction, not by accuracy: Ember's ambient airflow moves all the air, so its
+plume is bent into a low band and carried out through +x (the domain is empty
+by frame 90), while Mantaflow's wind pushes only the smoke, which rises
+diagonally and piles against +x. In `plume`, Ember is visibly smoother:
+Mantaflow keeps finer turbulent detail in the stem (streaks and ripples by
+frame 60, wisps and bulges by 90) and at frame 60 a larger cap about 0.1 of the
+domain higher. That agrees with Mantaflow's 1.7–1.9× kinetic energy per measured
+cell at frame 60 in `plume` at the rendered resolutions (1.08–2.12× in
+`plume_collider`, rising with resolution; `docs/bench/results.md`); part of the
+height is the heat mapping (Mantaflow's emitter is hotter early), not the
+solver. By frame 90 that reverses at the top: Mantaflow's cap is flattened
+against the open top and has lost 46% of its frame-60 mass against Ember's
+17%, so there Ember's cap is the larger. In both scenes at frame 90 Ember keeps
+a low blob near the emitter that Mantaflow does not, and in `plume_collider`
+Mantaflow's lobes spread wider. The remaining gap is Ember's small-scale
+detail. The levers are less numerical dissipation in advection, vorticity
+confinement (0 in both solvers' bench settings today), and the ML
 upresolution seam; a heat mapping that matches Ember's rate would make the
 heights comparable.
 
@@ -89,7 +97,7 @@ The collider sphere is not drawn; it shows only as the faint outline the smoke l
 
 ## `plume_wind` (128³)
 
-Both panels show solver behaviour, not the render. Ember's smoke leaves through the open +x side from about frames 23–34 and is gone by frame 90 (`docs/bench/results.md`), which is why its frame-90 panel is empty. Mantaflow's smoke stays in the domain against +x: at frame 60 its mass is 0.0842 against Ember's 0.0382 (sum of density × dx³ in these bakes). Mantaflow's wind acts only on cells that hold smoke, while Ember's moves all the air (`docs/bench/mantaflow-notes.md`, Wind as ambient airflow).
+Both panels show solver behaviour, not the render. Ember's smoke leaves through the open +x side; at 128³ it starts leaving at about frame 30 and is gone by frame 90, which is why its frame-90 panel is empty. Mantaflow's smoke stays in the domain against +x: at frame 60 its mass is 0.0842 against Ember's 0.0382 (the 128³ `mass` columns in `docs/bench/results/*-plume_wind-128.csv`, from the 2b-3c benchmark run). Mantaflow's wind acts only on cells that hold smoke, while Ember's moves all the air (`docs/bench/mantaflow-notes.md`, Wind as ambient airflow).
 
 ![plume_wind 128³ frame 30](plume_wind-128-f030.png)
 

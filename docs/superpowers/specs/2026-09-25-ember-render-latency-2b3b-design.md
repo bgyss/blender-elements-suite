@@ -53,8 +53,10 @@ frame."
 - **`tests/bench/render_compare.py`** (GPL-3.0-or-later, headless Blender):
   for each scene and frame (30, 60, 90), load both VDBs as Volume objects
   placed in their domain's space, side by side (Ember left, Mantaflow right).
-  Mantaflow's VDB puts voxel centres at i·dx, half a cell off the domain
-  (`docs/bench/mantaflow-notes.md`), so its object is shifted by half a cell.
+  Both writers put voxel centres at i·dx, half a cell off the domain
+  (`docs/bench/mantaflow-notes.md`; `tests/bench/placement.py` for Ember's),
+  so both objects are shifted by half a cell. *Corrected at implementation:
+  the design first said only Mantaflow's.*
   One camera, a key and a fill light, a world colour, the same Principled
   Volume shader and density scale on both, Cycles at a fixed sample count and
   seed, about 960×540, with "Ember" and "Mantaflow" labels in the image.
@@ -62,7 +64,8 @@ frame."
   `docs/bench/render/README.md` that lays them out as a contact sheet, with the
   machine, commits, Blender version and date.
 - **Judgement:** the controller describes what the images show; the user
-  records the verdict in the README's note line.
+  records the verdict in the README's note line. *In the event the user asked
+  the controller to record it accurately; the label says so.*
 
 ## 4. Records
 
@@ -84,7 +87,7 @@ CLAUDE.md's status and the roadmap (2b-3b done).
 
 - **(a) Load.** As before; loads are recorded and flagged.
 - **(b) Density scale.** The same shader density on both solvers only makes
-  sense because their emitted masses match (within 3.5% over frames 12–24,
-  `results.md`); the README says so.
+  sense because their emitted masses match (Ember 0.99–1.04× Mantaflow's over
+  frames 12–24, `results.md`); the README says so.
 - **(c) Render time.** 12 images of two volumes at 256³ at most; if Cycles is
   slow, lower the sample count, not the image count.

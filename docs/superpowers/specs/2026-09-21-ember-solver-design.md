@@ -313,8 +313,10 @@ output, after resampling velocity to cell centres:
 **Visual.** Both VDB sequences are rendered with one Cycles setup (same camera, lights
 and volume shader) and shown side by side. This is judged by eye and recorded
 as a note, not a number. *Done in 2b-3b (2026-09-25):* `docs/bench/render/README.md`,
-with the verdict: Ember matches Mantaflow's large-scale shape in every scene and
-is visibly smoother; Mantaflow keeps finer turbulent detail.
+with the verdict: Ember matches Mantaflow's large-scale shape in `plume` and
+`plume_collider` and is visibly smoother there, Mantaflow keeping finer
+turbulent detail; `plume_wind` differs by construction (Ember's wind moves all
+the air, Mantaflow's only the smoke).
 
 ### 5.5 The speed gate
 

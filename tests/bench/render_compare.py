@@ -274,10 +274,11 @@ NOTES = {
     ),
     "plume_wind": (
         "Both panels show solver behaviour, not the render. Ember's smoke leaves "
-        "through the open +x side from about frames 23–34 and is gone by frame 90 "
-        "(`docs/bench/results.md`), which is why its frame-90 panel is empty. "
+        "through the open +x side; at 128³ it starts leaving at about frame 30 and "
+        "is gone by frame 90, which is why its frame-90 panel is empty. "
         "Mantaflow's smoke stays in the domain against +x: at frame 60 its mass "
-        "is 0.0842 against Ember's 0.0382 (sum of density × dx³ in these bakes). "
+        "is 0.0842 against Ember's 0.0382 (the 128³ `mass` columns in "
+        "`docs/bench/results/*-plume_wind-128.csv`, from the 2b-3c benchmark run). "
         "Mantaflow's wind acts only on cells that hold smoke, while Ember's moves "
         "all the air (`docs/bench/mantaflow-notes.md`, Wind as ambient airflow)."
     ),

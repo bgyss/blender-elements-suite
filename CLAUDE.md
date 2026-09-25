@@ -42,7 +42,8 @@ measured under load. **2b-3b**, the side-by-side render and the latency
 measurement, is complete (`docs/bench/latency.md`, `docs/bench/render/`):
 after a parameter change at 128³ Ember reaches frame N about 7–10× sooner than
 Mantaflow re-bakes (under load, which may favour Ember), and the renders show
-Ember matching Mantaflow's large-scale shape with visibly less fine detail.
+Ember matching Mantaflow's large-scale shape in `plume` and `plume_collider` with
+visibly less fine detail (`plume_wind` differs by construction).
 Flame is next, as 2b-4. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
 branch `ember-node-editor`) is designed and planned but paused.
 
