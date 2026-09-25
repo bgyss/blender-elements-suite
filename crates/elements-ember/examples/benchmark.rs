@@ -8,10 +8,14 @@
 //!                                  Blender ($BLENDER_BIN, or the macOS app)
 //!   benchmark latency SCENE RES    time Ember from a parameter change to
 //!                                  frame N, in a warm process (2b-3b §2)
+//!   benchmark mantaflow-latency SCENE RES
+//!                                  time Mantaflow's re-bake to frame N after
+//!                                  a parameter change, in one open Blender
 //!   benchmark report               build docs/bench/results.md
+//!   benchmark latency-report       build docs/bench/latency.md
 //!
 //! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv;
-//! `latency` writes docs/bench/results/latency-ember-{scene}-{res}.json.
+//! the latency modes write docs/bench/results/latency-{solver}-{scene}-{res}.json.
 
 mod common;
 
@@ -23,7 +27,8 @@ use std::time::Instant;
 use elements_core::gpu::{Axis, FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::report::{
-    Context, RunSummary, load_average, results_markdown, single_commit, write_summary,
+    Context, LatencyPoint, LatencySummary, RunSummary, latency_markdown, load_average,
+    results_markdown, single_commit, single_latency_commit, write_latency, write_summary,
 };
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
 use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
@@ -35,7 +40,11 @@ type Res<T> = Result<T, Box<dyn Error>>;
 
 /// The benchmark's own output, relative to the repository root. Writing it
 /// must not make later runs' commit label dirty (see `bench_commit`).
-const OUTPUTS: [&str; 2] = ["docs/bench/results", "docs/bench/results.md"];
+const OUTPUTS: [&str; 3] = [
+    "docs/bench/results",
+    "docs/bench/results.md",
+    "docs/bench/latency.md",
+];
 
 /// The commit label recorded in every summary: `commit_label`, ignoring the
 /// benchmark's own output, so one `just bench` records one label throughout.
@@ -178,32 +187,13 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
 
 /// The frames each latency point evaluates up to (2b-3b spec §2).
 const LATENCY_FRAMES: [u32; 4] = [1, 24, 60, 120];
-/// Timed runs per latency point.
+/// Ember's timed runs per latency point.
 const LATENCY_RUNS: u32 = 5;
+/// Mantaflow's timed runs per latency point: 5 up to N = 24, 3 above, since
+/// a 128³ re-bake to frame 120 takes about a minute (spec §2).
+const MANTAFLOW_LATENCY_RUNS: [u32; 4] = [5, 5, 3, 3];
 /// The warm-up evaluates the unchanged scene this far, once, untimed.
 const WARM_UP_FRAMES: u32 = 24;
-
-/// One latency point: frames 1..=`frame`, 5 runs.
-#[derive(serde::Serialize)]
-struct LatencyPoint {
-    frame: u32,
-    runs_s: Vec<f64>,
-    median_s: f64,
-    /// Seconds to frame 1 (graph construction included); only on N = 1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    first_frame_s: Option<f64>,
-}
-
-#[derive(serde::Serialize)]
-struct LatencySummary {
-    solver: &'static str,
-    scene: String,
-    resolution: u32,
-    commit: String,
-    load_before: f64,
-    load_after: f64,
-    points: Vec<LatencyPoint>,
-}
 
 /// Evaluate `scene` from frame 1 to `frames` in a fresh graph, pool and
 /// state, as a daemon does after a parameter change, ending with a blocking
@@ -235,8 +225,10 @@ fn latency_run(
 }
 
 /// Spec §2: one process, device, pipeline cache and registry throughout;
-/// each run changes the emitter's density rate so no two runs share a
-/// document, then times graph construction plus frames 1..=N.
+/// each run changes the emitter's density rate, so no two runs within a
+/// point share a document, then times graph construction plus frames 1..=N.
+/// The N = 1 median is the time to the first frame. `load_before` is taken
+/// after the warm-up, just before the first timed run.
 fn run_latency(name: &str, res: u32) -> Res<()> {
     let gpu = GpuContext::new_headless()?;
     let registry = elements_ember::registry();
@@ -244,6 +236,9 @@ fn run_latency(name: &str, res: u32) -> Res<()> {
     let scene = scene(name, res)?;
     eprintln!("latency {name} {res}³: warm-up to frame {WARM_UP_FRAMES}");
     latency_run(&gpu, &registry, &mut pipelines, &scene, WARM_UP_FRAMES)?;
+    // Every pipeline the timed runs need should exist by now; a later
+    // compile would land inside a timing.
+    let warm_pipelines = pipelines.len();
     let load_before = load_average();
     let mut points = Vec::new();
     for n in LATENCY_FRAMES {
@@ -261,24 +256,29 @@ fn run_latency(name: &str, res: u32) -> Res<()> {
         points.push(LatencyPoint {
             frame: n,
             median_s: median(&runs_s),
-            first_frame_s: (n == 1).then(|| median(&runs_s)),
             runs_s,
         });
     }
     let load_after = load_average();
+    let compiled = pipelines.len() - warm_pipelines;
+    if compiled > 0 {
+        eprintln!(
+            "\n*** WARNING: latency {name} {res}³: {compiled} pipelines were compiled during \
+             the timed runs, so some timings include a shader compile ***\n"
+        );
+    }
     let summary = LatencySummary {
-        solver: "ember",
+        solver: "ember".into(),
         scene: name.into(),
         resolution: res,
         commit: bench_commit(),
         load_before,
         load_after,
+        blender: None,
+        pipelines_compiled: Some(compiled),
         points,
     };
-    let dir = results_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("latency-ember-{name}-{res}.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(&summary)? + "\n")?;
+    let path = write_latency(&results_dir(), &summary)?;
     eprintln!("wrote {}", path.display());
     Ok(())
 }
@@ -311,10 +311,11 @@ fn blender_tail(stderr: &str) -> String {
     lines[start..end].join("\n")
 }
 
-/// Run the scene script under `/usr/bin/time -l`, returning peak resident
-/// bytes and the tail of Blender's stderr, for errors found after it exits.
-/// `-l` prints "maximum resident set size" in bytes on macOS.
-fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<(u64, String)> {
+/// Run the scene script under `/usr/bin/time -l` with `extra` arguments
+/// after its two positional ones, returning peak resident bytes and the tail
+/// of Blender's stderr, for errors found after it exits. `-l` prints
+/// "maximum resident set size" in bytes on macOS.
+fn run_blender(scene_json: &Path, out: &Path, extra: &[&str]) -> Res<(u64, String)> {
     let script = workspace().join("tests/bench/mantaflow_scene.py");
     let mut cmd = Command::new("/usr/bin/time");
     cmd.arg("-l")
@@ -329,10 +330,8 @@ fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<(u64, String
         .arg(&script)
         .arg("--")
         .arg(scene_json)
-        .arg(out);
-    if no_bake {
-        cmd.arg("--no-bake");
-    }
+        .arg(out)
+        .args(extra);
     let output = cmd.output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let tail = blender_tail(&stderr);
@@ -398,10 +397,9 @@ fn clear_dir(dir: &Path) -> Res<()> {
     Ok(())
 }
 
-fn run_mantaflow(name: &str, res: u32) -> Res<()> {
-    let scene = scene(name, res)?;
-    let context =
-        |e: Box<dyn Error>| -> Box<dyn Error> { format!("mantaflow {name} {res}³: {e}").into() };
+/// The scene's scratch directory under `target/bench/`, with its
+/// Mantaflow twin written there as `scene.json`; returns both paths.
+fn scene_scratch(name: &str, res: u32, scene: &Scene) -> Res<(PathBuf, PathBuf)> {
     let scratch = workspace().join(format!("target/bench/{name}-{res}"));
     std::fs::create_dir_all(&scratch)?;
     let scene_json = scratch.join("scene.json");
@@ -409,11 +407,19 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
         &scene_json,
         serde_json::to_string_pretty(&scene.mantaflow_json())? + "\n",
     )?;
+    Ok((scratch, scene_json))
+}
+
+fn run_mantaflow(name: &str, res: u32) -> Res<()> {
+    let scene = scene(name, res)?;
+    let context =
+        |e: Box<dyn Error>| -> Box<dyn Error> { format!("mantaflow {name} {res}³: {e}").into() };
+    let (scratch, scene_json) = scene_scratch(name, res, &scene)?;
 
     eprintln!("mantaflow {name} {res}³: baseline (no bake)");
     let base_dir = scratch.join("baseline");
     clear_dir(&base_dir)?;
-    let (baseline, _) = run_blender(&scene_json, &base_dir, true).map_err(context)?;
+    let (baseline, _) = run_blender(&scene_json, &base_dir, &["--no-bake"]).map_err(context)?;
 
     // The scene script never clears an old cache, so a stale frame would
     // pass its missing-frame check: clear the output before every bake.
@@ -428,7 +434,7 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     for r in 0..runs {
         eprintln!("mantaflow {name} {res}³: timed run {} of {runs}", r + 1);
         clear_dir(&out)?;
-        let (rss, stderr) = run_blender(&scene_json, &out, false).map_err(context)?;
+        let (rss, stderr) = run_blender(&scene_json, &out, &[]).map_err(context)?;
         tail = stderr;
         let path = out.join("timings.json");
         let timings: Timings = std::fs::read_to_string(&path)
@@ -494,6 +500,143 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     };
     write_summary(&results_dir(), &summary)?;
     Ok(())
+}
+
+/// `latency.json` from the scene script's `--latency` mode.
+#[derive(serde::Deserialize)]
+struct MantaflowLatency {
+    solver: String,
+    resolution: u32,
+    load_before: f64,
+    load_after: f64,
+    blender: String,
+    points: Vec<LatencyPoint>,
+}
+
+/// Spec §2, Mantaflow's side: one Blender process builds the scene once
+/// and times re-bakes to each N after a density change, its cache freed
+/// between them (`mantaflow_scene.py --latency`). Blender's startup and the
+/// scene's construction are outside every timing.
+fn run_mantaflow_latency(name: &str, res: u32) -> Res<()> {
+    let scene = scene(name, res)?;
+    let context = |e: Box<dyn Error>| -> Box<dyn Error> {
+        format!("mantaflow latency {name} {res}³: {e}").into()
+    };
+    let (scratch, scene_json) = scene_scratch(name, res, &scene)?;
+    let out = scratch.join("latency");
+    clear_dir(&out)?;
+    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let (frames, runs) = (list(&LATENCY_FRAMES), list(&MANTAFLOW_LATENCY_RUNS));
+    eprintln!("mantaflow latency {name} {res}³: N = {frames}, runs {runs}");
+    let (_, tail) = run_blender(
+        &scene_json,
+        &out,
+        &["--latency", frames.as_str(), "--runs", runs.as_str()],
+    )
+    .map_err(context)?;
+    let path = out.join("latency.json");
+    let m: MantaflowLatency = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+        })
+        .map_err(|e| context(with_stderr(e, &tail)))?;
+    let shape: Vec<(u32, u32)> = m
+        .points
+        .iter()
+        .map(|p| (p.frame, p.runs_s.len() as u32))
+        .collect();
+    let expected: Vec<(u32, u32)> = LATENCY_FRAMES
+        .into_iter()
+        .zip(MANTAFLOW_LATENCY_RUNS)
+        .collect();
+    if m.solver != "mantaflow" || m.resolution != res || shape != expected {
+        return Err(context(with_stderr(
+            format!(
+                "{} holds solver {:?}, resolution {}, (N, runs) {shape:?}; expected \
+                 mantaflow, {res}, {expected:?}",
+                path.display(),
+                m.solver,
+                m.resolution
+            ),
+            &tail,
+        )));
+    }
+    for p in &m.points {
+        eprintln!(
+            "mantaflow latency {name} {res}³: N = {}: median {:.3} s",
+            p.frame, p.median_s
+        );
+    }
+    let summary = LatencySummary {
+        solver: "mantaflow".into(),
+        scene: name.into(),
+        resolution: res,
+        commit: bench_commit(),
+        load_before: m.load_before,
+        load_after: m.load_after,
+        blender: Some(m.blender),
+        pipelines_compiled: None,
+        points: m.points,
+    };
+    let path = write_latency(&results_dir(), &summary)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Build `docs/bench/latency.md` from every latency file, or name the
+/// missing ones and fail.
+fn latency_report() -> Res<()> {
+    let dir = results_dir();
+    let mut summaries = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let latency = path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with("latency-"));
+            if latency && path.extension().is_some_and(|e| e == "json") {
+                let text = std::fs::read_to_string(&path)?;
+                let s: LatencySummary =
+                    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                summaries.push(s);
+            }
+        }
+    }
+    let commit = single_latency_commit(&summaries).map_err(|lines| {
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        "latency files come from more than one commit; latency.md not written"
+    })?;
+    let ctx = Context {
+        machine: shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
+        os: format!("macOS {}", shell("sw_vers", &["-productVersion"])),
+        commit,
+        blender: summaries
+            .iter()
+            .find_map(|s| s.blender.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        date: shell("date", &["-u", "+%Y-%m-%d"]),
+    };
+    match latency_markdown(&summaries, &ctx) {
+        Ok(md) => {
+            let path = workspace().join("docs/bench/latency.md");
+            std::fs::write(&path, md)?;
+            eprintln!("wrote {}", path.display());
+            Ok(())
+        }
+        Err(missing) => {
+            for m in &missing {
+                eprintln!("missing: {}", dir.join(format!("{m}.json")).display());
+            }
+            Err(format!(
+                "{} latency files missing; latency.md not written",
+                missing.len()
+            )
+            .into())
+        }
+    }
 }
 
 /// Build `docs/bench/results.md` from every result file, or name the
@@ -574,7 +717,9 @@ fn run() -> Res<()> {
         ["ember", name, res] => run_ember(name, res.parse()?),
         ["mantaflow", name, res] => run_mantaflow(name, res.parse()?),
         ["latency", name, res] => run_latency(name, res.parse()?),
+        ["mantaflow-latency", name, res] => run_mantaflow_latency(name, res.parse()?),
         ["report"] => report(),
+        ["latency-report"] => latency_report(),
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
             println!("{}", serde_json::to_string_pretty(&json)?);
@@ -582,7 +727,7 @@ fn run() -> Res<()> {
         }
         _ => Err(
             "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES \
-             | latency SCENE RES | report"
+             | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report"
                 .into(),
         ),
     }

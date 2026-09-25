@@ -134,17 +134,26 @@ const EMISSION_CHECK_FRAMES: std::ops::RangeInclusive<usize> = 12..=24;
 /// `{solver}-{scene}-{resolution}: {commit}`, when they differ. A table
 /// mixing commits would compare different code.
 pub fn single_commit(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
-    let first = summaries
+    one_commit(summaries.iter().map(|s| {
+        (
+            format!("{}-{}-{}", s.solver, s.scene, s.resolution),
+            &*s.commit,
+        )
+    }))
+}
+
+/// The commit every labelled item shares, or one `{label}: {commit}` line
+/// per item, sorted, when they differ.
+fn one_commit<'a>(items: impl Iterator<Item = (String, &'a str)>) -> Result<String, Vec<String>> {
+    let items: Vec<(String, &str)> = items.collect();
+    let first = items
         .first()
-        .map(|s| s.commit.clone())
+        .map(|(_, c)| c.to_string())
         .unwrap_or_default();
-    if summaries.iter().all(|s| s.commit == first) {
+    if items.iter().all(|(_, c)| *c == first) {
         return Ok(first);
     }
-    let mut lines: Vec<String> = summaries
-        .iter()
-        .map(|s| format!("{}-{}-{}: {}", s.solver, s.scene, s.resolution, s.commit))
-        .collect();
+    let mut lines: Vec<String> = items.iter().map(|(l, c)| format!("{l}: {c}")).collect();
     lines.sort();
     Err(lines)
 }
@@ -381,6 +390,216 @@ fn sig(v: f64) -> String {
     } else {
         format!("{v:.2e}")
     }
+}
+
+/// The resolution the latency table reports (2b-3b spec §2).
+pub const LATENCY_RESOLUTION: u32 = 128;
+
+/// One latency point: the seconds from a parameter change to frame `frame`
+/// ready, for every run. The N = 1 point's median is the time to the first
+/// frame.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LatencyPoint {
+    pub frame: u32,
+    pub runs_s: Vec<f64>,
+    pub median_s: f64,
+}
+
+/// One solver's latency run of one scene (2b-3b spec §2).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LatencySummary {
+    /// "ember" or "mantaflow".
+    pub solver: String,
+    pub scene: String,
+    pub resolution: u32,
+    pub commit: String,
+    /// 1-minute load average before and after the timed runs, both taken
+    /// after the untimed warm-up.
+    pub load_before: f64,
+    pub load_after: f64,
+    /// Blender's version string for Mantaflow runs; `None` for Ember.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender: Option<String>,
+    /// Ember only: pipelines first compiled during the timed runs, after
+    /// the warm-up. Anything above 0 put a shader compile inside a timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipelines_compiled: Option<usize>,
+    pub points: Vec<LatencyPoint>,
+}
+
+/// `{dir}/latency-{solver}-{scene}-{resolution}.json`.
+pub fn latency_path(dir: &Path, solver: &str, scene: &str, resolution: u32) -> PathBuf {
+    dir.join(format!("latency-{solver}-{scene}-{resolution}.json"))
+}
+
+/// Write `s` as JSON at [`latency_path`], returning the path.
+pub fn write_latency(dir: &Path, s: &LatencySummary) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = latency_path(dir, &s.solver, &s.scene, s.resolution);
+    let json = serde_json::to_string_pretty(s).map_err(std::io::Error::other)?;
+    std::fs::write(&path, json + "\n")?;
+    Ok(path)
+}
+
+/// Like [`single_commit`], for latency summaries.
+pub fn single_latency_commit(summaries: &[LatencySummary]) -> Result<String, Vec<String>> {
+    one_commit(summaries.iter().map(|s| {
+        (
+            format!("latency-{}-{}-{}", s.solver, s.scene, s.resolution),
+            &*s.commit,
+        )
+    }))
+}
+
+/// `docs/bench/latency.md`: one table per scene at [`LATENCY_RESOLUTION`]
+/// of N against both solvers' median seconds and Mantaflow / Ember, or the
+/// stems of the missing latency files. Never a partial table.
+pub fn latency_markdown(
+    summaries: &[LatencySummary],
+    ctx: &Context,
+) -> Result<String, Vec<String>> {
+    let res = LATENCY_RESOLUTION;
+    let find = |solver: &str, scene: &str| {
+        summaries
+            .iter()
+            .find(|s| s.solver == solver && s.scene == scene && s.resolution == res)
+    };
+    let missing: Vec<String> = SOLVERS
+        .into_iter()
+        .flat_map(|solver| SCENES.into_iter().map(move |scene| (solver, scene)))
+        .filter(|(solver, scene)| find(solver, scene).is_none())
+        .map(|(solver, scene)| format!("latency-{solver}-{scene}-{res}"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+
+    let mut md = String::new();
+    let _ = write!(
+        md,
+        "# Latency: a parameter change to frame N\n\n\
+         - Machine: {}\n\
+         - OS: {}\n\
+         - Ember commit: {}\n\
+         - Blender: {}\n\
+         - Date: {}\n\n",
+        ctx.machine, ctx.os, ctx.commit, ctx.blender, ctx.date
+    );
+    let _ = write!(
+        md,
+        "| run | load before | load after | above {IDLE_LOAD} |\n|---|---|---|---|\n"
+    );
+    let mut loaded = Vec::new();
+    for scene in SCENES {
+        for solver in SOLVERS {
+            let s = find(solver, scene).expect("checked above");
+            let high = s.load_before > IDLE_LOAD || s.load_after > IDLE_LOAD;
+            let flag = if high { "**yes**" } else { "no" };
+            let _ = writeln!(
+                md,
+                "| `latency-{solver}-{scene}-{res}` | {:.2} | {:.2} | {flag} |",
+                s.load_before, s.load_after
+            );
+            if high {
+                loaded.push(format!("`latency-{solver}-{scene}-{res}`"));
+            }
+        }
+    }
+    let _ = writeln!(
+        md,
+        "\nTimings from a run whose 1-minute load average was above {IDLE_LOAD} before or \
+         after its timed runs should be redone on an idle machine. Such runs: {}.\n",
+        if loaded.is_empty() {
+            "none".to_owned()
+        } else {
+            loaded.join(", ")
+        }
+    );
+    for scene in SCENES {
+        let e = find("ember", scene).expect("checked above");
+        if let Some(n) = e.pipelines_compiled.filter(|&n| n > 0) {
+            let _ = writeln!(
+                md,
+                "**Warning:** Ember compiled {n} pipelines during `{scene}`'s timed runs, so \
+                 some timings include a shader compile.\n"
+            );
+        }
+    }
+    for scene in SCENES {
+        let e = find("ember", scene).expect("checked above");
+        let m = find("mantaflow", scene).expect("checked above");
+        let _ = write!(md, "## `{scene}` ({res}³)\n\n");
+        if let Some(first) = e.points.iter().find(|p| p.frame == 1) {
+            let _ = write!(
+                md,
+                "Ember's time to its first frame, graph construction included, is the N = 1 \
+                 median: {} s.\n\n",
+                sig(first.median_s)
+            );
+        }
+        md.push_str(
+            "| N | Ember s (median) | Mantaflow s (median) | Mantaflow / Ember |\n\
+             |---|---|---|---|\n",
+        );
+        for p in &e.points {
+            let (manta, ratio) = match m.points.iter().find(|q| q.frame == p.frame) {
+                Some(q) => (
+                    sig(q.median_s),
+                    format!("{}×", sig(q.median_s / p.median_s)),
+                ),
+                None => ("—".to_owned(), "—".to_owned()),
+            };
+            let _ = writeln!(
+                md,
+                "| {} | {} | {manta} | {ratio} |",
+                p.frame,
+                sig(p.median_s)
+            );
+        }
+        md.push('\n');
+    }
+    md.push_str(&latency_notes(summaries));
+    Ok(md)
+}
+
+/// Each solver's runs per N, e.g. "N = 1: 5, N = 24: 5", from the first
+/// scene that has that solver; the runs are the same in every scene.
+fn runs_per_point(summaries: &[LatencySummary], solver: &str) -> String {
+    summaries
+        .iter()
+        .find(|s| s.solver == solver)
+        .map(|s| {
+            s.points
+                .iter()
+                .map(|p| format!("{} at N = {}", p.runs_s.len(), p.frame))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// What the latency table does and does not compare.
+fn latency_notes(summaries: &[LatencySummary]) -> String {
+    let ember_runs = runs_per_point(summaries, "ember");
+    let manta_runs = runs_per_point(summaries, "mantaflow");
+    format!(
+        "## Notes\n\n\
+- **The change.** Every run changes the emitter's density (Ember's `density_rate`, Mantaflow's \
+flow density, each ×(1 + 0.01·(run + 1))), so no run can reuse an earlier result. Each is the \
+median of its runs ({ember_runs} for Ember; {manta_runs} for Mantaflow).\n\
+- **Ember** runs in one warm process, as a live daemon does: one GPU device, registry and \
+pipeline cache throughout, warmed by one untimed evaluation of the unchanged scene to frame 24. \
+Each run times graph construction plus `eval_frame` for frames 1..N in a fresh field pool and \
+state, ending with a blocking GPU wait.\n\
+- **Mantaflow's time is a re-bake in an open Blender with its cache freed**, excluding \
+Blender's startup and the scene's construction. After one untimed bake of the unchanged scene \
+to frame 24, each run frees the cache (`fluid.free_all`, checked to leave no data file), sets \
+the cache's last frame to N and times `fluid.bake_all` from just before the call to frame N's \
+data file existing: the later of the call returning and the file's modification time. Frame \
+time therefore includes Mantaflow writing its cache, as in `results.md`. A run whose frame N \
+file matches another run's, apart from the VDB header's random UUID, is refused.\n\
+- **Loads** are the 1-minute load average, taken after the warm-up and after the last run.\n"
+    )
 }
 
 /// A pressure solve as the report names it, e.g. "MGPCG ×4".

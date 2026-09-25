@@ -92,3 +92,28 @@ bench scenes="plume plume_collider plume_wind" resolutions="64 128 256":
       done
     done
     "$B" report
+
+# Ember in a warm process against Mantaflow re-baking in one open Blender.
+# Waits up to 5 minutes for the 1-minute load to fall below 2, then runs
+# anyway (the report flags loaded runs). Takes 20-30 minutes, real GPU and
+# Blender, not in `check`. Writes docs/bench/results/latency-*.json, then
+# docs/bench/latency.md.
+# Latency from a parameter change to frame N at 128³ (2b-3b spec §2).
+bench-latency scenes="plume plume_collider plume_wind" res="128":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p elements-ember --example benchmark
+    B=target/release/examples/benchmark
+    load() { sysctl -n vm.loadavg | awk '{print $2}'; }
+    for _ in $(seq 30); do
+      awk -v l="$(load)" 'BEGIN { exit !(l < 2) }' && break
+      echo "load $(load): waiting for it to fall below 2"
+      sleep 10
+    done
+    echo "load before: $(sysctl -n vm.loadavg)"
+    for scene in {{scenes}}; do
+      "$B" latency "$scene" {{res}}
+      "$B" mantaflow-latency "$scene" {{res}}
+    done
+    echo "load after: $(sysctl -n vm.loadavg)"
+    "$B" latency-report

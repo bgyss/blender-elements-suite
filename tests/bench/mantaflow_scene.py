@@ -4,11 +4,17 @@
 Run:
   Blender --background --factory-startup --python-exit-code 1 \
       --python tests/bench/mantaflow_scene.py -- SCENE_JSON OUT_DIR [--no-bake]
+      [--latency 1,24,60,120 --runs 5,5,3,3]
 
 SCENE_JSON is `Scene::mantaflow_json()`, printed by
 `cargo run -p elements-ember --example benchmark -- scene-json SCENE RES`.
 The script writes the Mantaflow cache to OUT_DIR/cache/ and each frame's data
 file modification time to OUT_DIR/timings.json.
+
+With --latency, it instead times re-bakes in this one open Blender (2b-3b
+spec §2): for each N and run, change the flow's density, free the cache, and
+bake frames 1..N. OUT_DIR/latency.json holds the seconds from the bake call
+to frame N's data file existing, in the shape of Ember's latency file.
 
 Fairness rules (piece 2 spec §5.3): no noise upres, no adaptive domain, fixed
 timesteps equal to Ember's substep count, and an uncompressed 32-bit OpenVDB
@@ -17,9 +23,12 @@ mapping.py, which names its sources. Blender settings that are not
 conversions are from docs/bench/mantaflow-notes.md, "Parameter mapping".
 """
 
+import hashlib
 import json
 import os
+import statistics
 import sys
+import time
 
 import bpy
 
@@ -123,9 +132,7 @@ def build_wind(sc: dict) -> None:
     if not rate:
         return
     size = sc["domain_size"]
-    strength, flow, direction = mapping.wind(
-        tuple(sc["wind_velocity"]), rate, sc["fps"], size
-    )
+    strength, flow, direction = mapping.wind(tuple(sc["wind_velocity"]), rate, sc["fps"], size)
     bpy.ops.object.effector_add(type="WIND", location=(size / 2,) * 3)
     wind = bpy.context.active_object
     f = wind.field
@@ -174,6 +181,110 @@ def bake(domain: bpy.types.Object, cache_dir: str, frames: int) -> list[dict]:
     return out
 
 
+# The untimed warm-up bakes the unchanged scene this far, as Ember's does,
+# so the timed runs see a Blender that has already baked once.
+WARM_UP_FRAMES = 24
+
+
+def data_file(cache_dir: str, n: int) -> str:
+    return os.path.join(cache_dir, "data", f"fluid_data_{n:04d}.vdb")
+
+
+def data_files(cache_dir: str) -> list[str]:
+    data = os.path.join(cache_dir, "data")
+    return sorted(os.listdir(data)) if os.path.isdir(data) else []
+
+
+def free(domain: bpy.types.Object, cache_dir: str) -> None:
+    with bpy.context.temp_override(object=domain, active_object=domain):
+        result = bpy.ops.fluid.free_all()
+    if "FINISHED" not in result:
+        sys.exit(f"free_all returned {result}")
+    # A stale frame N would end the next run's clock early.
+    left = data_files(cache_dir)
+    if left:
+        sys.exit(f"free_all left {len(left)} data files, e.g. {left[0]}")
+
+
+def timed_bake(domain: bpy.types.Object, cache_dir: str, n: int) -> float:
+    """Seconds from just before `bake_all` to frame n's data file existing:
+    the later of the call returning and the file's modification time."""
+    domain.modifiers["Fluid"].domain_settings.cache_frame_end = n
+    wall_ns = time.time_ns()
+    start = time.perf_counter()
+    with bpy.context.temp_override(object=domain, active_object=domain):
+        result = bpy.ops.fluid.bake_all()
+    returned = time.perf_counter() - start
+    if "FINISHED" not in result:
+        sys.exit(f"bake_all returned {result}")
+    path = data_file(cache_dir, n)
+    if not os.path.exists(path):
+        sys.exit(f"bake to frame {n} wrote no {path}")
+    written = (os.stat(path).st_mtime_ns - wall_ns) / 1e9
+    return max(returned, written)
+
+
+# An OpenVDB file header holds a random 36-character UUID at bytes 21..57,
+# the only bytes two bakes of the same scene differ in (checked at 32³).
+UUID = slice(21, 57)
+
+
+def data_hash(path: str) -> str:
+    """The data file's hash without its header UUID, so that equal bakes
+    give equal hashes."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    uuid = data[UUID]
+    if len(uuid) != 36 or uuid[8:9] != b"-" or uuid[23:24] != b"-":
+        sys.exit(f"{path}: no UUID at bytes 21..57, so the hash cannot skip it")
+    return hashlib.sha256(data[: UUID.start] + data[UUID.stop :]).hexdigest()
+
+
+def latency(
+    domain: bpy.types.Object, flow, cache_dir: str, frames: list[int], runs: list[int]
+) -> dict:
+    d = domain.modifiers["Fluid"].domain_settings
+    end, base = d.cache_frame_end, flow.density
+    free(domain, cache_dir)
+    print(f"latency: warm-up to frame {WARM_UP_FRAMES}", file=sys.stderr, flush=True)
+    timed_bake(domain, cache_dir, WARM_UP_FRAMES)
+    load_before = os.getloadavg()[0]
+    points = []
+    for n, count in zip(frames, runs, strict=True):
+        runs_s, hashes = [], set()
+        for run in range(count):
+            # A new density each run, so no bake can repeat an earlier one.
+            flow.density = base * (1 + 0.01 * (run + 1))
+            free(domain, cache_dir)
+            s = timed_bake(domain, cache_dir, n)
+            runs_s.append(s)
+            hashes.add(data_hash(data_file(cache_dir, n)))
+            print(
+                f"latency: N = {n}, run {run + 1} of {count}: {s:.3f} s",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Equal files would mean the density change never reached the bake.
+        if len(hashes) != count:
+            sys.exit(f"N = {n}: {count} densities gave {len(hashes)} distinct frame-{n} files")
+        points.append({"frame": n, "runs_s": runs_s, "median_s": statistics.median(runs_s)})
+    load_after = os.getloadavg()[0]
+    flow.density = base
+    d.cache_frame_end = end
+    return {
+        "solver": "mantaflow",
+        "resolution": d.resolution_max,
+        "load_before": load_before,
+        "load_after": load_after,
+        "blender": bpy.app.version_string,
+        "points": points,
+    }
+
+
+def int_list(args: list[str], flag: str) -> list[int]:
+    return [int(v) for v in args[args.index(flag) + 1].split(",")]
+
+
 def main() -> None:
     args = sys.argv[sys.argv.index("--") + 1 :]
     scene_json, out_dir = args[0], os.path.abspath(args[1])
@@ -183,6 +294,22 @@ def main() -> None:
     os.makedirs(cache_dir, exist_ok=True)
     domain = build(sc, cache_dir)
     if "--no-bake" in args[2:]:
+        return
+    if "--latency" in args[2:]:
+        flow = next(
+            o
+            for o in bpy.data.objects
+            if o.modifiers.get("Fluid") and o.modifiers["Fluid"].fluid_type == "FLOW"
+        )
+        out = latency(
+            domain,
+            flow.modifiers["Fluid"].flow_settings,
+            cache_dir,
+            int_list(args, "--latency"),
+            int_list(args, "--runs"),
+        )
+        with open(os.path.join(out_dir, "latency.json"), "w") as fh:
+            json.dump(out, fh, indent=1)
         return
     frames = bake(domain, cache_dir, sc["frames"])
     with open(os.path.join(out_dir, "timings.json"), "w") as fh:
