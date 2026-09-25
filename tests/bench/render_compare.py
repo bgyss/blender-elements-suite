@@ -311,9 +311,11 @@ and the plumes have not yet diverged, the emitted masses match: over frames
 12–24, Ember's mass is 0.99–1.04× Mantaflow's across every benchmark run
 (`docs/bench/results.md`, Notes, Heat). The scale is not normalised per
 solver, so a difference in brightness or opacity is a difference in density.
-Two known differences carry through (`results.md`): Mantaflow's emitter heat is
-held at Ember's frame-24 value rather than added at Ember's rate, so its plume
-rises faster; and Mantaflow's open top boundary layer is a density sink.
+Known differences carry through (`results.md`, `mantaflow-notes.md`):
+Mantaflow's emitter heat is held at Ember's frame-24 value rather than added
+at Ember's rate, so its plume rises faster; Mantaflow's open top boundary layer
+is a density sink; and Mantaflow clamps density to [0, 1] at the emitter while
+Ember does not, so Ember's densest cells can exceed 1.
 
 Verdict (recorded by the user): _pending_
 
