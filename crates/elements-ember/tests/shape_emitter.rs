@@ -373,3 +373,153 @@ fn an_active_range_must_not_run_backwards() {
     let err = window_doc("[61, 60]").into_graph(&registry).err();
     assert!(matches!(err, Some(DocError::BadParams { .. })), "{err:?}");
 }
+
+/// Total of an emitter output after frame 1, from a one-node document.
+fn emitter_total(params: &str, output: u32) -> Vec<f32> {
+    let doc = format!(
+        r#"{{ "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+  "nodes": [
+    {{ "id": 0, "kind": "ember.emitter", "params": {params} }},
+    {{ "id": 1, "kind": "core.output", "params": {{}} }} ],
+  "edges": [ {{ "from_node": 0, "from_index": {output}, "to_node": 1, "to_index": 0 }} ],
+  "output": 1 }}"#
+    );
+    let (graph, dims) = Document::from_json(&doc)
+        .unwrap()
+        .into_graph(&elements_ember::registry())
+        .unwrap();
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut state = StateStore::new();
+    let time = Time::at(1, 1, 24.0);
+    let out = graph
+        .eval_frame(&gpu, &mut pool, &mut pipelines, &mut state, time, dims)
+        .unwrap();
+    let v = out.value.as_field().unwrap().read_back(&gpu).unwrap();
+    out.value.release_to(&mut pool);
+    v
+}
+
+const SPHERE: &str = r#""shape": { "sphere": { "radius": 0.4 } },
+    "transform": { "keys": [ { "frame": 1, "translate": [1.0, 1.0, 1.0] } ] }"#;
+
+#[test]
+fn fuel_is_emitted_where_density_is_at_its_own_rate() {
+    let params = format!(
+        r#"{{ {SPHERE}, "density_rate": 1.0, "fuel_rate": 3.0,
+             "noise": {{ "seed": 7, "scale_m": 0.3, "amplitude": 0.5 }} }}"#
+    );
+    let density = emitter_total(&params, 0);
+    let fuel = emitter_total(&params, 4);
+    let want: Vec<f32> = density.iter().map(|d| 3.0 * d).collect();
+    assert!(want.iter().any(|&v| v > 0.0));
+    assert_close(&fuel, &want, 1e-6, "fuel");
+}
+
+#[test]
+fn an_inactive_emitter_emits_no_fuel() {
+    let params = format!(r#"{{ {SPHERE}, "fuel_rate": 3.0, "active_frames": [5, 9] }}"#);
+    assert!(emitter_total(&params, 4).iter().all(|&v| v == 0.0));
+}
+
+/// A one-emitter document, with an optional fuel edge to a union that feeds
+/// `core.output`. `centers` places two emitters; only those whose fuel rate
+/// is nonzero and whose fuel output is wired to the union contribute.
+fn union_fuel_doc(a_fuel_edge: bool, b_fuel_edge: bool) -> String {
+    let a_edge = if a_fuel_edge {
+        r#",{ "from_node": 0, "from_index": 4, "to_node": 2, "to_index": 8 }"#
+    } else {
+        ""
+    };
+    let b_edge = if b_fuel_edge {
+        r#",{ "from_node": 1, "from_index": 4, "to_node": 2, "to_index": 9 }"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{ "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+  "nodes": [
+    {{ "id": 0, "kind": "ember.emitter", "params": {{
+        "shape": {{ "sphere": {{ "radius": 0.4 }} }},
+        "transform": {{ "keys": [ {{ "frame": 1, "translate": [0.7, 1.0, 1.0] }} ] }},
+        "fuel_rate": 1.0 }} }},
+    {{ "id": 1, "kind": "ember.emitter", "params": {{
+        "shape": {{ "sphere": {{ "radius": 0.4 }} }},
+        "transform": {{ "keys": [ {{ "frame": 1, "translate": [1.3, 1.0, 1.0] }} ] }},
+        "fuel_rate": 2.0 }} }},
+    {{ "id": 2, "kind": "ember.emitter_union", "params": {{}} }},
+    {{ "id": 3, "kind": "core.output", "params": {{}} }} ],
+  "edges": [
+    {{ "from_node": 0, "from_index": 0, "to_node": 2, "to_index": 0 }},
+    {{ "from_node": 0, "from_index": 1, "to_node": 2, "to_index": 1 }},
+    {{ "from_node": 0, "from_index": 2, "to_node": 2, "to_index": 2 }},
+    {{ "from_node": 0, "from_index": 3, "to_node": 2, "to_index": 3 }},
+    {{ "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 4 }},
+    {{ "from_node": 1, "from_index": 1, "to_node": 2, "to_index": 5 }},
+    {{ "from_node": 1, "from_index": 2, "to_node": 2, "to_index": 6 }},
+    {{ "from_node": 1, "from_index": 3, "to_node": 2, "to_index": 7 }}{a_edge}{b_edge},
+    {{ "from_node": 2, "from_index": 4, "to_node": 3, "to_index": 0 }} ],
+  "output": 3 }}"#
+    )
+}
+
+/// The union's output-4 total after frame 1, from `union_fuel_doc`.
+fn union_fuel_total(a_fuel_edge: bool, b_fuel_edge: bool) -> Vec<f32> {
+    let doc = union_fuel_doc(a_fuel_edge, b_fuel_edge);
+    let (graph, dims) = Document::from_json(&doc)
+        .unwrap()
+        .into_graph(&elements_ember::registry())
+        .unwrap();
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut state = StateStore::new();
+    let time = Time::at(1, 1, 24.0);
+    let out = graph
+        .eval_frame(&gpu, &mut pool, &mut pipelines, &mut state, time, dims)
+        .unwrap();
+    let v = out.value.as_field().unwrap().read_back(&gpu).unwrap();
+    out.value.release_to(&mut pool);
+    v
+}
+
+#[test]
+fn the_union_fuel_output_is_the_sum_of_the_connected_fuel_inputs() {
+    let a = emitter_total(
+        r#"{ "shape": { "sphere": { "radius": 0.4 } },
+            "transform": { "keys": [ { "frame": 1, "translate": [0.7, 1.0, 1.0] } ] },
+            "fuel_rate": 1.0 }"#,
+        4,
+    );
+    let b = emitter_total(
+        r#"{ "shape": { "sphere": { "radius": 0.4 } },
+            "transform": { "keys": [ { "frame": 1, "translate": [1.3, 1.0, 1.0] } ] },
+            "fuel_rate": 2.0 }"#,
+        4,
+    );
+    assert!(a.iter().any(|&v| v > 0.0), "a emits");
+    assert!(b.iter().any(|&v| v > 0.0), "b emits");
+
+    let both = union_fuel_total(true, true);
+    let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+    assert_close(&both, &want, 1e-6, "a + b");
+
+    let a_only = union_fuel_total(true, false);
+    assert_close(&a_only, &a, 1e-6, "a only");
+
+    let neither = union_fuel_total(false, false);
+    assert!(neither.iter().all(|&v| v == 0.0), "neither connected");
+}
+
+/// Existing union documents (inputs 0–7 only, no fuel edges) must still
+/// validate: the new sockets are optional and appended.
+#[test]
+fn a_union_document_without_fuel_edges_still_validates() {
+    let doc = union_fuel_doc(false, false);
+    let registry = elements_ember::registry();
+    Document::from_json(&doc)
+        .unwrap()
+        .into_graph(&registry)
+        .expect("fuel-less union document must still validate");
+}

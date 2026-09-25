@@ -15,7 +15,7 @@ struct Emitter {
     noise_w: f32,          // evolution × seconds: noise's fourth coordinate
     seed_lo: u32,
     seed_hi: u32,
-    _pad0: u32,
+    fuel_rate: f32,
     _pad1: u32,
     _pad2: u32,
 };

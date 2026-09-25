@@ -2,7 +2,8 @@
 //! temperature and velocity (2b-2 spec §2.2).
 
 use elements_core::gpu::{
-    Axis, ComputeBatch, Field, GpuContext, GpuError, PipelineCache, StaggeredField, fill_constant,
+    Axis, ComputeBatch, Field, FieldFormat, GpuContext, GpuError, PipelineCache, StaggeredField,
+    fill_constant,
 };
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ pub const KIND: &str = "ember.emitter";
 const CELLS_WGSL: &str = concat!(
     include_str!("kernels/shaders/emitter_common.wgsl"),
     include_str!("kernels/shaders/shape.wgsl"),
+    include_str!("kernels/shaders/emitter_noise.wgsl"),
     include_str!("kernels/shaders/emitter_cells.wgsl"),
 );
 
@@ -24,6 +26,13 @@ const FACES_WGSL: &str = concat!(
     include_str!("kernels/shaders/emitter_common.wgsl"),
     include_str!("kernels/shaders/shape.wgsl"),
     include_str!("kernels/shaders/emitter_faces.wgsl"),
+);
+
+const FUEL_WGSL: &str = concat!(
+    include_str!("kernels/shaders/emitter_common.wgsl"),
+    include_str!("kernels/shaders/shape.wgsl"),
+    include_str!("kernels/shaders/emitter_noise.wgsl"),
+    include_str!("kernels/shaders/emitter_fuel.wgsl"),
 );
 
 /// The smallest noise cell a document may ask for, metres (spec §2.2).
@@ -58,6 +67,9 @@ pub struct EmitterParams {
     /// Temperature added per second where fully occupied.
     #[serde(default)]
     pub temperature_rate: f32,
+    /// Fuel added per second where fully occupied (2b-4 spec §4.1).
+    #[serde(default)]
+    pub fuel_rate: f32,
     /// Target velocity, m/s, world space. The emitter's own motion is added.
     #[serde(default)]
     pub velocity: [f32; 3],
@@ -82,6 +94,7 @@ impl EmitterParams {
             transform,
             density_rate: 0.0,
             temperature_rate: 0.0,
+            fuel_rate: 0.0,
             velocity: [0.0; 3],
             velocity_blend: 0.0,
             noise: None,
@@ -138,7 +151,8 @@ struct EmitterGpu {
     noise_w: f32,
     seed_lo: u32,
     seed_hi: u32,
-    _pad: [u32; 3],
+    fuel_rate: f32,
+    _pad: [u32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<EmitterGpu>() == 80);
@@ -167,7 +181,8 @@ impl EmitterGpu {
             noise_w: (f64::from(noise.evolution) * seconds) as f32,
             seed_lo: noise.seed as u32,
             seed_hi: (noise.seed >> 32) as u32,
-            _pad: [0; 3],
+            fuel_rate: p.fuel_rate,
+            _pad: [0; 2],
         }
     }
 }
@@ -227,6 +242,36 @@ pub fn fill_emitter(
     batch.submit(gpu)
 }
 
+/// Write `params`' fuel rate at `pose` and `seconds` into `out`. Submits its
+/// own batch.
+pub fn fill_fuel(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    params: &EmitterParams,
+    pose: &Pose,
+    seconds: f64,
+    dx: f32,
+    out: &Field,
+) -> Result<(), GpuError> {
+    let cells = out.dims();
+    let pipe = cache.get_or_create(gpu, "ember.emitter.fuel", FUEL_WGSL, "main")?;
+    let shape = uniform_buffer(
+        gpu,
+        "ember-shape",
+        bytemuck::bytes_of(&ShapeGpu::new(&params.shape, pose)),
+    )?;
+    let base = EmitterGpu::new(params, [cells.x, cells.y, cells.z], dx, seconds);
+    let uniforms = uniform_buffer(gpu, "ember-emitter", bytemuck::bytes_of(&base))?;
+    let mut batch = ComputeBatch::new();
+    let group = bind_group(
+        gpu,
+        &pipe,
+        &[Bind::Tex(out), Bind::Buf(&uniforms), Bind::Buf(&shape)],
+    )?;
+    batch.dispatch(&pipe, &group, cells);
+    batch.submit(gpu)
+}
+
 #[derive(Debug, Clone)]
 pub struct Emitter {
     params: EmitterParams,
@@ -245,14 +290,16 @@ impl Node for Emitter {
                 SocketType::Field,
                 SocketType::Field,
                 SocketType::VectorField,
+                SocketType::Field,
             ],
         }
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
         let time = ctx.time();
-        if !self.params.is_active(time.frame) {
-            return produce(ctx, 3, |gpu, cache, cells, velocity| {
+        let active = self.params.is_active(time.frame);
+        let mut values = if !active {
+            produce(ctx, 3, |gpu, cache, cells, velocity| {
                 for field in cells {
                     fill_constant(gpu, cache, field, 0.0)?;
                 }
@@ -260,27 +307,62 @@ impl Node for Emitter {
                     fill_constant(gpu, cache, velocity.face(axis), 0.0)?;
                 }
                 Ok(())
+            })?
+        } else {
+            let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
+            let dx = ctx.voxel_size();
+            let params = &self.params;
+            produce(ctx, 3, |gpu, cache, cells, velocity| {
+                fill_emitter(
+                    gpu,
+                    cache,
+                    params,
+                    &pose,
+                    time.seconds,
+                    dx,
+                    EmitterFields {
+                        density: &cells[0],
+                        temperature: &cells[1],
+                        weight: &cells[2],
+                        velocity,
+                    },
+                )
+            })?
+        };
+
+        let fuel = if !ctx.output_wanted(4) {
+            Value::Scalar(0.0)
+        } else {
+            let field = match ctx.acquire_uninit(FieldFormat::R32Float) {
+                Ok(f) => f,
+                Err(e) => {
+                    for v in values {
+                        ctx.release(v);
+                    }
+                    return Err(e);
+                }
+            };
+            let dx = ctx.voxel_size();
+            let params = &self.params;
+            let pose = params.transform.pose(f64::from(time.frame), time.dt);
+            let filled = ctx.with_gpu(|gpu, cache| {
+                if active {
+                    fill_fuel(gpu, cache, params, &pose, time.seconds, dx, &field)
+                } else {
+                    fill_constant(gpu, cache, &field, 0.0)
+                }
             });
-        }
-        let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
-        let dx = ctx.voxel_size();
-        let params = &self.params;
-        produce(ctx, 3, |gpu, cache, cells, velocity| {
-            fill_emitter(
-                gpu,
-                cache,
-                params,
-                &pose,
-                time.seconds,
-                dx,
-                EmitterFields {
-                    density: &cells[0],
-                    temperature: &cells[1],
-                    weight: &cells[2],
-                    velocity,
-                },
-            )
-        })
+            if let Err(e) = filled {
+                ctx.release(Value::Field(field));
+                for v in values {
+                    ctx.release(v);
+                }
+                return Err(e);
+            }
+            Value::Field(field)
+        };
+        values.push(fuel);
+        Ok(values)
     }
 }
 
@@ -294,6 +376,7 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
         &[
             p.density_rate,
             p.temperature_rate,
+            p.fuel_rate,
             p.velocity_blend,
             p.velocity[0],
             p.velocity[1],

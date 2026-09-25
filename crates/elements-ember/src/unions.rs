@@ -1,12 +1,14 @@
 //! `ember.emitter_union` and `ember.collider_union`: merge two
 //! emitters or two colliders into one (2b-2 spec §2.4). Chain them for more.
 
-use elements_core::gpu::{Axis, ComputeBatch, GpuContext, GpuError, PipelineCache};
+use elements_core::gpu::{
+    Axis, ComputeBatch, Field, FieldFormat, GpuContext, GpuError, PipelineCache,
+};
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 
 use crate::collider::ColliderFields;
 use crate::kernels::{Bind, axis_index, bind_group, uniform_buffer};
-use crate::node_util::{produce, take_inputs};
+use crate::node_util::{produce, take_inputs, take_listed};
 use crate::shape_emitter::EmitterFields;
 
 pub const EMITTER_UNION_KIND: &str = "ember.emitter_union";
@@ -16,6 +18,7 @@ const EMITTER_FACES_WGSL: &str = concat!(
     include_str!("kernels/shaders/weights.wgsl"),
     include_str!("kernels/shaders/emitter_union_faces.wgsl"),
 );
+const EMITTER_FUEL_WGSL: &str = include_str!("kernels/shaders/emitter_union_fuel.wgsl");
 
 /// Matches `Grid` in the union shaders, 16 bytes.
 #[repr(C)]
@@ -124,25 +127,43 @@ impl Node for EmitterUnion {
             SocketType::Field,
             SocketType::VectorField,
         ];
-        SocketSpec {
-            inputs: [group, group].concat(),
-            outputs: group.to_vec(),
-        }
+        let mut inputs = [group, group].concat();
+        inputs.extend([SocketType::Field, SocketType::Field]);
+        let mut outputs = group.to_vec();
+        outputs.push(SocketType::Field);
+        SocketSpec { inputs, outputs }
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
         let inputs = take_inputs(ctx, 8)?;
-        let result = union_node(ctx, &inputs);
-        for value in inputs {
+        let connected: Vec<u32> = [8, 9]
+            .into_iter()
+            .filter(|&i| ctx.input_connected(i))
+            .collect();
+        let fuel = match take_listed(ctx, &connected) {
+            Ok(f) => f,
+            Err(e) => {
+                for value in inputs {
+                    ctx.release(value);
+                }
+                return Err(e);
+            }
+        };
+        let result = union_node(ctx, &inputs, &fuel);
+        for value in inputs.into_iter().chain(fuel.into_iter().map(|(_, v)| v)) {
             ctx.release(value);
         }
         result
     }
 }
 
-fn union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, NodeError> {
+fn union_node(
+    ctx: &mut EvalCtx<'_>,
+    inputs: &[Value],
+    fuel: &[(u32, Value)],
+) -> Result<Vec<Value>, NodeError> {
     let (a, b) = (emitter_fields(inputs, 0)?, emitter_fields(inputs, 4)?);
-    produce(ctx, 3, |gpu, cache, cells, velocity| {
+    let mut values = produce(ctx, 3, |gpu, cache, cells, velocity| {
         union_emitters(
             gpu,
             cache,
@@ -155,7 +176,78 @@ fn union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, Nod
                 velocity,
             },
         )
-    })
+    })?;
+    let combined_fuel = if !ctx.output_wanted(4) {
+        Value::Scalar(0.0)
+    } else {
+        match union_fuel(ctx, fuel) {
+            Ok(v) => v,
+            Err(e) => {
+                for v in values {
+                    ctx.release(v);
+                }
+                return Err(e);
+            }
+        }
+    };
+    values.push(combined_fuel);
+    Ok(values)
+}
+
+/// Output 4: the sum of the connected fuel inputs, zero with none (spec §4.2).
+fn union_fuel(ctx: &mut EvalCtx<'_>, fuel: &[(u32, Value)]) -> Result<Value, NodeError> {
+    match fuel {
+        [] => ctx.acquire_zeroed().map(Value::Field),
+        [(_, one)] => {
+            let f = one.as_field()?;
+            ctx.duplicate(f).map(Value::Field)
+        }
+        [(_, a), (_, b)] => {
+            let (a, b) = (a.as_field()?, b.as_field()?);
+            let out = ctx.acquire_uninit(FieldFormat::R32Float)?;
+            let summed = ctx.with_gpu(|gpu, cache| sum_fuel(gpu, cache, a, b, &out));
+            match summed {
+                Ok(()) => Ok(Value::Field(out)),
+                Err(e) => {
+                    ctx.release(Value::Field(out));
+                    Err(e)
+                }
+            }
+        }
+        _ => unreachable!("at most inputs 8 and 9"),
+    }
+}
+
+fn sum_fuel(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    a: &Field,
+    b: &Field,
+    out: &Field,
+) -> Result<(), GpuError> {
+    let cells = out.dims();
+    if a.dims() != cells || b.dims() != cells {
+        return Err(GpuError::Validation(
+            "union fuel: inputs differ in size".to_owned(),
+        ));
+    }
+    let pipe = cache.get_or_create(gpu, "ember.emitter_union.fuel", EMITTER_FUEL_WGSL, "main")?;
+    let grid = uniform_buffer(
+        gpu,
+        "ember-union",
+        bytemuck::bytes_of(&GridGpu {
+            dims: [cells.x, cells.y, cells.z],
+            axis: 0,
+        }),
+    )?;
+    let mut batch = ComputeBatch::new();
+    let group = bind_group(
+        gpu,
+        &pipe,
+        &[Bind::Tex(a), Bind::Tex(b), Bind::Tex(out), Bind::Buf(&grid)],
+    )?;
+    batch.dispatch(&pipe, &group, cells);
+    batch.submit(gpu)
 }
 
 pub(crate) fn build_emitter_union(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
