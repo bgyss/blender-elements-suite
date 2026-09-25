@@ -2,11 +2,11 @@
 
 - Machine: Apple M1 Max
 - OS: macOS 27.2
-- Ember commit: 31cfeb2
+- Ember commit: 31cfeb2 (`plume`, `plume_collider`, `plume_wind`); c372579 (`fire`)
 - Blender: 5.2.2 LTS
 - Date: 2026-09-25
 
-Timings from a run whose 1-minute load average was above 2 before or after its timed runs should be redone on an idle machine. Such runs: `ember-plume-64` (12.5 → 11.8), `ember-plume-128` (27.9 → 19.8), `ember-plume-256` (18.7 → 16.3), `ember-plume_collider-64` (18.9 → 17.7), `ember-plume_collider-128` (32.1 → 25.2), `ember-plume_collider-256` (43.2 → 15.5), `ember-plume_wind-64` (28.6 → 27.0), `ember-plume_wind-128` (25.0 → 17.9), `ember-plume_wind-256` (17.2 → 9.2), `mantaflow-plume-64` (11.8 → 18.9), `mantaflow-plume-128` (17.9 → 32.0), `mantaflow-plume-256` (7.5 → 58.7), `mantaflow-plume_collider-64` (17.7 → 28.6), `mantaflow-plume_collider-128` (20.7 → 26.4), `mantaflow-plume_collider-256` (10.0 → 22.4), `mantaflow-plume_wind-64` (25.4 → 27.9), `mantaflow-plume_wind-128` (15.4 → 19.5), `mantaflow-plume_wind-256` (7.2 → 89.7).
+Timings from a run whose 1-minute load average was above 2 before or after its timed runs should be redone on an idle machine. Such runs: `ember-plume-64` (12.5 → 11.8), `ember-plume-128` (27.9 → 19.8), `ember-plume-256` (18.7 → 16.3), `ember-plume_collider-64` (18.9 → 17.7), `ember-plume_collider-128` (32.1 → 25.2), `ember-plume_collider-256` (43.2 → 15.5), `ember-plume_wind-64` (28.6 → 27.0), `ember-plume_wind-128` (25.0 → 17.9), `ember-plume_wind-256` (17.2 → 9.2), `ember-fire-64` (14.1 → 12.2), `ember-fire-128` (12.4 → 22.5), `ember-fire-256` (16.4 → 9.2), `mantaflow-plume-64` (11.8 → 18.9), `mantaflow-plume-128` (17.9 → 32.0), `mantaflow-plume-256` (7.5 → 58.7), `mantaflow-plume_collider-64` (17.7 → 28.6), `mantaflow-plume_collider-128` (20.7 → 26.4), `mantaflow-plume_collider-256` (10.0 → 22.4), `mantaflow-plume_wind-64` (25.4 → 27.9), `mantaflow-plume_wind-128` (15.4 → 19.5), `mantaflow-plume_wind-256` (7.2 → 89.7), `mantaflow-fire-64` (11.6 → 12.4), `mantaflow-fire-128` (20.4 → 17.3), `mantaflow-fire-256` (6.2 → 24.4).
 
 ## Summary
 
@@ -81,6 +81,45 @@ Ember's smoke leaves through +x from frames 23–34, against Mantaflow's
   `plume_wind` shapes differ by construction.
 - Load, as above.
 
+**Fire (2b-4).** `fire` was run at c372579, after the rest, so the header
+names two commits. Each scene's own runs share one commit. Ember traces
+velocity with Euler (first-order) backtracing while fire is burning, and
+clamps fuel to [0, 10] at emission as Mantaflow does. At one substep, the
+MacCormack velocity trace made flame vorticity blow up. The fire runs
+were under load too: 1-minute load 6.2–24.4 per run, and `vm.loadavg` was
+`{ 12.57 12.84 11.86 }` before `just bench fire` and `{ 16.36 18.46 16.15 }`
+after it.
+- **Speed and memory.** An Ember fire frame takes 19.4, 104 and 811 ms at
+  64³, 128³ and 256³, against Mantaflow's 117, 585 and 3,982 ms. That is
+  6.0×, 5.6× and 4.9× faster. At 128³ Ember is over preview's 100 ms budget,
+  under load. Peak memory is 42.6, 340 and 2,718 MiB against 90.1, 429 and
+  2,979 MiB.
+- **Fuel.** At frame 60, Ember holds 0.61, 0.60 and 0.63 (fuel × m³) at 64³,
+  128³ and 256³, so it barely changes with resolution. Mantaflow holds
+  0.70, 0.52 and 0.44, which falls as resolution rises. Ember/Mantaflow is
+  0.88× at 64³, 1.16× at 128³ and 1.42× at 256³, and about the same at
+  frame 30 (0.89×, 1.43×, 1.46×). A ratio below 1 is expected where
+  Mantaflow's advection gains fuel. That advection is not conservative: a
+  fuel budget at 32³ found it gained 26% of the emitted fuel by frame 30 and
+  103% by frame 60, and 24% by frame 60 at 64³. Ember's advection gained
+  none. The emission and the burn law match (`.superpowers/sdd/fire-diagnosis.md`).
+  This run has no budget at 128³ or 256³, so it does not explain why
+  Mantaflow holds less fuel than Ember there.
+- **Burn-out.** Ember burns out more slowly after emission stops. At frame 90,
+  Ember still has 0.005, 0.072 and 0.098 fuel, against Mantaflow's 4e-5,
+  2e-8 and 0.001.
+- **Flame.** At frame 60, Ember's flame volume is 0.37, 0.34 and 0.37 m³,
+  against Mantaflow's 0.70, 0.33 and 0.21. Mantaflow has 1.9× more at 64³,
+  about the same at 128³, and 0.56× Ember's at 256³.
+- **Divergence.** Mantaflow is lower in `fire` at every resolution: at frame 60
+  Ember's RMS is 4.0×, 26× and 28× Mantaflow's. This is the only scene where
+  Ember is behind at 64³ and 128³. The Euler velocity trace is the change
+  from the smoke scenes, but this run does not separate its effect.
+- **Mass and drift.** In `fire` these count smoke made by burning, and fuel
+  still burns after frame 60. So drift there is not a conservation check:
+  +63% to +125% at 120 in both solvers. Mantaflow also clamps density to
+  [0, 1] on every burn step, and Ember does not.
+
 ## `plume`
 
 | solver | cells | frame ms (median, min–max) | peak MiB | div. RMS 1/s (60 / 120) | measured cells (60 / 120) | kinetic energy m⁵/s² (60 / 120) | KE per cell m⁵/s² (60 / 120) | vorticity m³/s (60 / 120) | vorticity per cell m³/s (60 / 120) | centroid m (60 / 120) | top m (60 / 120) | drift at 80 (% of mass at 60) | drift at 120 (% of mass at 60) |
@@ -114,6 +153,28 @@ Ember's smoke leaves through +x from frames 23–34, against Mantaflow's
 | ember | 256³ | 526 (503–581), 1 run | 1758.4 | 5.39e-6 / 0 | 280281 / 0 | 0.0577 / 0 | 2.06e-7 / — | 0.118 / 0 | 4.20e-7 / — | 0.330 / — | 0.480 / — | -1.92e-4 (-0.5%); outflow from frame 34 credits 82.7% | -7.07e-4 (-1.9%) |
 | mantaflow | 256³ | 3534 (3092–6387), 1 run | 2854.8 | 1.61e-4 / 1.91e-4 | 547502 / 188959 | 0.0557 / 0.00825 | 1.02e-7 / 4.37e-8 | 2.03 / 0.669 | 3.70e-6 / 3.54e-6 | 0.774 / 1.62 | 1.12 / 1.84 | 0.00364 (+4.4%); outflow from frame 59 credits 52.4% | 0.00491 (+5.9%) |
 
+## `fire`
+
+| solver | cells | frame ms (median, min–max) | peak MiB | div. RMS 1/s (60 / 120) | measured cells (60 / 120) | kinetic energy m⁵/s² (60 / 120) | KE per cell m⁵/s² (60 / 120) | vorticity m³/s (60 / 120) | vorticity per cell m³/s (60 / 120) | centroid m (60 / 120) | top m (60 / 120) | drift at 80 (% of mass at 60) | drift at 120 (% of mass at 60) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ember | 64³ | 19.4 (15.0–21.9), median of 3 | 42.6 | 4.98e-4 / 1.00e-4 | 21617 / 27976 | 0.689 / 0.222 | 3.19e-5 / 7.94e-6 | 15.4 / 9.26 | 7.13e-4 / 3.31e-4 | 1.37 / 1.47 | 1.95 / 1.95 | 0.0313 (+58.4%); outflow from frame 48 credits 75.7% | 0.0389 (+72.7%) |
+| mantaflow | 64³ | 117 (96.0–178), median of 3 | 90.1 | 1.25e-4 / 7.72e-5 | 49158 / 72326 | 1.01 / 0.175 | 2.05e-5 / 2.42e-6 | 25.6 / 10.1 | 5.20e-4 / 1.39e-4 | 1.29 / 1.63 | 1.89 / 1.95 | 0.0566 (+72.7%); outflow from frame 47 credits 92.7% | 0.0701 (+90.0%) |
+| ember | 128³ | 104 (102–106), median of 3 | 340.2 | 0.00119 / 4.82e-4 | 118033 / 144310 | 0.438 / 0.119 | 3.71e-6 / 8.26e-7 | 16.3 / 8.98 | 1.38e-4 / 6.22e-5 | 1.40 / 1.57 | 1.93 / 1.96 | 0.0212 (+42.2%); outflow from frame 56 credits 80.6% | 0.0319 (+63.4%) |
+| mantaflow | 128³ | 585 (479–871), median of 3 | 428.5 | 4.60e-5 / 1.52e-4 | 159112 / 151601 | 0.493 / 0.0370 | 3.10e-6 / 2.44e-7 | 19.2 / 3.76 | 1.20e-4 / 2.48e-5 | 1.42 / 1.79 | 1.93 / 1.98 | 0.0287 (+98.1%); outflow from frame 52 credits 109.5% | 0.0360 (+123.1%) |
+| ember | 256³ | 811 (793–835), 1 run | 2718.4 | 0.00250 / 0.00158 | 782469 / 1291439 | 0.234 / 0.407 | 2.99e-7 / 3.15e-7 | 22.2 / 18.5 | 2.84e-5 / 1.43e-5 | 1.34 / 1.57 | 1.81 / 1.97 | 0.0233 (+54.6%); outflow from frame 61 credits 70.9% | 0.0333 (+78.3%) |
+| mantaflow | 256³ | 3982 (3562–4448), 1 run | 2979.2 | 9.00e-5 / 4.16e-5 | 749770 / 589669 | 0.323 / 0.0150 | 4.30e-7 / 2.55e-8 | 18.7 / 2.65 | 2.49e-5 / 4.50e-6 | 1.41 / 1.78 | 1.95 / 1.98 | 0.0159 (+89.2%); outflow from frame 53 credits 112.7% | 0.0223 (+125.1%) |
+
+## `fire`: fuel and flame
+
+| solver | cells | fuel mass (30 / 60 / 90) | flame volume m³ (30 / 60 / 90) |
+|---|---|---|---|
+| ember | 64³ | 0.620 / 0.610 / 0.00523 | 0.301 / 0.373 / 0.0559 |
+| mantaflow | 64³ | 0.699 / 0.696 / 4.24e-5 | 0.451 / 0.695 / 0.00104 |
+| ember | 128³ | 0.641 / 0.599 / 0.0716 | 0.187 / 0.343 / 0.140 |
+| mantaflow | 128³ | 0.448 / 0.517 / 2.01e-8 | 0.197 / 0.327 / 3.81e-6 |
+| ember | 256³ | 0.621 / 0.631 / 0.0985 | 0.146 / 0.367 / 0.106 |
+| mantaflow | 256³ | 0.425 / 0.443 / 0.00131 | 0.144 / 0.205 / 0.0133 |
+
 ## Notes
 
 - **Velocity metrics** (divergence, kinetic energy, vorticity) cover only measured cells: those whose whole 3×3×3 neighbourhood is inside the domain, outside any collider and holds smoke (density > 1e-6). The rule is the same for both solvers, because Mantaflow's cache stores velocity only where there is smoke (spec §4.1). The measured-cell count says how much of each field that is.
@@ -125,3 +186,4 @@ Ember's smoke leaves through +x from frames 23–34, against Mantaflow's
 - **Drift** is (mass inside the outflow planes + outflow since frame 60) − that mass at frame 60, with outflow estimated at frame resolution as the net upwind flux out through a plane two cells in from each open face (the top, and in `plume_wind` both x sides), and mass summed over the cells inside those planes (2b-3 spec §4.3, 2b-3c spec §6). Emission stops after frame 60, so a perfect solver drifts 0. Where no outflow has started by frame 80, drift at 80 is mass gained or lost inside the domain. Where it has, the frame-80 cell names the first frame whose outflow rate is non-zero and the share of the frame-60 mass that the outflow estimate credits by frame 80; that share rests on the frame-resolution estimate, and so does that part of the drift. Drift at 120 covers the whole outflow period.
 - **Frame times** exclude frame 1. Ember's frame is `eval_frame` plus a blocking GPU wait; Mantaflow's is the difference between consecutive cache files' modification times, so it includes writing the cache. 256³ is one run of each solver, the other resolutions the median of three runs' medians; the min–max range pools every timed frame.
 - **Peak memory** is in MiB (2²⁰ bytes), and the two solvers' figures count different things. Ember's is the field pool's allocated bytes, with the frame cache off: textures only, not buffers, pipelines or the driver. Mantaflow's is Blender's peak resident memory while baking, minus the same scene's peak without a bake.
+- **Fire.** `fire` emits fuel, not smoke, so its mass, drift, centroid and top describe the smoke made by burning, and it is left out of the emitted-mass comparison above. Mantaflow's burn clamps density to [0, 1] in every cell on every step; Ember does not clamp it. Fuel mass is Σ fuel dV. Mantaflow's cache stores fuel only where it stores density (above 1e-6), so fuel in a cell with no smoke is not counted there. Flame volume is the volume of cells whose flame is above 0.01; both solvers' flame is √react, with Ember's react clamped to [0, 1].
