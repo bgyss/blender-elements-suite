@@ -1,10 +1,12 @@
 # Ember Piece 2b-3c — Solver Quality Design
 
 **Date:** 2026-09-24
-**Status:** Design approved; plan not yet written.
+**Status:** Complete (2026-09-25). Plan:
+`docs/superpowers/plans/2026-09-24-ember-solver-quality-2b3c.md`; gate record
+`docs/bench/solver-gate.md`; rerun `docs/bench/results.md`, measured under load.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2). Follows 2b-3
 (`2026-09-23-ember-mantaflow-benchmark-2b3-design.md`), whose results
-(`docs/bench/results.md`) this cycle answers. It comes before 2b-3b (render
+(now `docs/bench/results-2b3/results.md`) this cycle answers. It comes before 2b-3b (render
 and latency).
 **Branch base:** `ember-bench-2b3` at 9ae4cf0 (PR #8).
 
@@ -206,7 +208,7 @@ Pre-registered, not revised to fit the results.
 - **Rule:** a solver configuration **passes** when, at both resolutions and
   in all three scenes, its solve time is at most Gauss–Seidel's and its
   divergence at frames 60 and 120 is at most Mantaflow's for that scene and
-  resolution in `docs/bench/results.md`. For `plume_wind` the Mantaflow
+  resolution in 2b-3's run (`docs/bench/results-2b3/results.md`). For `plume_wind` the Mantaflow
   reference is the rerun's (§7), since the scene changes; until then the
   `plume` value at that resolution stands in.
 - **Thin colliders** (amended 2026-09-24, before any gate numbers, by the

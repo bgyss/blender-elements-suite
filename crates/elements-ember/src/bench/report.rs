@@ -186,7 +186,7 @@ pub fn results_markdown(summaries: &[RunSummary], ctx: &Context) -> Result<Strin
     let mut md = String::new();
     let _ = write!(
         md,
-        "# Ember against Mantaflow (2b-3)\n\n\
+        "# Ember against Mantaflow\n\n\
          - Machine: {}\n\
          - OS: {}\n\
          - Ember commit: {}\n\
@@ -419,7 +419,8 @@ towards the ambient airflow in every cell. `plume_wind` compares the plume's sha
 frame 24), not added at Ember's rate, so Mantaflow's emitter is hotter before frame 24 and \
 cooler after it. Plume centroid and top carry that difference. {emitted}\n\
 - **Pressure.** Mantaflow solves with multigrid-preconditioned conjugate gradients to a \
-tolerance; Ember runs a fixed count of red-black Gauss–Seidel iterations.\n\
+tolerance; Ember runs the same method for a fixed count, the preview preset's MGPCG ×4 per \
+substep, and then its global mass correction on density and temperature.\n\
 - **Drift** is (mass inside the outflow planes + outflow since frame 60) − that mass at frame \
 60, with outflow estimated at frame resolution as the net upwind flux out through a plane two \
 cells in from each open face (the top, and in `plume_wind` both x sides), and mass summed \

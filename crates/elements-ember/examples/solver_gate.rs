@@ -71,7 +71,7 @@ const LOAD_FLAG: f64 = 2.0;
 const SCENES: [&str; 3] = ["plume", "plume_collider", "plume_wind"];
 
 /// Mantaflow's masked divergence RMS at frames 60 and 120, from
-/// `docs/bench/results.md` (the 7fe5d9d run), at [128³, 256³]. `plume_wind`
+/// `docs/bench/results-2b3/results.md` (the 7fe5d9d run), at [128³, 256³]. `plume_wind`
 /// uses `plume`'s until the 2b-3c rerun gives the new wind a reference
 /// (spec §4).
 fn mantaflow(scene: &str) -> [[f64; 2]; 2] {
@@ -1201,7 +1201,7 @@ fn main() -> Res<()> {
          A configuration passes when, at {low}³ and {high}³ and in `plume`, `plume_collider` and \
          `plume_wind`, {timing_clause}, and its masked divergence RMS at \
          frames 60 and 120 is at most Mantaflow's for that scene and resolution \
-         (`docs/bench/results.md`, the 7fe5d9d run; `plume_wind` uses `plume`'s until the rerun). \
+         (`docs/bench/results-2b3/results.md`, the 7fe5d9d run; `plume_wind` uses `plume`'s until the rerun). \
          It must also pass `plume_plate` at {low}³: RMS divergence after projection over before it, \
          at frames 60 and 120, through the kernel API, at most {PLATE_RATIO:e}. The chosen \
          configuration must be stable past the floor: in `plume_collider` at {low}³ the masked \

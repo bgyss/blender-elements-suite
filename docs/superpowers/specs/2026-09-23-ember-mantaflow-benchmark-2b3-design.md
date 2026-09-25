@@ -1,8 +1,9 @@
 # Ember Piece 2b-3 — Mantaflow Benchmark Design
 
 **Date:** 2026-09-23
-**Status:** Complete. Results are in `docs/bench/results.md`, measured under
-load; the idle-machine preset rerun is still owed (piece 2 risk (k)). §4, §5,
+**Status:** Complete. Results are in `docs/bench/results-2b3/results.md`
+(moved there by 2b-3c, whose rerun is now `docs/bench/results.md`), measured
+under load; the idle-machine preset rerun is still owed (piece 2 risk (k)). §4, §5,
 §6.2 and §8 were revised on 2026-09-23 after Task 3's findings
 (`docs/bench/mantaflow-notes.md`) and the user's decisions.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2), whose §5 is the
