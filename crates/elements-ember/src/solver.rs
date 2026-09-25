@@ -2,8 +2,11 @@
 //!
 //! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
 //! project, and advect scalars with dissipation, each followed by the mass
-//! correction when `conserve_mass` is set. Each frame first measures
-//! the fastest face and picks its substep count by CFL.
+//! correction when `conserve_mass` is set. With fire on, fuel is emitted
+//! and its react blended right after density and temperature, and fuel and
+//! react are advected alongside them, never dissipated (2b-4 spec §3.2).
+//! Each frame first measures the fastest face and picks its substep count
+//! by CFL.
 //!
 //! The projection's pressure solve is chosen by `pressure_solver`: red-black
 //! Gauss–Seidel for `pressure_iterations` sweeps, or, on a multigrid
@@ -414,6 +417,13 @@ impl SolverParams {
     }
 }
 
+/// Fuel and the reaction coordinate: the state fire adds (2b-4 spec §3.1).
+pub struct FireState {
+    pub fuel: Field,
+    /// 1 for fresh fuel, falling as it burns; flame is its square root.
+    pub react: Field,
+}
+
 /// Everything the solver carries from one step to the next.
 pub struct SolverState {
     pub velocity: StaggeredField,
@@ -421,6 +431,8 @@ pub struct SolverState {
     pub temperature: Field,
     /// p, kept as the next solve's warm start.
     pub pressure: Field,
+    /// Fuel and react, present once fire is on (2b-4 spec §3.1).
+    pub fire: Option<FireState>,
 }
 
 impl SolverState {
@@ -454,6 +466,7 @@ impl SolverState {
             density,
             temperature,
             pressure,
+            fire: None,
         })
     }
 
@@ -462,6 +475,33 @@ impl SolverState {
         pool.release(self.density);
         pool.release(self.temperature);
         pool.release(self.pressure);
+        if let Some(fire) = self.fire {
+            pool.release(fire.fuel);
+            pool.release(fire.react);
+        }
+    }
+
+    /// Zeroed fuel and react, for a state that starts burning.
+    pub fn add_fire(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+    ) -> Result<(), GpuError> {
+        let cells = self.density.dims();
+        let fuel = pool.acquire_zeroed(gpu, cache, cells)?;
+        let react = match pool.acquire_zeroed(gpu, cache, cells) {
+            Ok(field) => field,
+            Err(e) => {
+                pool.release(fuel);
+                return Err(e);
+            }
+        };
+        if let Some(old) = self.fire.replace(FireState { fuel, react }) {
+            pool.release(old.fuel);
+            pool.release(old.react);
+        }
+        Ok(())
     }
 
     /// The X, Y and Z faces, x-fastest, for tests and the speed gate.
@@ -492,6 +532,8 @@ pub struct Sources<'a> {
     pub emission: Option<Emission<'a>>,
     /// The frame's collider, when its SDF and velocity are connected (spec §3.2).
     pub solids: Option<Solids<'a>>,
+    /// The fuel emission rate per second, when fire is on (2b-4 spec §4.3).
+    pub fuel: Option<&'a Field>,
 }
 
 impl<'a> Sources<'a> {
@@ -501,6 +543,7 @@ impl<'a> Sources<'a> {
             temperature,
             emission: None,
             solids: None,
+            fuel: None,
         }
     }
 
@@ -514,6 +557,14 @@ impl<'a> Sources<'a> {
     pub fn with_solids(self, solids: Solids<'a>) -> Self {
         Self {
             solids: Some(solids),
+            ..self
+        }
+    }
+
+    /// The fuel emission rate per second: turns fire on (2b-4 spec §4.3).
+    pub fn with_fuel(self, fuel: &'a Field) -> Self {
+        Self {
+            fuel: Some(fuel),
             ..self
         }
     }
@@ -542,6 +593,7 @@ pub struct Substep {
     vorticity: bool,
     wind: bool,
     conserve_mass: bool,
+    fire: bool,
 }
 
 impl Substep {
@@ -556,6 +608,7 @@ impl Substep {
             vorticity: constants.vorticity > 0.0,
             wind: constants.wind_rate > 0.0,
             conserve_mass: constants.conserve_mass,
+            fire: constants.fire,
         })
     }
 
@@ -594,6 +647,23 @@ impl Substep {
             &state.temperature,
             sources.temperature,
         )?;
+        if self.fire {
+            let (Some(fire), Some(fuel)) = (state.fire.as_ref(), sources.fuel) else {
+                return Err(GpuError::Validation(
+                    "a fire substep needs the fuel state and a fuel source".to_owned(),
+                ));
+            };
+            // Fresh fuel is unburnt: react blends towards 1 (spec §3.2 step 1).
+            kernels::emit_fuel(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &fire.fuel,
+                &fire.react,
+                fuel,
+            )?;
+        }
         if let Some(e) = sources.emission {
             kernels::blend_velocity(
                 gpu,
@@ -829,6 +899,33 @@ impl Substep {
         )?;
         self.retired
             .push(std::mem::replace(&mut state.temperature, temperature));
+        if self.fire {
+            let Some(fire) = state.fire.as_mut() else {
+                return Err(GpuError::Validation(
+                    "a fire substep needs the fuel state".to_owned(),
+                ));
+            };
+            let fuel = self.advect_scalar(
+                gpu,
+                cache,
+                pool,
+                Carried::Fuel,
+                &state.velocity,
+                &fire.fuel,
+                solids,
+            )?;
+            self.retired.push(std::mem::replace(&mut fire.fuel, fuel));
+            let react = self.advect_scalar(
+                gpu,
+                cache,
+                pool,
+                Carried::React,
+                &state.velocity,
+                &fire.react,
+                solids,
+            )?;
+            self.retired.push(std::mem::replace(&mut fire.react, react));
+        }
         Ok(())
     }
 
@@ -1098,6 +1195,7 @@ impl SmokeSolver {
                 density,
                 temperature,
                 pressure,
+                fire: None,
             }),
             (a, b, c, d) => {
                 for value in [a, b, c, d].into_iter().flatten() {

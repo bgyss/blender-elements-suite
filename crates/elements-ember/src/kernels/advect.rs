@@ -41,6 +41,10 @@ pub enum Carried {
     Face(Axis),
     Density,
     Temperature,
+    /// Fuel, never dissipated (2b-4).
+    Fuel,
+    /// The reaction coordinate, never dissipated.
+    React,
 }
 
 impl Carried {
@@ -48,7 +52,7 @@ impl Carried {
     fn axis(self) -> Option<Axis> {
         match self {
             Self::Face(axis) => Some(axis),
-            Self::Density | Self::Temperature => None,
+            Self::Density | Self::Temperature | Self::Fuel | Self::React => None,
         }
     }
 
@@ -56,7 +60,7 @@ impl Carried {
     pub fn dims(self, cells: FieldDims) -> FieldDims {
         match self {
             Self::Face(axis) => StaggeredField::face_dims(cells, axis),
-            Self::Density | Self::Temperature => cells,
+            Self::Density | Self::Temperature | Self::Fuel | Self::React => cells,
         }
     }
 }

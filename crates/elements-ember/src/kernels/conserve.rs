@@ -164,7 +164,10 @@ pub fn correct_after(
 ) -> Result<(), GpuError> {
     expect_dims("correct_after field", advected, u.cells())?;
     expect_target("correct_after", target)?;
-    if !matches!(carried, Carried::Density | Carried::Temperature) {
+    if !matches!(
+        carried,
+        Carried::Density | Carried::Temperature | Carried::Fuel | Carried::React
+    ) {
         return Err(GpuError::Validation(
             "correct_after: only cell-centred scalars are corrected".to_owned(),
         ));

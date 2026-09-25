@@ -7,6 +7,7 @@
 
 mod advect;
 pub mod conserve;
+mod fire;
 mod forces;
 pub mod mgpcg;
 pub mod multigrid;
@@ -15,6 +16,7 @@ mod solid;
 mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
+pub use fire::emit_fuel;
 pub use forces::{blend_velocity, buoyancy, emit, wind};
 pub use mgpcg::mgpcg;
 pub use multigrid::{Hierarchy, v_cycle_from_zero, v_cycles};
@@ -155,6 +157,8 @@ pub struct Uniforms {
     /// Cell grids (`axis` = CELL), each with its scalar's `decay`.
     density: wgpu::Buffer,
     temperature: wgpu::Buffer,
+    /// Fuel and react: decay 1, never dissipated (2b-4 spec §3.2).
+    cell: wgpu::Buffer,
     cells: FieldDims,
     open_mask: u32,
     wind: bool,
@@ -210,11 +214,12 @@ impl Uniforms {
                 })
         };
         const CELL: u32 = 3; // `CELL` in common.wgsl
-        let (faces, density, temperature) = gpu.scoped(|| {
+        let (faces, density, temperature, cell) = gpu.scoped(|| {
             (
                 [make(0, 1.0), make(1, 1.0), make(2, 1.0)],
                 make(CELL, (-c.density_dissipation * c.h).exp()),
                 make(CELL, (-c.temperature_dissipation * c.h).exp()),
+                make(CELL, 1.0),
             )
         })?;
         let placeholder = gpu.scoped(|| {
@@ -238,6 +243,7 @@ impl Uniforms {
             faces,
             density,
             temperature,
+            cell,
             cells: c.cells,
             open_mask: c.open_mask,
             wind: c.wind_rate > 0.0,
@@ -286,6 +292,7 @@ impl Uniforms {
             Carried::Face(axis) => self.axis(axis),
             Carried::Density => &self.density,
             Carried::Temperature => &self.temperature,
+            Carried::Fuel | Carried::React => &self.cell,
         }
     }
 }
