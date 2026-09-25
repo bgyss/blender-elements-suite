@@ -12,7 +12,9 @@
 //!                                  time Mantaflow's re-bake to frame N after
 //!                                  a parameter change, in one open Blender
 //!   benchmark report               build docs/bench/results.md
-//!   benchmark latency-report       build docs/bench/latency.md
+//!   benchmark latency-report [LOADAVG]
+//!                                  build docs/bench/latency.md; LOADAVG is
+//!                                  `sysctl -n vm.loadavg` from before the run
 //!
 //! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv;
 //! the latency modes write docs/bench/results/latency-{solver}-{scene}-{res}.json.
@@ -28,7 +30,8 @@ use elements_core::gpu::{Axis, FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::report::{
     Context, LatencyPoint, LatencySummary, RunSummary, latency_markdown, load_average,
-    results_markdown, single_commit, single_latency_commit, write_latency, write_summary,
+    results_markdown, single_commit, single_latency_blender, single_latency_commit, write_latency,
+    write_summary,
 };
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
 use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
@@ -257,6 +260,7 @@ fn run_latency(name: &str, res: u32) -> Res<()> {
             frame: n,
             median_s: median(&runs_s),
             runs_s,
+            return_after_write_s: None,
         });
     }
     let load_after = load_average();
@@ -585,8 +589,9 @@ fn run_mantaflow_latency(name: &str, res: u32) -> Res<()> {
 }
 
 /// Build `docs/bench/latency.md` from every latency file, or name the
-/// missing ones and fail.
-fn latency_report() -> Res<()> {
+/// missing ones and fail. `recipe_load` is `sysctl -n vm.loadavg` from
+/// before the benchmark started, when the caller recorded it.
+fn latency_report(recipe_load: Option<&str>) -> Res<()> {
     let dir = results_dir();
     let mut summaries = Vec::new();
     if dir.exists() {
@@ -609,17 +614,20 @@ fn latency_report() -> Res<()> {
         }
         "latency files come from more than one commit; latency.md not written"
     })?;
+    let blender = single_latency_blender(&summaries).map_err(|lines| {
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        "Mantaflow latency files name more than one Blender; latency.md not written"
+    })?;
     let ctx = Context {
         machine: shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
         os: format!("macOS {}", shell("sw_vers", &["-productVersion"])),
         commit,
-        blender: summaries
-            .iter()
-            .find_map(|s| s.blender.clone())
-            .unwrap_or_else(|| "unknown".to_owned()),
+        blender,
         date: shell("date", &["-u", "+%Y-%m-%d"]),
     };
-    match latency_markdown(&summaries, &ctx) {
+    match latency_markdown(&summaries, &ctx, recipe_load) {
         Ok(md) => {
             let path = workspace().join("docs/bench/latency.md");
             std::fs::write(&path, md)?;
@@ -719,7 +727,8 @@ fn run() -> Res<()> {
         ["latency", name, res] => run_latency(name, res.parse()?),
         ["mantaflow-latency", name, res] => run_mantaflow_latency(name, res.parse()?),
         ["report"] => report(),
-        ["latency-report"] => latency_report(),
+        ["latency-report"] => latency_report(None),
+        ["latency-report", load] => latency_report(Some(load)),
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
             println!("{}", serde_json::to_string_pretty(&json)?);
@@ -727,7 +736,7 @@ fn run() -> Res<()> {
         }
         _ => Err(
             "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES \
-             | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report"
+             | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report [LOADAVG]"
                 .into(),
         ),
     }

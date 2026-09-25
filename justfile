@@ -104,16 +104,22 @@ bench-latency scenes="plume plume_collider plume_wind" res="128":
     set -euo pipefail
     cargo build --release -p elements-ember --example benchmark
     B=target/release/examples/benchmark
+    # The load the benchmark did not cause, for the report.
+    RECIPE_LOAD="$(sysctl -n vm.loadavg)"
     load() { sysctl -n vm.loadavg | awk '{print $2}'; }
+    # The load wait runs once, before the first scene only: later solvers
+    # start right after the previous one and inherit its load, which the
+    # per-solver log lines below record.
     for _ in $(seq 30); do
       awk -v l="$(load)" 'BEGIN { exit !(l < 2) }' && break
       echo "load $(load): waiting for it to fall below 2"
       sleep 10
     done
-    echo "load before: $(sysctl -n vm.loadavg)"
     for scene in {{scenes}}; do
+      echo "load before Ember $scene: $(sysctl -n vm.loadavg)"
       "$B" latency "$scene" {{res}}
+      echo "load before Blender $scene: $(sysctl -n vm.loadavg)"
       "$B" mantaflow-latency "$scene" {{res}}
     done
     echo "load after: $(sysctl -n vm.loadavg)"
-    "$B" latency-report
+    "$B" latency-report "$RECIPE_LOAD"

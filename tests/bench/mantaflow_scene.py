@@ -206,9 +206,10 @@ def free(domain: bpy.types.Object, cache_dir: str) -> None:
         sys.exit(f"free_all left {len(left)} data files, e.g. {left[0]}")
 
 
-def timed_bake(domain: bpy.types.Object, cache_dir: str, n: int) -> float:
+def timed_bake(domain: bpy.types.Object, cache_dir: str, n: int) -> tuple[float, float]:
     """Seconds from just before `bake_all` to frame n's data file existing:
-    the later of the call returning and the file's modification time."""
+    the later of the call returning and the file's modification time; and
+    the call's return minus that modification time."""
     domain.modifiers["Fluid"].domain_settings.cache_frame_end = n
     wall_ns = time.time_ns()
     start = time.perf_counter()
@@ -221,7 +222,7 @@ def timed_bake(domain: bpy.types.Object, cache_dir: str, n: int) -> float:
     if not os.path.exists(path):
         sys.exit(f"bake to frame {n} wrote no {path}")
     written = (os.stat(path).st_mtime_ns - wall_ns) / 1e9
-    return max(returned, written)
+    return max(returned, written), returned - written
 
 
 # An OpenVDB file header holds a random 36-character UUID at bytes 21..57,
@@ -256,7 +257,7 @@ def latency(
             # A new density each run, so no bake can repeat an earlier one.
             flow.density = base * (1 + 0.01 * (run + 1))
             free(domain, cache_dir)
-            s = timed_bake(domain, cache_dir, n)
+            s, gap = timed_bake(domain, cache_dir, n)
             runs_s.append(s)
             hashes.add(data_hash(data_file(cache_dir, n)))
             print(
@@ -267,7 +268,15 @@ def latency(
         # Equal files would mean the density change never reached the bake.
         if len(hashes) != count:
             sys.exit(f"N = {n}: {count} densities gave {len(hashes)} distinct frame-{n} files")
-        points.append({"frame": n, "runs_s": runs_s, "median_s": statistics.median(runs_s)})
+        points.append(
+            {
+                "frame": n,
+                "runs_s": runs_s,
+                "median_s": statistics.median(runs_s),
+                # The last run's: how long bake_all returns after frame n's file.
+                "return_after_write_s": gap,
+            }
+        )
     load_after = os.getloadavg()[0]
     flow.density = base
     d.cache_frame_end = end

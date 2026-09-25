@@ -747,6 +747,7 @@ fn latency(solver: &str, scene: &str, per_frame: f64) -> report::LatencySummary 
                 frame: n,
                 runs_s: vec![per_frame * f64::from(n); 3],
                 median_s: per_frame * f64::from(n),
+                return_after_write_s: None,
             })
             .collect(),
     }
@@ -766,7 +767,7 @@ fn all_latency() -> Vec<report::LatencySummary> {
 
 #[test]
 fn the_latency_table_gives_mantaflow_over_ember_per_frame() {
-    let md = report::latency_markdown(&all_latency(), &context()).unwrap();
+    let md = report::latency_markdown(&all_latency(), &context(), None).unwrap();
     for scene in report::SCENES {
         assert!(md.contains(&format!("## `{scene}` (128³)")), "{md}");
     }
@@ -790,7 +791,7 @@ fn the_latency_table_gives_mantaflow_over_ember_per_frame() {
 fn the_latency_table_needs_both_solvers_and_one_commit() {
     let mut s = all_latency();
     s.retain(|r| !(r.solver == "mantaflow" && r.scene == "plume_collider"));
-    let missing = report::latency_markdown(&s, &context()).unwrap_err();
+    let missing = report::latency_markdown(&s, &context(), None).unwrap_err();
     assert_eq!(
         missing,
         vec!["latency-mantaflow-plume_collider-128".to_owned()]
@@ -810,9 +811,80 @@ fn the_latency_table_needs_both_solvers_and_one_commit() {
 fn a_pipeline_compiled_in_a_timed_run_is_flagged() {
     let mut s = all_latency();
     s[0].pipelines_compiled = Some(2);
-    let md = report::latency_markdown(&s, &context()).unwrap();
+    let md = report::latency_markdown(&s, &context(), None).unwrap();
     assert!(
         md.contains("Ember compiled 2 pipelines during `plume`'s timed runs"),
         "{md}"
     );
+}
+
+#[test]
+fn an_n_mantaflow_lacks_shows_a_dash_row() {
+    let mut s = all_latency();
+    let m = s
+        .iter_mut()
+        .find(|r| r.solver == "mantaflow" && r.scene == "plume")
+        .unwrap();
+    m.points.retain(|p| p.frame != 120);
+    let md = report::latency_markdown(&s, &context(), None).unwrap();
+    assert!(md.contains("| 120 | 2.40 | — | — |"), "{md}");
+    // The other scenes keep their row.
+    assert_eq!(
+        md.matches("| 120 | 2.40 | 60.0 | 25.0× |").count(),
+        2,
+        "{md}"
+    );
+}
+
+#[test]
+fn a_missing_ember_first_frame_is_said_not_dropped() {
+    let mut s = all_latency();
+    s[0].points.retain(|p| p.frame != 1);
+    let md = report::latency_markdown(&s, &context(), None).unwrap();
+    assert!(
+        md.contains(
+            "Ember's file has no N = 1 point, so its time to the first frame is not reported."
+        ),
+        "{md}"
+    );
+    assert_eq!(md.matches("the N = 1 median: 0.0200 s.").count(), 2, "{md}");
+}
+
+#[test]
+fn the_latency_report_refuses_more_than_one_blender() {
+    let mut s = all_latency();
+    assert_eq!(
+        report::single_latency_blender(&s),
+        Ok("5.2.2 LTS".to_owned())
+    );
+    s[3].blender = Some("5.3.0".into());
+    let lines = report::single_latency_blender(&s).unwrap_err();
+    assert!(
+        lines.contains(&"latency-mantaflow-plume_collider-128: 5.3.0".to_owned()),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn the_latency_notes_name_inherited_and_outside_load() {
+    let mut s = all_latency();
+    // Ember plume_collider starts where Mantaflow plume left the load.
+    // As sysctl (two decimals) and os.getloadavg (full precision) report it.
+    s[1].load_after = 1.496435546875;
+    s[2].load_before = 1.50;
+    s[1].points[3].return_after_write_s = Some(0.004);
+    s[3].points[3].return_after_write_s = Some(0.02);
+    let md = report::latency_markdown(&s, &context(), Some("{ 12.62 13.15 13.46 }")).unwrap();
+    assert!(
+        md.contains("Ember `plume_collider`'s 1.50 is exactly Mantaflow `plume`'s `load_after`"),
+        "{md}"
+    );
+    assert!(md.contains("was `{ 12.62 13.15 13.46 }`"), "{md}");
+    assert!(md.contains("up to 60 s of multi-threaded baking"), "{md}");
+    assert!(md.contains("returned 0.00400–0.0200 s after"), "{md}");
+    assert!(
+        md.contains("writing N uncompressed 128³ OpenVDB files"),
+        "{md}"
+    );
+    assert!(!md.contains("more trustworthy"), "{md}");
 }
