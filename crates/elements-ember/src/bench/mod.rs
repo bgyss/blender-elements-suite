@@ -148,6 +148,13 @@ impl Scene {
         self
     }
 
+    /// The scene with the emitter's density rate set to `rate`: the
+    /// parameter change the latency run times (2b-3b spec §2).
+    pub fn with_density_rate(mut self, rate: f32) -> Self {
+        self.emitter.density_rate = rate;
+        self
+    }
+
     pub fn with_max_substeps(mut self, n: u32) -> Self {
         self.solver.max_substeps = n;
         self

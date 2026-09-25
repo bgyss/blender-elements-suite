@@ -705,3 +705,186 @@ fn the_bench_mask_refuses_a_keyframed_collider() {
     c.transform.keys.push(key);
     let _ = s.solid_mask();
 }
+
+/// The latency run's document must differ from the scene's only in the
+/// emitter's density rate, so nothing the engine caches can be reused and
+/// nothing else about the scene changes.
+#[test]
+fn the_latency_document_changes_only_the_density_rate() {
+    for scene in [
+        Scene::plume(32),
+        Scene::plume_collider(32),
+        Scene::plume_wind(32),
+    ] {
+        let base = serde_json::to_value(scene.document()).unwrap();
+        let changed =
+            serde_json::to_value(scene.clone().with_density_rate(1.1).document()).unwrap();
+        assert_ne!(base, changed);
+        let mut patched = base.clone();
+        assert_eq!(
+            patched["nodes"][0]["kind"],
+            elements_ember::shape_emitter::KIND
+        );
+        patched["nodes"][0]["params"]["density_rate"] = serde_json::json!(1.1f32);
+        assert_eq!(patched, changed, "{}", scene.name);
+    }
+}
+
+/// A latency run whose median at N is `per_frame · N` seconds.
+fn latency(solver: &str, scene: &str, per_frame: f64) -> report::LatencySummary {
+    report::LatencySummary {
+        solver: solver.into(),
+        scene: scene.into(),
+        resolution: report::LATENCY_RESOLUTION,
+        commit: "abc1234".into(),
+        load_before: 1.0,
+        load_after: if scene == "plume_wind" { 3.5 } else { 1.5 },
+        blender: (solver == "mantaflow").then(|| "5.2.2 LTS".to_owned()),
+        pipelines_compiled: (solver == "ember").then_some(0),
+        points: [1u32, 24, 60, 120]
+            .into_iter()
+            .map(|n| report::LatencyPoint {
+                frame: n,
+                runs_s: vec![per_frame * f64::from(n); 3],
+                median_s: per_frame * f64::from(n),
+                return_after_write_s: None,
+            })
+            .collect(),
+    }
+}
+
+fn all_latency() -> Vec<report::LatencySummary> {
+    report::SCENES
+        .into_iter()
+        .flat_map(|scene| {
+            [
+                latency("ember", scene, 0.02),
+                latency("mantaflow", scene, 0.5),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn the_latency_table_gives_mantaflow_over_ember_per_frame() {
+    let md = report::latency_markdown(&all_latency(), &context(), None).unwrap();
+    for scene in report::SCENES {
+        assert!(md.contains(&format!("## `{scene}` (128³)")), "{md}");
+    }
+    // Mantaflow 0.5 s a frame against Ember's 0.02: 25× at every N.
+    assert!(md.contains("| 1 | 0.0200 | 0.500 | 25.0× |"), "{md}");
+    assert!(md.contains("| 120 | 2.40 | 60.0 | 25.0× |"), "{md}");
+    assert!(md.contains("the N = 1 median: 0.0200 s."), "{md}");
+    assert!(
+        md.contains("| `latency-mantaflow-plume_wind-128` | 1.00 | 3.50 | **yes** |"),
+        "{md}"
+    );
+    assert!(
+        md.contains("| `latency-ember-plume-128` | 1.00 | 1.50 | no |"),
+        "{md}"
+    );
+    assert!(md.contains("3 at N = 1, 3 at N = 24"), "{md}");
+    assert!(!md.contains("Warning"), "{md}");
+}
+
+#[test]
+fn the_latency_table_needs_both_solvers_and_one_commit() {
+    let mut s = all_latency();
+    s.retain(|r| !(r.solver == "mantaflow" && r.scene == "plume_collider"));
+    let missing = report::latency_markdown(&s, &context(), None).unwrap_err();
+    assert_eq!(
+        missing,
+        vec!["latency-mantaflow-plume_collider-128".to_owned()]
+    );
+
+    let mut s = all_latency();
+    assert_eq!(report::single_latency_commit(&s), Ok("abc1234".to_owned()));
+    s[1].commit = "def5678".into();
+    let lines = report::single_latency_commit(&s).unwrap_err();
+    assert!(
+        lines.contains(&"latency-mantaflow-plume-128: def5678".to_owned()),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_pipeline_compiled_in_a_timed_run_is_flagged() {
+    let mut s = all_latency();
+    s[0].pipelines_compiled = Some(2);
+    let md = report::latency_markdown(&s, &context(), None).unwrap();
+    assert!(
+        md.contains("Ember compiled 2 pipelines during `plume`'s timed runs"),
+        "{md}"
+    );
+}
+
+#[test]
+fn an_n_mantaflow_lacks_shows_a_dash_row() {
+    let mut s = all_latency();
+    let m = s
+        .iter_mut()
+        .find(|r| r.solver == "mantaflow" && r.scene == "plume")
+        .unwrap();
+    m.points.retain(|p| p.frame != 120);
+    let md = report::latency_markdown(&s, &context(), None).unwrap();
+    assert!(md.contains("| 120 | 2.40 | — | — |"), "{md}");
+    // The other scenes keep their row.
+    assert_eq!(
+        md.matches("| 120 | 2.40 | 60.0 | 25.0× |").count(),
+        2,
+        "{md}"
+    );
+}
+
+#[test]
+fn a_missing_ember_first_frame_is_said_not_dropped() {
+    let mut s = all_latency();
+    s[0].points.retain(|p| p.frame != 1);
+    let md = report::latency_markdown(&s, &context(), None).unwrap();
+    assert!(
+        md.contains(
+            "Ember's file has no N = 1 point, so its time to the first frame is not reported."
+        ),
+        "{md}"
+    );
+    assert_eq!(md.matches("the N = 1 median: 0.0200 s.").count(), 2, "{md}");
+}
+
+#[test]
+fn the_latency_report_refuses_more_than_one_blender() {
+    let mut s = all_latency();
+    assert_eq!(
+        report::single_latency_blender(&s),
+        Ok("5.2.2 LTS".to_owned())
+    );
+    s[3].blender = Some("5.3.0".into());
+    let lines = report::single_latency_blender(&s).unwrap_err();
+    assert!(
+        lines.contains(&"latency-mantaflow-plume_collider-128: 5.3.0".to_owned()),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn the_latency_notes_name_inherited_and_outside_load() {
+    let mut s = all_latency();
+    // Ember plume_collider starts where Mantaflow plume left the load.
+    // As sysctl (two decimals) and os.getloadavg (full precision) report it.
+    s[1].load_after = 1.496435546875;
+    s[2].load_before = 1.50;
+    s[1].points[3].return_after_write_s = Some(0.004);
+    s[3].points[3].return_after_write_s = Some(0.02);
+    let md = report::latency_markdown(&s, &context(), Some("{ 12.62 13.15 13.46 }")).unwrap();
+    assert!(
+        md.contains("Ember `plume_collider`'s 1.50 is exactly Mantaflow `plume`'s `load_after`"),
+        "{md}"
+    );
+    assert!(md.contains("was `{ 12.62 13.15 13.46 }`"), "{md}");
+    assert!(md.contains("up to 60 s of multi-threaded baking"), "{md}");
+    assert!(md.contains("returned 0.00400–0.0200 s after"), "{md}");
+    assert!(
+        md.contains("writing N uncompressed 128³ OpenVDB files"),
+        "{md}"
+    );
+    assert!(!md.contains("more trustworthy"), "{md}");
+}

@@ -4,11 +4,23 @@
 //!   benchmark ember SCENE RES      time and measure Ember
 //!   benchmark scene-json SCENE RES print the scene's Mantaflow twin as JSON,
 //!                                  for tests/bench/mantaflow_scene.py
+//!   benchmark document SCENE RES   print the scene's `.elements` document,
+//!                                  for `elements-cli bake` (the render
+//!                                  comparison, 2b-3b §3)
 //!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow in
 //!                                  Blender ($BLENDER_BIN, or the macOS app)
+//!   benchmark latency SCENE RES    time Ember from a parameter change to
+//!                                  frame N, in a warm process (2b-3b §2)
+//!   benchmark mantaflow-latency SCENE RES
+//!                                  time Mantaflow's re-bake to frame N after
+//!                                  a parameter change, in one open Blender
 //!   benchmark report               build docs/bench/results.md
+//!   benchmark latency-report [LOADAVG]
+//!                                  build docs/bench/latency.md; LOADAVG is
+//!                                  `sysctl -n vm.loadavg` from before the run
 //!
-//! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv.
+//! Each run writes docs/bench/results/{solver}-{scene}-{res}.json and .csv;
+//! the latency modes write docs/bench/results/latency-{solver}-{scene}-{res}.json.
 
 mod common;
 
@@ -20,7 +32,9 @@ use std::time::Instant;
 use elements_core::gpu::{Axis, FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::report::{
-    Context, RunSummary, load_average, results_markdown, single_commit, write_summary,
+    Context, LatencyPoint, LatencySummary, RunSummary, latency_markdown, load_average,
+    results_markdown, single_commit, single_latency_blender, single_latency_commit, write_latency,
+    write_summary,
 };
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
 use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
@@ -32,7 +46,11 @@ type Res<T> = Result<T, Box<dyn Error>>;
 
 /// The benchmark's own output, relative to the repository root. Writing it
 /// must not make later runs' commit label dirty (see `bench_commit`).
-const OUTPUTS: [&str; 2] = ["docs/bench/results", "docs/bench/results.md"];
+const OUTPUTS: [&str; 3] = [
+    "docs/bench/results",
+    "docs/bench/results.md",
+    "docs/bench/latency.md",
+];
 
 /// The commit label recorded in every summary: `commit_label`, ignoring the
 /// benchmark's own output, so one `just bench` records one label throughout.
@@ -173,6 +191,105 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
     Ok(())
 }
 
+/// The frames each latency point evaluates up to (2b-3b spec §2).
+const LATENCY_FRAMES: [u32; 4] = [1, 24, 60, 120];
+/// Ember's timed runs per latency point.
+const LATENCY_RUNS: u32 = 5;
+/// Mantaflow's timed runs per latency point: 5 up to N = 24, 3 above, since
+/// a 128³ re-bake to frame 120 takes about a minute (spec §2).
+const MANTAFLOW_LATENCY_RUNS: [u32; 4] = [5, 5, 3, 3];
+/// The warm-up evaluates the unchanged scene this far, once, untimed.
+const WARM_UP_FRAMES: u32 = 24;
+
+/// Evaluate `scene` from frame 1 to `frames` in a fresh graph, pool and
+/// state, as a daemon does after a parameter change, ending with a blocking
+/// wait. Returns the seconds from before graph construction to frame N
+/// ready. The pipeline cache is the caller's and stays warm.
+fn latency_run(
+    gpu: &GpuContext,
+    registry: &NodeRegistry,
+    pipelines: &mut PipelineCache,
+    scene: &Scene,
+    frames: u32,
+) -> Res<f64> {
+    let doc = scene.document();
+    let config = doc.timeline_config();
+    let first = config.start_frame;
+    let start = Instant::now();
+    let (graph, dims) = doc.into_graph(registry)?;
+    let mut pool = FieldPool::new();
+    let mut state = StateStore::new();
+    for frame in first..first + frames {
+        let time = Time::at(frame, first, config.fps);
+        let evaluated = graph.eval_frame(gpu, &mut pool, pipelines, &mut state, time, dims)?;
+        evaluated.value.release_to(&mut pool);
+    }
+    gpu.wait()?;
+    let seconds = start.elapsed().as_secs_f64();
+    state.clear(&mut pool);
+    Ok(seconds)
+}
+
+/// Spec §2: one process, device, pipeline cache and registry throughout;
+/// each run changes the emitter's density rate, so no two runs within a
+/// point share a document, then times graph construction plus frames 1..=N.
+/// The N = 1 median is the time to the first frame. `load_before` is taken
+/// after the warm-up, just before the first timed run.
+fn run_latency(name: &str, res: u32) -> Res<()> {
+    let gpu = GpuContext::new_headless()?;
+    let registry = elements_ember::registry();
+    let mut pipelines = PipelineCache::new();
+    let scene = scene(name, res)?;
+    eprintln!("latency {name} {res}³: warm-up to frame {WARM_UP_FRAMES}");
+    latency_run(&gpu, &registry, &mut pipelines, &scene, WARM_UP_FRAMES)?;
+    // Every pipeline the timed runs need should exist by now; a later
+    // compile would land inside a timing.
+    let warm_pipelines = pipelines.len();
+    let load_before = load_average();
+    let mut points = Vec::new();
+    for n in LATENCY_FRAMES {
+        let mut runs_s = Vec::new();
+        for run in 0..LATENCY_RUNS {
+            let rate = 1.0 + 0.01 * (run + 1) as f32;
+            let changed = scene.clone().with_density_rate(rate);
+            let s = latency_run(&gpu, &registry, &mut pipelines, &changed, n)?;
+            eprintln!(
+                "latency {name} {res}³: N = {n}, run {} of {LATENCY_RUNS}: {s:.3} s",
+                run + 1
+            );
+            runs_s.push(s);
+        }
+        points.push(LatencyPoint {
+            frame: n,
+            median_s: median(&runs_s),
+            runs_s,
+            return_after_write_s: None,
+        });
+    }
+    let load_after = load_average();
+    let compiled = pipelines.len() - warm_pipelines;
+    if compiled > 0 {
+        eprintln!(
+            "\n*** WARNING: latency {name} {res}³: {compiled} pipelines were compiled during \
+             the timed runs, so some timings include a shader compile ***\n"
+        );
+    }
+    let summary = LatencySummary {
+        solver: "ember".into(),
+        scene: name.into(),
+        resolution: res,
+        commit: bench_commit(),
+        load_before,
+        load_after,
+        blender: None,
+        pipelines_compiled: Some(compiled),
+        points,
+    };
+    let path = write_latency(&results_dir(), &summary)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
 /// Drift from the last emitting frame on, so `drift[0]` is frame 60.
 fn drift_from_cut_off(frames: &[FrameMetrics], fps: f64) -> Vec<f64> {
     let from = (EMISSION_FRAMES[1] - 1) as usize;
@@ -201,10 +318,11 @@ fn blender_tail(stderr: &str) -> String {
     lines[start..end].join("\n")
 }
 
-/// Run the scene script under `/usr/bin/time -l`, returning peak resident
-/// bytes and the tail of Blender's stderr, for errors found after it exits.
-/// `-l` prints "maximum resident set size" in bytes on macOS.
-fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<(u64, String)> {
+/// Run the scene script under `/usr/bin/time -l` with `extra` arguments
+/// after its two positional ones, returning peak resident bytes and the tail
+/// of Blender's stderr, for errors found after it exits. `-l` prints
+/// "maximum resident set size" in bytes on macOS.
+fn run_blender(scene_json: &Path, out: &Path, extra: &[&str]) -> Res<(u64, String)> {
     let script = workspace().join("tests/bench/mantaflow_scene.py");
     let mut cmd = Command::new("/usr/bin/time");
     cmd.arg("-l")
@@ -219,10 +337,8 @@ fn run_blender(scene_json: &Path, out: &Path, no_bake: bool) -> Res<(u64, String
         .arg(&script)
         .arg("--")
         .arg(scene_json)
-        .arg(out);
-    if no_bake {
-        cmd.arg("--no-bake");
-    }
+        .arg(out)
+        .args(extra);
     let output = cmd.output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let tail = blender_tail(&stderr);
@@ -288,10 +404,9 @@ fn clear_dir(dir: &Path) -> Res<()> {
     Ok(())
 }
 
-fn run_mantaflow(name: &str, res: u32) -> Res<()> {
-    let scene = scene(name, res)?;
-    let context =
-        |e: Box<dyn Error>| -> Box<dyn Error> { format!("mantaflow {name} {res}³: {e}").into() };
+/// The scene's scratch directory under `target/bench/`, with its
+/// Mantaflow twin written there as `scene.json`; returns both paths.
+fn scene_scratch(name: &str, res: u32, scene: &Scene) -> Res<(PathBuf, PathBuf)> {
     let scratch = workspace().join(format!("target/bench/{name}-{res}"));
     std::fs::create_dir_all(&scratch)?;
     let scene_json = scratch.join("scene.json");
@@ -299,11 +414,19 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
         &scene_json,
         serde_json::to_string_pretty(&scene.mantaflow_json())? + "\n",
     )?;
+    Ok((scratch, scene_json))
+}
+
+fn run_mantaflow(name: &str, res: u32) -> Res<()> {
+    let scene = scene(name, res)?;
+    let context =
+        |e: Box<dyn Error>| -> Box<dyn Error> { format!("mantaflow {name} {res}³: {e}").into() };
+    let (scratch, scene_json) = scene_scratch(name, res, &scene)?;
 
     eprintln!("mantaflow {name} {res}³: baseline (no bake)");
     let base_dir = scratch.join("baseline");
     clear_dir(&base_dir)?;
-    let (baseline, _) = run_blender(&scene_json, &base_dir, true).map_err(context)?;
+    let (baseline, _) = run_blender(&scene_json, &base_dir, &["--no-bake"]).map_err(context)?;
 
     // The scene script never clears an old cache, so a stale frame would
     // pass its missing-frame check: clear the output before every bake.
@@ -318,7 +441,7 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     for r in 0..runs {
         eprintln!("mantaflow {name} {res}³: timed run {} of {runs}", r + 1);
         clear_dir(&out)?;
-        let (rss, stderr) = run_blender(&scene_json, &out, false).map_err(context)?;
+        let (rss, stderr) = run_blender(&scene_json, &out, &[]).map_err(context)?;
         tail = stderr;
         let path = out.join("timings.json");
         let timings: Timings = std::fs::read_to_string(&path)
@@ -386,6 +509,147 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
     Ok(())
 }
 
+/// `latency.json` from the scene script's `--latency` mode.
+#[derive(serde::Deserialize)]
+struct MantaflowLatency {
+    solver: String,
+    resolution: u32,
+    load_before: f64,
+    load_after: f64,
+    blender: String,
+    points: Vec<LatencyPoint>,
+}
+
+/// Spec §2, Mantaflow's side: one Blender process builds the scene once
+/// and times re-bakes to each N after a density change, its cache freed
+/// between them (`mantaflow_scene.py --latency`). Blender's startup and the
+/// scene's construction are outside every timing.
+fn run_mantaflow_latency(name: &str, res: u32) -> Res<()> {
+    let scene = scene(name, res)?;
+    let context = |e: Box<dyn Error>| -> Box<dyn Error> {
+        format!("mantaflow latency {name} {res}³: {e}").into()
+    };
+    let (scratch, scene_json) = scene_scratch(name, res, &scene)?;
+    let out = scratch.join("latency");
+    clear_dir(&out)?;
+    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let (frames, runs) = (list(&LATENCY_FRAMES), list(&MANTAFLOW_LATENCY_RUNS));
+    eprintln!("mantaflow latency {name} {res}³: N = {frames}, runs {runs}");
+    let (_, tail) = run_blender(
+        &scene_json,
+        &out,
+        &["--latency", frames.as_str(), "--runs", runs.as_str()],
+    )
+    .map_err(context)?;
+    let path = out.join("latency.json");
+    let m: MantaflowLatency = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+        })
+        .map_err(|e| context(with_stderr(e, &tail)))?;
+    let shape: Vec<(u32, u32)> = m
+        .points
+        .iter()
+        .map(|p| (p.frame, p.runs_s.len() as u32))
+        .collect();
+    let expected: Vec<(u32, u32)> = LATENCY_FRAMES
+        .into_iter()
+        .zip(MANTAFLOW_LATENCY_RUNS)
+        .collect();
+    if m.solver != "mantaflow" || m.resolution != res || shape != expected {
+        return Err(context(with_stderr(
+            format!(
+                "{} holds solver {:?}, resolution {}, (N, runs) {shape:?}; expected \
+                 mantaflow, {res}, {expected:?}",
+                path.display(),
+                m.solver,
+                m.resolution
+            ),
+            &tail,
+        )));
+    }
+    for p in &m.points {
+        eprintln!(
+            "mantaflow latency {name} {res}³: N = {}: median {:.3} s",
+            p.frame, p.median_s
+        );
+    }
+    let summary = LatencySummary {
+        solver: "mantaflow".into(),
+        scene: name.into(),
+        resolution: res,
+        commit: bench_commit(),
+        load_before: m.load_before,
+        load_after: m.load_after,
+        blender: Some(m.blender),
+        pipelines_compiled: None,
+        points: m.points,
+    };
+    let path = write_latency(&results_dir(), &summary)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Build `docs/bench/latency.md` from every latency file, or name the
+/// missing ones and fail. `recipe_load` is `sysctl -n vm.loadavg` from
+/// before the recipe's load wait, when the caller recorded it.
+fn latency_report(recipe_load: Option<&str>) -> Res<()> {
+    let dir = results_dir();
+    let mut summaries = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let latency = path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with("latency-"));
+            if latency && path.extension().is_some_and(|e| e == "json") {
+                let text = std::fs::read_to_string(&path)?;
+                let s: LatencySummary =
+                    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                summaries.push(s);
+            }
+        }
+    }
+    let commit = single_latency_commit(&summaries).map_err(|lines| {
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        "latency files come from more than one commit; latency.md not written"
+    })?;
+    let blender = single_latency_blender(&summaries).map_err(|lines| {
+        for l in &lines {
+            eprintln!("{l}");
+        }
+        "Mantaflow latency files name more than one Blender; latency.md not written"
+    })?;
+    let ctx = Context {
+        machine: shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
+        os: format!("macOS {}", shell("sw_vers", &["-productVersion"])),
+        commit,
+        blender,
+        date: shell("date", &["-u", "+%Y-%m-%d"]),
+    };
+    match latency_markdown(&summaries, &ctx, recipe_load) {
+        Ok(md) => {
+            let path = workspace().join("docs/bench/latency.md");
+            std::fs::write(&path, md)?;
+            eprintln!("wrote {}", path.display());
+            Ok(())
+        }
+        Err(missing) => {
+            for m in &missing {
+                eprintln!("missing: {}", dir.join(format!("{m}.json")).display());
+            }
+            Err(format!(
+                "{} latency files missing; latency.md not written",
+                missing.len()
+            )
+            .into())
+        }
+    }
+}
+
 /// Build `docs/bench/results.md` from every result file, or name the
 /// missing ones and fail.
 fn report() -> Res<()> {
@@ -394,7 +658,11 @@ fn report() -> Res<()> {
     if dir.exists() {
         for entry in std::fs::read_dir(&dir)? {
             let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "json") {
+            // Latency files have their own shape and their own report.
+            let latency = path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with("latency-"));
+            if path.extension().is_some_and(|e| e == "json") && !latency {
                 let text = std::fs::read_to_string(&path)?;
                 let s: RunSummary =
                     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -459,14 +727,24 @@ fn run() -> Res<()> {
     {
         ["ember", name, res] => run_ember(name, res.parse()?),
         ["mantaflow", name, res] => run_mantaflow(name, res.parse()?),
+        ["latency", name, res] => run_latency(name, res.parse()?),
+        ["mantaflow-latency", name, res] => run_mantaflow_latency(name, res.parse()?),
         ["report"] => report(),
+        ["latency-report"] => latency_report(None),
+        ["latency-report", load] => latency_report(Some(load)),
+        ["document", name, res] => {
+            println!("{}", scene(name, res.parse()?)?.document().to_json()?);
+            Ok(())
+        }
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
             println!("{}", serde_json::to_string_pretty(&json)?);
             Ok(())
         }
         _ => Err(
-            "usage: benchmark ember SCENE RES | scene-json SCENE RES | mantaflow SCENE RES | report"
+            "usage: benchmark ember SCENE RES | scene-json SCENE RES | document SCENE RES \
+             | mantaflow SCENE RES \
+             | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report [LOADAVG]"
                 .into(),
         ),
     }

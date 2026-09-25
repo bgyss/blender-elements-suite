@@ -39,7 +39,13 @@ mass at frame 80, and in `plume_collider`, where almost no smoke leaves, it
 stays under 1.5e-6 through frame 120. It leaves less divergence everywhere
 except `plume_collider` and `plume`'s frame 120 at 256³. All timings were
 measured under load. **2b-3b**, the side-by-side render and the latency
-measurement, is next. Flame is its own later cycle, 2b-4.
+measurement, is complete (`docs/bench/latency.md`, `docs/bench/render/`):
+after a parameter change at 128³ Ember reaches frame N about 7–10× sooner than
+Mantaflow re-bakes (under load, which may favour Ember), and the renders show
+Ember matching Mantaflow's large-scale shape in `plume` and `plume_collider` with
+visibly less fine detail (`plume_wind` differs by construction).
+Flame is next, as 2b-4. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
+branch `ember-node-editor`) is designed and planned but paused.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -54,6 +60,8 @@ measurement, is next. Flame is its own later cycle, 2b-4.
 - Ember piece 2b-2 plan: `docs/superpowers/plans/2026-09-23-ember-scene-content-2b2.md`
 - Ember piece 2b-3 spec: `docs/superpowers/specs/2026-09-23-ember-mantaflow-benchmark-2b3-design.md`
 - Ember piece 2b-3 plan: `docs/superpowers/plans/2026-09-23-ember-mantaflow-benchmark-2b3.md`
+- Ember piece 2b-3b spec and plan: `docs/superpowers/specs/2026-09-25-ember-render-latency-2b3b-design.md`, `docs/superpowers/plans/2026-09-25-ember-render-latency-2b3b.md`
+- Latency and render comparison: `docs/bench/latency.md`, `docs/bench/render/README.md`
 - Ember piece 2b-3c spec: `docs/superpowers/specs/2026-09-24-ember-solver-quality-2b3c-design.md`
 - Ember piece 2b-3c plan: `docs/superpowers/plans/2026-09-24-ember-solver-quality-2b3c.md`
 - Mantaflow benchmark results and cache notes: `docs/bench/results.md` (2b-3c's rerun; 2b-3's run is in `docs/bench/results-2b3/`), `docs/bench/mantaflow-notes.md`
@@ -81,6 +89,8 @@ just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
 just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
 just bench-presets # the preview preset's substep cap; minutes, real GPU, not in check
 just bench-solver # the 2b-3c solver gate; about an hour, real GPU, not in check
+just bench-latency # 2b-3b latency, Ember and Mantaflow at 128³; about 30 min, real GPU and Blender
+just bench-render # 2b-3b side-by-side Cycles stills into docs/bench/render/; needs Blender
 just bench        # the Mantaflow benchmark; an hour or more, real GPU and Blender, not in check
                   # (positional: `just bench plume 64` for one scene and resolution)
 ```

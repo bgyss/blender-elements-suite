@@ -9,5 +9,6 @@ __pycache__/
 *.png
 !crates/*/tests/golden/*.npy
 !crates/*/tests/golden/*.png
+!docs/bench/render/*.png
 !crates/*/tests/fixtures/*/*.vdb
 .superpowers/
