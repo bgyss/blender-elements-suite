@@ -569,20 +569,39 @@ fn the_results_row_pins_drift_frames_and_per_cell_values() {
 }
 
 #[test]
-fn the_report_refuses_summaries_from_more_than_one_commit() {
+fn the_report_refuses_a_scene_from_more_than_one_commit() {
     let mut s = all();
-    assert_eq!(report::single_commit(&s), Ok("abc1234".to_owned()));
     s[4].commit = "def5678".into();
-    let lines = report::single_commit(&s).unwrap_err();
-    assert_eq!(lines.len(), s.len(), "every file is listed with its commit");
+    assert_eq!(s[4].scene, "plume_collider");
+    let lines = report::scene_commits(&s).unwrap_err();
     assert!(
         lines.contains(&"ember-plume_collider-128: def5678".to_owned()),
         "{lines:?}"
     );
     assert!(
-        lines.contains(&"ember-plume-64: abc1234".to_owned()),
+        lines.contains(&"mantaflow-plume_collider-64: abc1234".to_owned()),
         "{lines:?}"
     );
+}
+
+/// The notes pool the smoke scenes' mass ratios into one range, so those
+/// scenes must share one commit even when each is internally consistent.
+#[test]
+fn the_smoke_scenes_must_share_one_commit() {
+    let mut s = all();
+    for r in s.iter_mut().filter(|r| r.scene == "plume_wind") {
+        r.commit = "def5678".into();
+    }
+    let lines = report::scene_commits(&s).unwrap_err();
+    assert!(
+        lines.contains(&"ember-plume_wind-64: def5678".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"mantaflow-plume-256: abc1234".to_owned()),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("fire")), "{lines:?}");
 }
 
 /// The drift-at-80 cell says when a run's outflow started, and how much of

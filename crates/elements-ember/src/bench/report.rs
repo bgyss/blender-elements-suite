@@ -138,16 +138,16 @@ pub const MASS_FLOOR: f64 = 1e-9;
 /// plumes have diverged.
 const EMISSION_CHECK_FRAMES: std::ops::RangeInclusive<usize> = 12..=24;
 
-/// The commit every summary was built from, or one line per summary,
-/// `{solver}-{scene}-{resolution}: {commit}`, when they differ. A table
-/// mixing commits would compare different code.
-pub fn single_commit(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
-    one_commit(summaries.iter().map(|s| {
+/// Each summary labelled `{solver}-{scene}-{resolution}`, with its commit.
+fn labelled<'a>(
+    summaries: impl Iterator<Item = &'a RunSummary>,
+) -> impl Iterator<Item = (String, &'a str)> {
+    summaries.map(|s| {
         (
             format!("{}-{}-{}", s.solver, s.scene, s.resolution),
             &*s.commit,
         )
-    }))
+    })
 }
 
 /// The commit every labelled item shares, or one `{label}: {commit}` line
@@ -182,7 +182,10 @@ pub struct Context {
 /// `plume_wind`); abc1234 (`fire`)". A scene's table compares its two
 /// solvers, so each scene must come from one commit, and the lines naming
 /// every summary of each scene that mixes commits are the error. Scenes may
-/// differ, since a scene added later is run at a later commit.
+/// differ, since a scene added later is run at a later commit, except the
+/// [`SMOKE_SCENES`]: the notes pool their mass ratios into one range, which
+/// must describe one build, so their summaries mixing commits is an error
+/// too, naming every smoke-scene summary.
 pub fn scene_commits(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
     let mut scenes: Vec<&str> = SCENES.to_vec();
     for s in summaries {
@@ -197,13 +200,7 @@ pub fn scene_commits(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
         if of_scene.is_empty() {
             continue;
         }
-        let labelled = of_scene.iter().map(|s| {
-            (
-                format!("{}-{}-{}", s.solver, s.scene, s.resolution),
-                &*s.commit,
-            )
-        });
-        match one_commit(labelled) {
+        match one_commit(labelled(of_scene.into_iter())) {
             Ok(commit) => match groups.iter_mut().find(|(c, _)| *c == commit) {
                 Some((_, names)) => names.push(scene),
                 None => groups.push((commit, vec![scene])),
@@ -215,6 +212,10 @@ pub fn scene_commits(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
         errors.sort();
         return Err(errors);
     }
+    let smoke = summaries
+        .iter()
+        .filter(|s| SMOKE_SCENES.contains(&s.scene.as_str()));
+    one_commit(labelled(smoke))?;
     Ok(match groups.as_slice() {
         [] => String::new(),
         [(commit, _)] => commit.clone(),
@@ -342,7 +343,8 @@ fn fire_table<'a>(find: &impl Fn(&str, &str, u32) -> Option<&'a RunSummary>) -> 
 }
 
 /// Ember's mass over Mantaflow's, as the least and greatest ratio over
-/// `frames` (1-based) and every scene and resolution. `None` if no pair of
+/// `frames` (1-based) and every smoke scene and resolution, all from one
+/// commit ([`scene_commits`] refuses otherwise). `None` if no pair of
 /// runs has a frame in range with Mantaflow mass above [`MASS_FLOOR`].
 fn mass_ratio_range<'a>(
     find: &impl Fn(&str, &str, u32) -> Option<&'a RunSummary>,
@@ -554,7 +556,9 @@ pub fn single_latency_blender(summaries: &[LatencySummary]) -> Result<String, Ve
     one_commit(labelled.into_iter())
 }
 
-/// Like [`single_commit`], for latency summaries.
+/// The commit every latency summary was built from, or one
+/// `latency-{solver}-{scene}-{resolution}: {commit}` line per summary when
+/// they differ.
 pub fn single_latency_commit(summaries: &[LatencySummary]) -> Result<String, Vec<String>> {
     one_commit(summaries.iter().map(|s| {
         (
