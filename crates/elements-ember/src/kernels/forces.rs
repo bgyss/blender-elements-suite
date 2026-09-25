@@ -130,8 +130,10 @@ pub fn blend_velocity(
     Ok(())
 }
 
-/// Add h·wind at every face that is neither a wall nor touching `solids`, on
-/// each axis whose wind is nonzero (spec §3.4).
+/// Relax every face that is neither a wall nor touching `solids` towards the
+/// wind's velocity, by 1 − exp(−wind_rate·h) (2b-3c spec §6). Every axis
+/// runs, including those whose wind is 0: the air there relaxes to rest.
+/// Records nothing when `wind_rate` is 0.
 pub fn wind(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -149,10 +151,10 @@ pub fn wind(
     }
     let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.wind", WIND, "main")?;
-    for (axis, a) in Axis::ALL.into_iter().zip(u.wind()) {
-        if a == 0.0 {
-            continue;
-        }
+    if !u.wind() {
+        return Ok(());
+    }
+    for axis in Axis::ALL {
         let face = velocity.face(axis);
         let group = bind_group(
             gpu,

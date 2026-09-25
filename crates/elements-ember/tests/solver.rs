@@ -1,15 +1,20 @@
 mod common;
 
 use common::*;
-use elements_core::gpu::{FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache};
+use elements_core::gpu::{
+    Axis, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache,
+};
 use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
     StateStore, Time, Timeline, TimelineConfig, Value,
 };
 use elements_ember::cfl;
 use elements_ember::kernels::Advection;
-use elements_ember::kernels::StepConstants;
-use elements_ember::solver::{KIND, SolverParams, SolverState, Sources, resolve_params, substep};
+use elements_ember::kernels::{Solids, StepConstants};
+use elements_ember::metrics::{Sample, measure};
+use elements_ember::solver::{
+    KIND, PressureSolve, SolverParams, SolverState, Sources, Substep, resolve_params, substep,
+};
 use std::sync::{Arc, Mutex};
 
 fn rejected(params: serde_json::Value) -> bool {
@@ -67,7 +72,42 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(
         serde_json::json!({ "temperature_dissipation": 1e39 })
     ));
-    assert!(rejected(serde_json::json!({ "wind": [1e39, 0.0, 0.0] })));
+    assert!(rejected(
+        serde_json::json!({ "wind_velocity": [1e39, 0.0, 0.0] })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "wind_velocity": [1.0, 0.0, 0.0], "wind_rate": 1.0 })
+    ));
+    assert!(rejected(serde_json::json!({ "wind_rate": -1.0 })));
+    // JSON has no NaN; a number too large for f32 is the non-finite value a
+    // document can hold.
+    assert!(rejected(serde_json::json!({ "wind_rate": 1e39 })));
+    assert!(!rejected(
+        serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 64 })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "pressure_solver": "multigrid", "pressure_cycles": 1 })
+    ));
+    assert!(!rejected(
+        serde_json::json!({ "pressure_solver": "gauss_seidel" })
+    ));
+    assert!(rejected(serde_json::json!({ "pressure_solver": "jacobi" })));
+    assert!(rejected(serde_json::json!({ "pressure_cycles": 0 })));
+    assert!(rejected(serde_json::json!({ "pressure_cycles": 65 })));
+}
+
+/// 2b-3c spec §6: `wind` was an acceleration and is gone. A document still
+/// using it must fail, and the message must name what replaced it.
+#[test]
+fn the_old_wind_parameter_is_rejected_with_its_replacements() {
+    let err = resolve_params(&serde_json::json!({ "wind": [0.5, 0.0, 0.0] })).unwrap_err();
+    let DocError::BadParams { reason, .. } = &err else {
+        panic!("expected BadParams, got {err:?}");
+    };
+    assert!(
+        reason.contains("wind_velocity") && reason.contains("wind_rate"),
+        "{reason}"
+    );
 }
 
 /// Spec §6: a preset fills only the fields a document leaves unset, and
@@ -80,6 +120,19 @@ fn a_preset_fills_only_what_the_document_leaves_unset() {
     assert_eq!(p.max_substeps, 8, "final's cap");
     let alias = resolve_params(&serde_json::json!({ "substeps": 3 })).unwrap();
     assert_eq!(alias.max_substeps, 3, "the 2a alias");
+    // The user's decision after the 2b-3c gate (`docs/bench/solver-gate.md`).
+    for (quality, cycles) in [("preview", 4), ("final", 10)] {
+        let p = resolve_params(&serde_json::json!({ "quality": quality })).unwrap();
+        assert_eq!(p.pressure(), PressureSolve::Mgpcg(cycles), "{quality}");
+        // 2b-3c spec §5: both presets conserve scalar mass.
+        assert!(p.conserve_mass, "{quality}");
+    }
+    let off = resolve_params(&serde_json::json!({ "conserve_mass": false })).unwrap();
+    assert!(!off.conserve_mass, "a document may turn the correction off");
+    let chosen =
+        resolve_params(&serde_json::json!({ "pressure_solver": "mgpcg", "pressure_cycles": 9 }))
+            .unwrap();
+    assert_eq!(chosen.pressure(), PressureSolve::Mgpcg(9));
     assert_eq!(
         resolve_params(&serde_json::Value::Null).unwrap(),
         SolverParams::default()
@@ -93,7 +146,9 @@ fn step_constants_carry_every_solver_parameter() {
         "advection": "semi_lagrangian", "vorticity": 3.0,
         "density_dissipation": 0.5, "temperature_dissipation": 0.25,
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
-        "boundaries": { "-x": "open" }, "wind": [0.5, 0.0, -1.0]
+        "boundaries": { "-x": "open" },
+        "wind_velocity": [0.5, 0.0, -1.0], "wind_rate": 2.5,
+        "conserve_mass": false
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -104,7 +159,14 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.alpha, 0.75);
     assert_eq!(c.beta, 2.0);
     assert_eq!(c.open_mask, 0b100001);
-    assert_eq!(c.wind, [0.5, 0.0, -1.0]);
+    assert_eq!(c.wind_velocity, [0.5, 0.0, -1.0]);
+    assert_eq!(c.wind_rate, 2.5);
+    assert!(!c.conserve_mass);
+    let on = resolve_params(&serde_json::json!({})).unwrap();
+    assert!(
+        on.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125)
+            .conserve_mass
+    );
 }
 
 /// Umbrella §6: no emitters and nothing to be buoyant, so nothing moves.
@@ -126,7 +188,13 @@ fn a_still_domain_stays_exactly_still() {
     let sources = Sources::new(&zero, &zero);
     for _ in 0..10 {
         substep(
-            &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
+            &gpu,
+            &mut cache,
+            &mut pool,
+            &mut state,
+            sources,
+            &constants,
+            PressureSolve::GaussSeidel(20),
         )
         .unwrap();
     }
@@ -161,8 +229,22 @@ fn plume_16(solver: &str) -> String {
     )
 }
 
-/// The preview defaults: one substep, no confinement, no dissipation, open top.
-const PREVIEW: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0 }"#;
+/// The preview defaults: one substep, no confinement, no dissipation, open
+/// top, and the preset's pressure solve, MGPCG ×4.
+const PREVIEW: &str = r#"{ "buoyancy_temperature": 1.0 }"#;
+
+/// `solver`, a solver's parameter object, with Gauss–Seidel for 40
+/// iterations in place of the preset's MGPCG: the path documents that
+/// choose Gauss–Seidel take.
+fn gauss_seidel(solver: &str) -> String {
+    let doc = solver.replacen(
+        '{',
+        r#"{ "pressure_solver": "gauss_seidel", "pressure_iterations": 40,"#,
+        1,
+    );
+    assert_ne!(doc, solver, "the solver must be inserted");
+    doc
+}
 
 struct Session {
     gpu: GpuContext,
@@ -258,8 +340,13 @@ fn assert_doc_frame_40_is_bit_identical(doc: &str) {
 }
 
 #[test]
-fn frame_40_is_bit_identical_however_it_is_reached() {
+fn frame_40_is_bit_identical_however_it_is_reached_with_mgpcg() {
     assert_frame_40_is_bit_identical(PREVIEW);
+}
+
+#[test]
+fn frame_40_is_bit_identical_however_it_is_reached_with_gauss_seidel() {
+    assert_frame_40_is_bit_identical(&gauss_seidel(PREVIEW));
 }
 
 /// A 16³ document with an animated, noisy box emitter (all four outputs
@@ -280,7 +367,7 @@ const ANIMATED: &str = r#"{
         "transform": { "keys": [
           { "frame": 1, "translate": [0.6, 1.0, 1.2] },
           { "frame": 40, "translate": [1.4, 1.0, 1.1] } ] } } },
-    { "id": 2, "kind": "ember.smoke_solver", "params": { "pressure_iterations": 40, "buoyancy_temperature": 1.0, "vorticity": 2.0 } },
+    { "id": 2, "kind": "ember.smoke_solver", "params": { "buoyancy_temperature": 1.0, "vorticity": 2.0 } },
     { "id": 3, "kind": "core.output", "params": {} }
   ],
   "edges": [
@@ -298,9 +385,17 @@ const ANIMATED: &str = r#"{
 /// Umbrella §4: frame 40 is bit-identical in order, after scrubbing and after
 /// eviction, with an animated collider and an animated, noisy emitter,
 /// because poses, masks and noise are recomputed from the document's time.
+/// The preset's MGPCG rebuilds its hierarchy from each frame's mask.
 #[test]
-fn frame_40_is_bit_identical_with_animated_emitter_and_collider() {
+fn frame_40_is_bit_identical_with_animated_emitter_and_collider_with_mgpcg() {
     assert_doc_frame_40_is_bit_identical(ANIMATED);
+}
+
+#[test]
+fn frame_40_is_bit_identical_with_animated_emitter_and_collider_with_gauss_seidel() {
+    assert_doc_frame_40_is_bit_identical(&animated_with(
+        r#""pressure_solver": "gauss_seidel", "pressure_iterations": 40"#,
+    ));
 }
 
 /// Spec §3: the frame after the emitter switches off reproduces bit for bit
@@ -318,13 +413,14 @@ fn frame_40_is_bit_identical_after_the_emitter_switches_off() {
 /// Everything 2b-1 added, switched on: a CFL count that varies from frame to
 /// frame, confinement, and dissipation. `cfl` is small enough that the count
 /// changes within the first 40 frames (`substep_counts` shows it does).
-const STRESSED: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0,
+const STRESSED: &str = r#"{ "buoyancy_temperature": 1.0,
     "max_substeps": 8, "cfl": 0.1, "vorticity": 2.0,
     "density_dissipation": 0.2, "temperature_dissipation": 0.5 }"#;
 
 /// `STRESSED` in a box with every face a wall, so the closed-domain pressure
-/// mean removal runs too.
-const STRESSED_CLOSED: &str = r#"{ "pressure_iterations": 40, "buoyancy_temperature": 1.0,
+/// mean removal runs too: MGPCG's fluid means of r and p, and Gauss–Seidel's
+/// pressure mean.
+const STRESSED_CLOSED: &str = r#"{ "buoyancy_temperature": 1.0,
     "max_substeps": 8, "cfl": 0.1, "vorticity": 2.0,
     "density_dissipation": 0.2, "temperature_dissipation": 0.5,
     "boundaries": { "-x": "wall", "+x": "wall", "-y": "wall",
@@ -434,15 +530,29 @@ fn assert_counts_vary(solver: &str) {
 }
 
 #[test]
-fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation() {
+fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation_with_mgpcg() {
     assert_counts_vary(STRESSED);
     assert_frame_40_is_bit_identical(STRESSED);
 }
 
 #[test]
-fn frame_40_is_bit_identical_in_a_closed_domain() {
+fn frame_40_is_bit_identical_with_varying_substeps_confinement_and_dissipation_with_gauss_seidel() {
+    let solver = gauss_seidel(STRESSED);
+    assert_counts_vary(&solver);
+    assert_frame_40_is_bit_identical(&solver);
+}
+
+#[test]
+fn frame_40_is_bit_identical_in_a_closed_domain_with_mgpcg() {
     assert_counts_vary(STRESSED_CLOSED);
     assert_frame_40_is_bit_identical(STRESSED_CLOSED);
+}
+
+#[test]
+fn frame_40_is_bit_identical_in_a_closed_domain_with_gauss_seidel() {
+    let solver = gauss_seidel(STRESSED_CLOSED);
+    assert_counts_vary(&solver);
+    assert_frame_40_is_bit_identical(&solver);
 }
 
 /// Outputs a zero field one cell larger than the domain: a mis-sized source.
@@ -555,7 +665,13 @@ fn a_substep_failing_after_retiring_fields_returns_them_all() {
     let sources = Sources::new(&zero, &zero);
 
     let err = substep(
-        &gpu, &mut cache, &mut pool, &mut state, sources, &constants, 20,
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &mut state,
+        sources,
+        &constants,
+        PressureSolve::GaussSeidel(20),
     )
     .unwrap_err();
     assert!(matches!(err, GpuError::Validation(_)), "got {err:?}");
@@ -863,10 +979,9 @@ fn plume_16_with_far_collider(solver: &str, velocity: bool) -> String {
 
 /// Spec §3.1: a collider entirely outside the domain changes nothing, bit for
 /// bit, so the solid code paths are exact when nothing is solid.
-#[test]
-fn a_collider_outside_the_domain_changes_nothing() {
-    let mut plain = Session::new(&plume_16(PREVIEW));
-    let mut far = Session::new(&plume_16_with_far_collider(PREVIEW, true));
+fn assert_far_collider_changes_nothing(solver: &str) {
+    let mut plain = Session::new(&plume_16(solver));
+    let mut far = Session::new(&plume_16_with_far_collider(solver, true));
     let (mut a, mut b) = (timeline(0), timeline(0));
     for frame in 1..=10 {
         assert!(
@@ -874,6 +989,21 @@ fn a_collider_outside_the_domain_changes_nothing() {
             "frame {frame}"
         );
     }
+}
+
+/// With MGPCG the hierarchy takes its solid path (fluid fractions,
+/// renormalised prolongation), which must reduce exactly to the plain one
+/// when every cell is fluid. Before 2b-3c Task 5's fix it did not: the
+/// prolongation weight at the open top was 1.0000001, and density drifted
+/// from frame 4.
+#[test]
+fn a_collider_outside_the_domain_changes_nothing_with_mgpcg() {
+    assert_far_collider_changes_nothing(PREVIEW);
+}
+
+#[test]
+fn a_collider_outside_the_domain_changes_nothing_with_gauss_seidel() {
+    assert_far_collider_changes_nothing(&gauss_seidel(PREVIEW));
 }
 
 /// Spec §3.1: a collider SDF without its velocity is an error naming both inputs.
@@ -995,4 +1125,239 @@ fn a_collider_mask_does_not_leak_across_frames() {
         counts.push(session.pool.allocation_count());
     }
     assert_eq!(counts[2], counts[5], "allocations per frame: {counts:?}");
+}
+
+/// `ANIMATED` with `fields` (solver parameters, comma-separated) choosing
+/// its pressure solve in place of the preset's MGPCG ×4.
+fn animated_with(fields: &str) -> String {
+    let doc = ANIMATED.replace(
+        r#""params": { "buoyancy_temperature": 1.0,"#,
+        &format!(r#""params": {{ {fields}, "buoyancy_temperature": 1.0,"#),
+    );
+    assert_ne!(doc, ANIMATED, "the solver must be inserted");
+    doc
+}
+
+/// Umbrella §4 with multigrid: the hierarchy is rebuilt every substep from
+/// the frame's collider mask, so frame 40 still reproduces bit for bit.
+#[test]
+fn frame_40_is_bit_identical_with_multigrid() {
+    assert_doc_frame_40_is_bit_identical(&animated_with(
+        r#""pressure_solver": "multigrid", "pressure_cycles": 4"#,
+    ));
+}
+
+/// Passes density through, and keeps a read-back copy of the velocity it
+/// is given, replacing the previous frame's.
+struct VelocityProbe(Arc<Mutex<[Vec<f32>; 3]>>);
+
+impl Node for VelocityProbe {
+    fn kind(&self) -> &'static str {
+        "test.velocity_probe"
+    }
+
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![SocketType::Field, SocketType::VectorField],
+            outputs: vec![SocketType::Field],
+        }
+    }
+
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let velocity = ctx.take_input(1)?;
+        let faces = ctx.with_gpu(|gpu, _| {
+            let v = velocity.as_vector_field().unwrap();
+            let mut faces: [Vec<f32>; 3] = Default::default();
+            for (a, axis) in Axis::ALL.into_iter().enumerate() {
+                faces[a] = v.face(axis).read_back(gpu)?;
+            }
+            Ok(faces)
+        });
+        ctx.release(velocity);
+        *self.0.lock().unwrap() = faces?;
+        Ok(vec![ctx.take_input(0)?])
+    }
+}
+
+/// Masked divergence RMS (`metrics::measure`) at frame 20 of `plume_16`'s
+/// scene at 32³, with `solver` as the solver's params.
+fn plume_32_divergence_rms(solver: &str) -> f64 {
+    const N: u32 = 32;
+    let doc: serde_json::Value = serde_json::from_str(&plume_16(solver)).unwrap();
+    let registry = elements_ember::registry();
+    let build = |i: usize| {
+        let node = &doc["nodes"][i];
+        registry
+            .build(node["kind"].as_str().unwrap(), &node["params"])
+            .unwrap()
+    };
+    let mut graph = Graph::new();
+    let emitter = graph.add_node(build(0));
+    let solver_node = graph.add_node(build(1));
+    let faces = Arc::new(Mutex::new(Default::default()));
+    let probe = graph.add_node(Box::new(VelocityProbe(Arc::clone(&faces))));
+    let output = graph.add_node(build(2));
+    let socket = |node: NodeId, index: u32| SocketId { node, index };
+    for (from, to) in [
+        (socket(emitter, 0), socket(solver_node, 0)),
+        (socket(emitter, 1), socket(solver_node, 1)),
+        (socket(solver_node, 0), socket(probe, 0)),
+        (socket(solver_node, 2), socket(probe, 1)),
+        (socket(probe, 0), socket(output, 0)),
+    ] {
+        graph.connect(from, to).unwrap();
+    }
+    graph.set_output(output);
+    graph.set_domain_size(2.0);
+
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let cells = FieldDims::new(N, N, N);
+    let evaluated = timeline(0)
+        .goto(&graph, &gpu, &mut pool, &mut pipelines, cells, 20)
+        .unwrap();
+    let density = evaluated.value.as_field().unwrap().read_back(&gpu).unwrap();
+    evaluated.value.release_to(&mut pool);
+    let faces = faces.lock().unwrap();
+    let m = measure(&Sample {
+        cells,
+        dx: 2.0 / f64::from(N),
+        density: &density,
+        faces: &faces,
+        solid: &[],
+        open_mask: elements_ember::boundaries::DEFAULT_OPEN_MASK,
+    });
+    eprintln!("{solver}: {m:?}");
+    assert!(m.measured_cells > 0, "the plume must be measured");
+    m.divergence_rms
+}
+
+/// 2b-3c spec §3: four V-cycles leave less divergence in the smoke than 40
+/// red-black Gauss–Seidel iterations, so the document's choice reaches the
+/// projection. Four MGPCG iterations leave less than four V-cycles (about
+/// 47× less), so `multigrid` and `mgpcg` each reach their own kernel.
+#[test]
+fn multigrid_leaves_less_divergence_than_gauss_seidel() {
+    // Every run sets 40 iterations, so a solver choice that were ignored
+    // would run exactly the Gauss–Seidel baseline and tie with it.
+    let rms = |solver: &str, cycles: u32| {
+        plume_32_divergence_rms(&format!(
+            r#"{{ "pressure_solver": "{solver}", "pressure_iterations": 40, "pressure_cycles": {cycles} }}"#
+        ))
+    };
+    let gauss_seidel = rms("gauss_seidel", 4);
+    let multigrid = rms("multigrid", 4);
+    let mgpcg = rms("mgpcg", 4);
+    eprintln!(
+        "divergence RMS at frame 20: gauss_seidel × 40 {gauss_seidel:.3e}, \
+         multigrid × 4 {multigrid:.3e}, mgpcg × 4 {mgpcg:.3e}"
+    );
+    assert!(multigrid < gauss_seidel, "{multigrid} vs {gauss_seidel}");
+    assert!(mgpcg < gauss_seidel, "{mgpcg} vs {gauss_seidel}");
+    assert!(mgpcg < multigrid, "{mgpcg} vs {multigrid}");
+}
+
+/// Like `a_substep_failing_after_retiring_fields_returns_them_all`, with a
+/// multigrid or MGPCG solve and a collider, so the substep has built a
+/// hierarchy with every kind of level field (masks, fluid fractions,
+/// prolongation weights) before the mis-sized pressure fails the solve.
+fn assert_failed_solve_returns_the_hierarchy(pressure: PressureSolve) {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(8, 6, 5);
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+    let wrong_dims = FieldDims::new(cells.x + 1, cells.y, cells.z);
+    let wrong_pressure = pool.acquire_zeroed(&gpu, &mut cache, wrong_dims).unwrap();
+    pool.release(std::mem::replace(&mut state.pressure, wrong_pressure));
+
+    let zero = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
+    let mask = pool.acquire_zeroed(&gpu, &mut cache, cells).unwrap();
+    let obstacle = pool
+        .acquire_staggered_zeroed(&gpu, &mut cache, cells)
+        .unwrap();
+    let constants = StepConstants {
+        alpha: 0.5,
+        beta: 2.0,
+        has_solids: true,
+        ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
+    };
+    let sources = Sources::new(&zero, &zero).with_solids(Solids {
+        mask: &mask,
+        velocity: &obstacle,
+    });
+
+    let err = substep(
+        &gpu, &mut cache, &mut pool, &mut state, sources, &constants, pressure,
+    )
+    .unwrap_err();
+    assert!(matches!(err, GpuError::Validation(_)), "got {err:?}");
+
+    state.release_to(&mut pool);
+    pool.release(zero);
+    pool.release(mask);
+    pool.release_staggered(obstacle);
+    assert_eq!(
+        pool.pooled_count() as u64,
+        pool.allocation_count(),
+        "every allocated texture, the hierarchy's included, must be back in the pool"
+    );
+}
+
+#[test]
+fn a_failed_step_with_multigrid_returns_every_field_to_the_pool() {
+    assert_failed_solve_returns_the_hierarchy(PressureSolve::Multigrid(4));
+}
+
+#[test]
+fn a_failed_step_with_mgpcg_returns_every_field_to_the_pool() {
+    assert_failed_solve_returns_the_hierarchy(PressureSolve::Mgpcg(4));
+}
+
+/// Pool acquisitions and recorded dispatches of one `advect_scalars`.
+fn scalar_advection_work(advection: Advection, conserve_mass: bool) -> (u64, usize) {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(8, 6, 5);
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, cells).unwrap();
+    let constants = StepConstants {
+        advection,
+        conserve_mass,
+        ..StepConstants::new(cells, 1.0 / 24.0, 0.25)
+    };
+    let mut step = Substep::new(&gpu, &constants).unwrap();
+    let before = pool.acquisitions();
+    step.advect_scalars(&gpu, &mut cache, &mut pool, &mut state, None)
+        .unwrap();
+    let work = (pool.acquisitions() - before, step.recorded_dispatches());
+    step.submit(&gpu, &mut pool).unwrap();
+    state.release_to(&mut pool);
+    work
+}
+
+/// 2b-3c spec §5: with `conserve_mass` off, scalar advection does exactly
+/// the work it did before the correction existed. The expected counts are
+/// the parent commit's (9940e8c): its acquisitions were measured there
+/// (6 for MacCormack, 2 for semi-Lagrangian); it had no dispatch counter,
+/// and its code records one dispatch per pass: forward, backward and
+/// correction for MacCormack, one pass for semi-Lagrangian, per scalar.
+/// With the flag on the same counter sees the correction's work, so the
+/// comparison can tell the two apart.
+#[test]
+fn conserve_mass_off_adds_no_work() {
+    for (advection, parent) in [
+        (Advection::MacCormack, (6, 6)),
+        (Advection::SemiLagrangian, (2, 2)),
+    ] {
+        let off = scalar_advection_work(advection, false);
+        let on = scalar_advection_work(advection, true);
+        eprintln!("{advection:?}: off {off:?}, on {on:?}");
+        assert_eq!(off, parent, "{advection:?} with the correction off");
+        assert!(
+            on.0 > off.0 && on.1 > off.1,
+            "{advection:?}: on {on:?}, off {off:?}"
+        );
+    }
 }

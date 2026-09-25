@@ -352,8 +352,9 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 ## 6. Risks carried into piece 2b
 
 Found by piece 2a's whole-branch review. (a) and (i) were resolved in 2a, and
-(g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). Still open: (e), the open
-part of (g), (j), and (k), which 2b-2 added.
+(g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). 2b-3c resolved (e) and
+(l). Still open: the open part of (g), (j), (k), which 2b-2 added, and (m),
+which 2b-3c added. Future work that is not a risk is listed after them.
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
@@ -379,6 +380,12 @@ part of (g), (j), and (k), which 2b-2 added.
   about as N^-1.5 (`docs/bench/iteration-sweep.md`), so expect plume shape to
   differ from Mantaflow's PCG. Multigrid is the stretch goal, and the warm start
   is load-bearing.
+
+  **Resolved by 2b-3c (2026-09-25).** The presets solve with MGPCG, ×4 in
+  preview and ×10 in final (`docs/bench/solver-gate.md`). In the rerun
+  (`docs/bench/results.md`), `plume`'s masked divergence at frame 60 is
+  2.3e-5, 3.7e-5 and 6.7e-5 at 64³, 128³ and 256³, 113× to 3,750× below
+  Gauss–Seidel ×160's.
 - **(f) Resolved (d0cc411).** The pressure loop is split across submissions
   every `iterations_per_submit(cells)` iterations, bit-identical to one
   submission. As found: one substep was one submission, up to 2000 dispatches,
@@ -497,6 +504,18 @@ part of (g), (j), and (k), which 2b-2 added.
      - **Next steps:** measure on an idle machine, over a sustained run, with a
        Metal GPU capture or Instruments' GPU counters. Treat presets.md's
        timings as upper bounds until then.
+
+  **Updated 2026-09-25 (2b-3c).** Preview now solves with MGPCG ×4, not
+  Gauss–Seidel ×160, so the 160-dispatch pressure loop in cause 1 is no
+  longer on preview's path. `just bench-presets` at ce881a5 puts a 128³
+  preview frame, with one CFL-clamped substep, at **71.5 ms** (67.9–72.6).
+  That includes the mass correction. It was 91.8 ms before, so about 28 ms
+  of the 100 ms budget is left. Two substeps take 140.5 ms and still do not
+  fit. The benchmark's own 128³ Ember frames agree: 71.1 ms for `plume` and
+  68.4 ms for `plume_wind` (`docs/bench/results.md`). The load average was
+  about 10 throughout, so these are upper bounds. MacCormack's cost and the
+  variable in-scene slowdowns (cause 2 above) have not been re-measured
+  apart.
 - **(k) Preview budget after solids.** 2b-2 added work to every kernel: the
   solid-mask branches (`face_solid`, `fluid_neighbour`), `fluid_corners` in
   the sampling path, and a uniform buffer per substep. Nobody has measured
@@ -512,9 +531,24 @@ part of (g), (j), and (k), which 2b-2 added.
   **Still open, 2026-09-24.** The machine was never idle during 2b-3 (load
   average 6–70), so this rerun has not been done. By the user's decision, the
   benchmark ran anyway, with every timing flagged as measured under load
-  (`docs/bench/results.md`). The rerun is still owed, on an idle machine.
-- **(l) Domain-wide wind in a closed-sided domain.** 2b-3's `plume_wind`
-  (`docs/bench/results.md`) fails in Ember at every resolution. At frame 60
+  (now `docs/bench/results-2b3/results.md`). The rerun is still owed, on an
+  idle machine.
+
+  **Updated 2026-09-25 (2b-3c).** The rerun was done, but still under load
+  (1-minute load average 9.6 before and 9.5 after). With every 2b-2 solid
+  branch, MGPCG ×4 and the new mass correction, a 128³ `plume` preview frame
+  takes 71.5 ms (`docs/bench/presets.md`), so preview fits. The correction's
+  own cost was not separated out: the frame fell by 20 ms overall, because
+  the cheaper solve saves more than the correction adds. **The case to watch
+  is colliders.** In the rerun, `plume_collider` at 128³ takes 97.3 ms (range
+  69.6–116, `docs/bench/results.md`). That is within 3 ms of the budget
+  under load, and some frames go over it. An idle rerun is still owed, and
+  it should time `plume_collider` as well as `plume`.
+- **(l) Resolved by 2b-3c (2026-09-25).** The evidence is after the
+  history below.
+
+  Domain-wide wind in a closed-sided domain: 2b-3's `plume_wind`
+  (`docs/bench/results-2b3/results.md`) fails in Ember at every resolution. At frame 60
   its RMS divergence is 0.14 at 64³, 1.4 at 128³ and 2.4 at 256³, against
   0.003–0.25 for `plume`. The smoke is gone long before frame 120: about 2e-6
   of mass is left at frame 100 at 64³, and none from frame 83 at 128³.
@@ -532,7 +566,7 @@ part of (g), (j), and (k), which 2b-2 added.
     (Mantaflow: 0.085). So most of the loss inside the domain before frame 60
     goes with the fixed-iteration solve, which does not converge the
     domain-wide pressure gradient a uniform push against closed side walls
-    needs. The follow-up is recorded in `docs/bench/results.md`.
+    needs. The follow-up is recorded in `docs/bench/results-2b3/results.md`.
   - **A fast exit through the top, at 64³ and 128³.** Every configuration of
     the 128³ follow-up still loses its smoke by frame 80–90. From about frame
     65 the outflow estimate credits nearly all of the frame-60 mass by frame
@@ -544,3 +578,41 @@ part of (g), (j), and (k), which 2b-2 added.
     already names; wind applied only where there is smoke, or relative to the
     air; open side boundaries for wind scenes; or a wind force field with
     falloff instead of a uniform acceleration. None is chosen yet.
+  - **The fix (2b-3c).** Two changes, both chosen by the user. Wind is now
+    an ambient airflow that the air relaxes towards (`wind_velocity`,
+    `wind_rate`). `plume_wind` is open at −x and +x, so it has no uniform push
+    against closed walls, and the pressure is solved by MGPCG. MacCormack
+    also falls back to first order where a trace crosses an open face, and
+    the mass correction runs in both presets.
+  - **Evidence** (`docs/bench/results.md`, 31cfeb2). At frame 60, Ember's
+    `plume_wind` divergence is 8.3e-7, 1.9e-6 and 5.4e-6 at 64³, 128³ and
+    256³. In 2b-3 it was 0.14, 1.4 and 2.4, and Mantaflow's is 6.2e-5 to
+    1.6e-4. Nothing is lost inside the domain. Mass equals what was emitted
+    until smoke reaches an open face (frames 23, 30 and 34). After that,
+    mass inside plus the estimated outflow stays within 3% of what was
+    emitted, and within 0.4% from frame 90. Drift at 80 is −0.3%, −0.4% and
+    −0.5%. The smoke leaves sideways through +x and is gone by frame 90,
+    sooner than Mantaflow's. That is the expected difference: Ember moves
+    all of the air, while Mantaflow's wind pushes only smoke
+    (`docs/bench/mantaflow-notes.md`).
+- **(m) Thin colliders under preview (2026-09-25, 2b-3c).** Around a
+  one-cell wall, MGPCG needs several times its usual iteration count.
+  Preview's ×4 leaves `plume_plate`'s divergence at 4.7e-3 and 1.2e-3 of its
+  pre-projection value at frames 60 and 120, against the gate's 1e-3 target.
+  Final's ×10 passes (`docs/bench/solver-gate.md`). ×4 still beats
+  Gauss–Seidel ×160 on the plate (8.7e-3 and 6.5e-3), so preview is no worse
+  than before. None of the benchmark scenes has a thin collider. A scene
+  with one-cell walls or thin tubes should be run in `final` or given more
+  `pressure_cycles`. An adaptive count, stopping on a residual target, is
+  out of scope for now (2b-3c spec §2).
+
+**Future work.**
+
+- **Mass-conserving semi-Lagrangian advection** (Lentine, Aanjaneya and
+  Fedkiw, 2011, "Mass and momentum conservation for fluid simulation"). It
+  conserves each cell's mass locally at any CFL number: the mass a cell
+  sends along its backtrace is redistributed to the cells where it lands.
+  That would replace 2b-3c's global correction, which conserves only the
+  total, is all-or-nothing on fields with negative values, and can hide a
+  local error. It is substantially more complex. The user asked on
+  2026-09-24 to look into it at a later date.

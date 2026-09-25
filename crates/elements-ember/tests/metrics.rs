@@ -1,4 +1,5 @@
 use elements_core::gpu::FieldDims;
+use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::metrics::{SMOKE_THRESHOLD, Sample, cell_centred, drift, measure};
 
 const N: u32 = 16;
@@ -45,6 +46,7 @@ fn sample<'a>(density: &'a [f32], faces: &'a [Vec<f32>; 3], solid: &'a [bool]) -
         density,
         faces,
         solid,
+        open_mask: DEFAULT_OPEN_MASK,
     }
 }
 
@@ -193,9 +195,9 @@ fn outflow_is_the_net_upwind_flux_two_cells_below_the_top() {
     assert!((m.outflow_rate - expected).abs() < 1e-9, "{m:?}");
 }
 
-/// `mass_below` is the mass of layers 0 … N − 3.
+/// With only the top open, `mass_inside` is the mass of layers 0 … N − 3.
 #[test]
-fn mass_below_leaves_out_the_top_two_layers() {
+fn mass_inside_leaves_out_the_top_two_layers() {
     let mut d = vec![0.0; (N * N * N) as usize];
     d[idx(1, 1, N - 3)] = 1.0;
     d[idx(1, 1, N - 2)] = 1.0;
@@ -203,7 +205,77 @@ fn mass_below_leaves_out_the_top_two_layers() {
     let v = faces(|_| [0.0; 3]);
     let m = measure(&sample(&d, &v, &[]));
     assert!((m.mass - 3.0 * DX.powi(3)).abs() < 1e-12, "{m:?}");
-    assert!((m.mass_below - DX.powi(3)).abs() < 1e-12, "{m:?}");
+    assert!((m.mass_inside - DX.powi(3)).abs() < 1e-12, "{m:?}");
+}
+
+/// Open +x and top (bits 1 and 5).
+const OPEN_POS_X_AND_TOP: u32 = 0b10_0010;
+
+/// 2b-3c spec §6: outflow is counted through a plane two cells in from
+/// every open face, and the control volume stops at those planes. Each plane
+/// spans only the control volume's cross-section, so a corner cell counts
+/// once in the mass and once through each face it leaves by.
+///
+/// Density 1 fills x layers 13…15 and z layers 13…15 (N = 16), and the air
+/// moves at 0.4 m/s along +x and +z. The +x plane (x-face 14) sees layer 13
+/// over y 0…15, z 0…13: 224 cells. The top plane (z-face 14) sees layer 13
+/// over x 0…13, y 0…15: 224 cells. The control volume, x < 14 and z < 14,
+/// holds the 224 + 224 − 16 cells of the two inner layers.
+#[test]
+fn outflow_counts_every_open_face() {
+    let mut d = vec![0.0; (N * N * N) as usize];
+    for k in 0..N {
+        for j in 0..N {
+            for i in 0..N {
+                if i >= N - 3 || k >= N - 3 {
+                    d[idx(i, j, k)] = 1.0;
+                }
+            }
+        }
+    }
+    let v = faces(|_| [0.4, 0.0, 0.4]);
+    let m = measure(&Sample {
+        open_mask: OPEN_POS_X_AND_TOP,
+        ..sample(&d, &v, &[])
+    });
+    let expected = (224.0 + 224.0) * 0.4 * DX * DX;
+    // 0.4 is an f32 in the faces: 0.4000000059.
+    assert!((m.outflow_rate - expected).abs() < 1e-6, "{m:?}");
+    let filled = 3.0 * 256.0 + 3.0 * 256.0 - 9.0 * 16.0;
+    assert!((m.mass - filled * DX.powi(3)).abs() < 1e-12, "{m:?}");
+    assert!(
+        (m.mass_inside - (224.0 + 224.0 - 16.0) * DX.powi(3)).abs() < 1e-12,
+        "{m:?}"
+    );
+}
+
+/// Open −x and top (bits 0 and 5).
+const OPEN_NEG_X_AND_TOP: u32 = 0b10_0001;
+
+/// A low face's plane is x-face 2, and flow towards −x is outflow: upwind
+/// there is cell 2, inside; cell 1, beyond the plane, is not counted.
+#[test]
+fn outflow_through_a_low_face_is_positive_outwards() {
+    let mut d = vec![0.0; (N * N * N) as usize];
+    for k in 0..N {
+        for j in 0..N {
+            d[idx(1, j, k)] = 5.0; // beyond the plane: not upwind, not inside
+            d[idx(2, j, k)] = 1.0; // inside, next to the plane: leaves
+        }
+    }
+    let v = faces(|_| [-0.4, 0.0, 0.0]);
+    let m = measure(&Sample {
+        open_mask: OPEN_NEG_X_AND_TOP,
+        ..sample(&d, &v, &[])
+    });
+    // y 0…15, z 0…13 below the top plane.
+    let expected = 16.0 * 14.0 * 0.4 * DX * DX;
+    // 0.4 is an f32 in the faces: 0.4000000059.
+    assert!((m.outflow_rate - expected).abs() < 1e-6, "{m:?}");
+    assert!(
+        (m.mass_inside - 16.0 * 14.0 * DX.powi(3)).abs() < 1e-12,
+        "{m:?}"
+    );
 }
 
 /// Mass 10, falling to 8 while 2 flows out: no drift.

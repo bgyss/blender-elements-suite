@@ -127,6 +127,7 @@ fn metrics_run(gpu: &GpuContext, registry: &NodeRegistry, scene: &Scene) -> Res<
             density: &density,
             faces: &faces,
             solid: &solid,
+            open_mask: scene.solver.boundaries.open_mask(),
         }));
     }
     state.clear(&mut pool);
@@ -175,7 +176,7 @@ fn run_ember(name: &str, res: u32) -> Res<()> {
 /// Drift from the last emitting frame on, so `drift[0]` is frame 60.
 fn drift_from_cut_off(frames: &[FrameMetrics], fps: f64) -> Vec<f64> {
     let from = (EMISSION_FRAMES[1] - 1) as usize;
-    let mass: Vec<f64> = frames.iter().map(|f| f.mass_below).collect();
+    let mass: Vec<f64> = frames.iter().map(|f| f.mass_inside).collect();
     let outflow: Vec<f64> = frames.iter().map(|f| f.outflow_rate).collect();
     drift(&mass, &outflow, 1.0 / fps, from)[from..].to_vec()
 }
@@ -356,6 +357,7 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
             density: &f.density,
             faces: &f.faces,
             solid: &solid,
+            open_mask: scene.solver.boundaries.open_mask(),
         }));
     }
     if omitted > 0 {

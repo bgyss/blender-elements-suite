@@ -68,26 +68,38 @@ def vorticity(ember_confinement: float, fps: float) -> float:
 
 
 def wind(
-    ember_accel: tuple[float, float, float], fps: float
-) -> tuple[float, tuple[float, float, float]]:
-    """Return a wind field's (strength, direction) for Ember's acceleration.
+    wind_velocity: tuple[float, float, float], wind_rate: float, fps: float, domain_size: float
+) -> tuple[float, float, tuple[float, float, float]]:
+    """Return a wind field's (strength, flow, direction) for Ember's ambient airflow.
 
-    Assumes one solver step per frame, falloff off (SPHERE, power 0), and the
-    field's `flow` set to 0. Mantaflow applies it only in cells that hold smoke.
+    Ember relaxes the air towards `wind_velocity` (m/s) at `wind_rate` (1/s):
+    u += (w - u)(1 - exp(-rate / fps)) each step. `domain_size` is the
+    domain's longest side in metres. Assumes one solver step per frame and the
+    falloff off (SPHERE, power 0). Mantaflow applies it only in cells that
+    hold smoke. (0, 0, (0, 0, 1)) means no field.
     """
-    # fluid.cc update_effectors_task_cb scales the field force by 0.2, and
-    # effect.cc do_physical_effector divides it by fps (vel_to_sec). With the
-    # script's scaleSpeedFrames and addForceField, the acceleration is
-    # 0.2 * strength * fps m/s². Confirmed by the domain-filling wind experiment.
-    magnitude = math.sqrt(sum(a * a for a in ember_accel))
-    if magnitude == 0.0:
-        return 0.0, (0.0, 0.0, 1.0)
+    # effect.cc do_physical_effector: a WIND field returns strength * nor /
+    # fps (vel_to_sec) minus flow * vel, where fluid.cc
+    # update_effectors_task_cb passes the cell's velocity as grid velocity
+    # times 1 / resolution, that is u * 0.4 / L for u in m/s (the notes' units
+    # rule), and scales the result by 0.2. The script's scaleSpeedFrames and
+    # addForceField turn a force F into F * fps m/s per frame, so one frame
+    # adds 0.2 * strength - 0.08 * fps * flow / L * u. Matching Ember's blend
+    # k = 1 - exp(-rate / fps) and target w gives flow = 12.5 k L / fps and
+    # strength = 5 k |w|. Confirmed by the domain-filling wind experiments.
+    if wind_rate == 0.0:
+        return 0.0, 0.0, (0.0, 0.0, 1.0)
+    blend = 1.0 - math.exp(-wind_rate / fps)
+    flow = 12.5 * blend * domain_size / fps
+    speed = math.sqrt(sum(w * w for w in wind_velocity))
+    if speed == 0.0:
+        return 0.0, flow, (0.0, 0.0, 1.0)  # a pure drag towards rest
     direction = (
-        ember_accel[0] / magnitude,
-        ember_accel[1] / magnitude,
-        ember_accel[2] / magnitude,
+        wind_velocity[0] / speed,
+        wind_velocity[1] / speed,
+        wind_velocity[2] / speed,
     )
-    return magnitude / (0.2 * fps), direction
+    return 5.0 * blend * speed, flow, direction
 
 
 def rotation_to(direction: tuple[float, float, float]) -> tuple[float, float, float, float]:

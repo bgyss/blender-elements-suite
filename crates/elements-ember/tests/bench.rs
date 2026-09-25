@@ -1,11 +1,14 @@
 mod common;
 
-use elements_core::gpu::{FieldPool, PipelineCache};
-use elements_core::graph::{Document, Timeline};
+use elements_core::gpu::{Axis, FieldFormat, FieldPool, PipelineCache};
+use elements_core::graph::{Document, StateStore, Time, Timeline};
 use elements_ember::bench::{
-    GateRow, PresetRow, Scene, gate_verdict, preview_substeps_verdict, report,
+    GateRow, PresetRow, SOLVER_NODE, Scene, gate_verdict, preview_substeps_verdict, report,
 };
-use elements_ember::metrics::FrameMetrics;
+use elements_ember::boundaries::Face;
+use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
+use elements_ember::shape_emitter::{EmitterFields, fill_emitter};
+use elements_ember::solver;
 
 fn row(iterations: u32, step_ms_median: f64, ratio: f64) -> GateRow {
     GateRow {
@@ -111,12 +114,20 @@ fn the_plume_collider_scene_loads_and_steps() {
     loads_and_steps(&scene);
 }
 
+/// 2b-3c spec §6: `plume_wind`'s air relaxes towards 1 m/s along +x at
+/// 1/s, and blows in at −x and out at +x, with the top still open.
 #[test]
-fn the_plume_wind_scene_loads_and_steps() {
+fn plume_wind_blows_through_open_sides() {
     let scene = Scene::plume_wind(16);
-    assert_eq!(scene.solver.wind, [0.5, 0.0, 0.0]);
-    // The document is what 2b-3's Mantaflow side and the daemon read, so the
-    // wind must survive serialisation, not just sit on the struct.
+    assert_eq!(scene.solver.wind_velocity, [1.0, 0.0, 0.0]);
+    assert_eq!(scene.solver.wind_rate, 1.0);
+    let b = scene.solver.boundaries;
+    assert_eq!((b.neg_x, b.pos_x), (Face::Open, Face::Open));
+    assert_eq!((b.neg_y, b.pos_y), (Face::Wall, Face::Wall));
+    assert_eq!((b.neg_z, b.pos_z), (Face::Wall, Face::Open));
+    // The document is what the daemon and the benchmark read, so the wind
+    // and the boundaries must survive serialisation, not just sit on the
+    // struct.
     let text = scene.document().to_json().unwrap();
     let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
     let solver = doc["nodes"]
@@ -125,12 +136,129 @@ fn the_plume_wind_scene_loads_and_steps() {
         .iter()
         .find(|n| n["id"] == 1)
         .expect("node 1 is the solver");
-    assert_eq!(
-        solver["params"]["wind"],
-        serde_json::json!([0.5, 0.0, 0.0]),
-        "the serialised solver params must carry the wind"
-    );
+    let params = &solver["params"];
+    assert_eq!(params["wind_velocity"], serde_json::json!([1.0, 0.0, 0.0]));
+    assert_eq!(params["wind_rate"], 1.0);
+    assert!(params.get("wind").is_none(), "{params}");
+    assert_eq!(params["boundaries"]["-x"], "open");
+    assert_eq!(params["boundaries"]["+x"], "open");
     loads_and_steps(&scene);
+}
+
+/// A regression guard for 2b-3's wind, an acceleration nothing balanced:
+/// the air sped up without bound and blew the smoke out of its own
+/// accounting. At 32³ over the scene's 120 frames the air must stay below
+/// 3 m/s with no NaN; an unbalanced 1 m/s² passes 3 m/s only after about
+/// 3 s, so the 60 emitting frames alone would not see it. At frame 60, the
+/// last emitting frame, the mass inside plus the mass that left through the
+/// open faces must be within 10% of what the emitter put in.
+#[test]
+fn plume_wind_stays_bounded_and_keeps_its_mass() {
+    let scene = Scene::plume_wind(32);
+    let gpu = common::gpu();
+    let registry = elements_ember::registry();
+    let doc = scene.document();
+    let config = doc.timeline_config();
+    let (graph, dims) = doc.into_graph(&registry).unwrap();
+    let dx = scene.domain_size / f64::from(*scene.cells.iter().max().unwrap());
+    let mut pool = FieldPool::new();
+    let mut pipelines = PipelineCache::new();
+    let mut state = StateStore::new();
+
+    // What the emitter adds per second: its density rate field summed.
+    let emitted_per_second = {
+        let f: [_; 3] =
+            std::array::from_fn(|_| pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap());
+        let v = pool.acquire_staggered_uninit(&gpu, dims).unwrap();
+        let spf = 1.0 / scene.fps;
+        fill_emitter(
+            &gpu,
+            &mut pipelines,
+            &scene.emitter,
+            &scene.emitter.transform.pose(1.0, spf),
+            spf,
+            dx as f32,
+            EmitterFields {
+                density: &f[0],
+                temperature: &f[1],
+                weight: &f[2],
+                velocity: &v,
+            },
+        )
+        .unwrap();
+        let rate: f64 = f[0]
+            .read_back(&gpu)
+            .unwrap()
+            .iter()
+            .map(|&r| f64::from(r))
+            .sum();
+        for field in f {
+            pool.release(field);
+        }
+        pool.release_staggered(v);
+        rate * dx.powi(3)
+    };
+
+    let open_mask = scene.solver.boundaries.open_mask();
+    let first = config.start_frame;
+    let last_emitting = EMISSION_FRAMES[1];
+    let mut frames = Vec::new();
+    let mut max_speed = 0.0f32;
+    for frame in first..first + scene.frames {
+        let time = Time::at(frame, first, config.fps);
+        let evaluated = graph
+            .eval_frame(&gpu, &mut pool, &mut pipelines, &mut state, time, dims)
+            .unwrap();
+        evaluated.value.release_to(&mut pool);
+        let density = state
+            .get(SOLVER_NODE, solver::DENSITY)
+            .unwrap()
+            .as_field()
+            .unwrap()
+            .read_back(&gpu)
+            .unwrap();
+        let velocity = state
+            .get(SOLVER_NODE, solver::VELOCITY)
+            .unwrap()
+            .as_vector_field()
+            .unwrap();
+        let faces = [Axis::X, Axis::Y, Axis::Z].map(|a| velocity.face(a).read_back(&gpu).unwrap());
+        for v in faces.iter().flatten().chain(&density) {
+            assert!(v.is_finite(), "frame {frame}: a non-finite value");
+        }
+        max_speed = faces
+            .iter()
+            .flatten()
+            .fold(max_speed, |m, v| m.max(v.abs()));
+        frames.push(measure(&Sample {
+            cells: dims,
+            dx,
+            density: &density,
+            faces: &faces,
+            solid: &[],
+            open_mask,
+        }));
+    }
+    state.clear(&mut pool);
+
+    // Frames 1 … 60, the emitting ones.
+    let emitting = (last_emitting - first + 1) as usize;
+    let mass: Vec<f64> = frames[..emitting].iter().map(|f| f.mass_inside).collect();
+    let rate: Vec<f64> = frames[..emitting].iter().map(|f| f.outflow_rate).collect();
+    // `drift` from frame 1 is M(60) + outflow − M(1); add M(1) back.
+    let spf = 1.0 / scene.fps;
+    let accounted = drift(&mass, &rate, spf, 0)[emitting - 1] + mass[0];
+    let emitted = emitted_per_second * spf * emitting as f64;
+    let ratio = accounted / emitted;
+    eprintln!(
+        "plume_wind 32³: max |u| {max_speed} m/s over {} frames; at frame {last_emitting}, \
+         mass_inside {} + outflow {} = {accounted} of {emitted} emitted ({ratio})",
+        scene.frames,
+        mass[emitting - 1],
+        accounted - mass[emitting - 1],
+    );
+    assert!(max_speed < 3.0, "max |u| {max_speed} m/s");
+    assert!((ratio - 1.0).abs() <= 0.10, "accounted/emitted {ratio}");
 }
 
 use elements_ember::bench::EMISSION_FRAMES;
@@ -174,6 +302,83 @@ fn the_collider_mask_marks_cells_inside_the_sphere() {
     assert!(Scene::plume(32).solid_mask().is_empty());
 }
 
+/// 2b-3c spec §4: one layer of solid across the domain at z = 0.8 m, open
+/// only in a slit two cells wide in x, along all of y, above the emitter.
+#[test]
+fn the_plate_mask_leaves_only_the_slit_open() {
+    let n = 64u32;
+    let mask = Scene::plume_plate(n).solid_mask();
+    assert_eq!(mask.len(), (n * n * n) as usize);
+    // dx = 1/32 m, so 0.8 m lies in layer 25 and x = 1 m between cells 31
+    // and 32.
+    let (layer, slit) = (25, [31, 32]);
+    let mut open_in_layer = Vec::new();
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let solid = mask[(i + n * (j + n * k)) as usize];
+                if k != layer {
+                    assert!(!solid, "({i}, {j}, {k}) is outside the plate");
+                } else if !solid {
+                    open_in_layer.push((i, j));
+                }
+            }
+        }
+    }
+    let expected: Vec<(u32, u32)> = (0..n).flat_map(|j| slit.map(|i| (i, j))).collect();
+    assert_eq!(
+        open_in_layer, expected,
+        "only the slit is open in the plate"
+    );
+}
+
+/// Both boxes reach the solver, merged: each feeds one side of the union,
+/// and the union, not either box, feeds the solver's inputs 4 and 5.
+#[test]
+fn the_plate_document_merges_both_boxes_into_the_solver() {
+    let doc = Scene::plume_plate(16).document();
+    let ids = |kind: &str| -> Vec<u32> {
+        doc.nodes
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.id)
+            .collect()
+    };
+    let boxes = ids(elements_ember::collider::KIND);
+    let unions = ids(elements_ember::unions::COLLIDER_UNION_KIND);
+    assert_eq!((boxes.len(), unions.len()), (2, 1));
+    let union = unions[0];
+    let into = |node: u32, index: u32| {
+        let found: Vec<(u32, u32)> = doc
+            .edges
+            .iter()
+            .filter(|e| e.to_node == node && e.to_index == index)
+            .map(|e| (e.from_node, e.from_index))
+            .collect();
+        found
+    };
+    assert_eq!(into(union, 0), [(boxes[0], 0)]);
+    assert_eq!(into(union, 1), [(boxes[0], 1)]);
+    assert_eq!(into(union, 2), [(boxes[1], 0)]);
+    assert_eq!(into(union, 3), [(boxes[1], 1)]);
+    let solver = SOLVER_NODE.0;
+    assert_eq!(
+        into(solver, 4),
+        [(union, 0)],
+        "the union's SDF feeds the solver"
+    );
+    assert_eq!(
+        into(solver, 5),
+        [(union, 1)],
+        "the union's velocity feeds the solver"
+    );
+}
+
+#[test]
+fn the_plume_plate_scene_loads_and_steps() {
+    loads_and_steps(&Scene::plume_plate(16));
+}
+
 #[test]
 fn a_summary_round_trips_through_its_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,7 +389,7 @@ fn a_summary_round_trips_through_its_file() {
         vorticity: 2.0 * n,
         measured_cells: 100 * n as u64,
         mass: 0.125 * n,
-        mass_below: 0.0625 * n,
+        mass_inside: 0.0625 * n,
         centroid_m: if n > 1.0 { Some(0.3 * n) } else { None },
         top_m: Some(0.4 * n),
         outflow_rate: 0.01 * n,
@@ -213,6 +418,19 @@ fn a_summary_round_trips_through_its_file() {
     assert!(dir.path().join("ember-plume-64.csv").exists());
 }
 
+/// 2b-3's result files call `mass_inside` by its old name, `mass_below`;
+/// the report still reads them until they are rerun.
+#[test]
+fn a_frame_written_as_mass_below_still_loads() {
+    let json = serde_json::json!({
+        "divergence_max": 0.0, "divergence_rms": 0.0, "kinetic_energy": 0.0,
+        "vorticity": 0.0, "measured_cells": 0, "mass": 2.0, "mass_below": 1.5,
+        "centroid_m": null, "top_m": null, "outflow_rate": 0.0
+    });
+    let f: FrameMetrics = serde_json::from_value(json).unwrap();
+    assert_eq!(f.mass_inside, 1.5);
+}
+
 /// The Mantaflow twin is built from the same scene (2b-3 spec §5): every
 /// parameter the scene script needs comes from `mantaflow_json`.
 #[test]
@@ -231,7 +449,11 @@ fn the_mantaflow_json_carries_every_matched_parameter() {
     assert_eq!(j["boundaries"]["neg_z"], "wall");
     assert_eq!(j["substeps"], s.solver.max_substeps);
     let w = Scene::plume_wind(64).mantaflow_json();
-    assert_eq!(w["wind"], serde_json::json!([0.5, 0.0, 0.0]));
+    assert_eq!(w["wind_velocity"], serde_json::json!([1.0, 0.0, 0.0]));
+    assert_eq!(w["wind_rate"], 1.0);
+    assert!(w.get("wind").is_none(), "{w}");
+    assert_eq!(w["boundaries"]["neg_x"], "open");
+    assert_eq!(w["boundaries"]["pos_x"], "open");
     assert!(Scene::plume(64).mantaflow_json()["collider"].is_null());
 }
 
@@ -248,7 +470,7 @@ fn summary(solver: &str, scene: &str, res: u32) -> report::RunSummary {
                 vorticity: 0.02 * n,
                 measured_cells: 1000 + 50 * n as u64,
                 mass: 0.001 * n,
-                mass_below: 0.0009 * n,
+                mass_inside: 0.0009 * n,
                 centroid_m: Some(0.01 * n),
                 top_m: Some(0.015 * n),
                 outflow_rate: 0.0,
@@ -319,12 +541,12 @@ fn the_results_table_has_one_section_per_scene_and_names_run_counts() {
 }
 
 /// The row reads drift at frames 80 and 120 (`drift[20]`, `drift[60]`) as a
-/// percentage of `mass_below` at frame 60, and divides kinetic energy and
+/// percentage of `mass_inside` at frame 60, and divides kinetic energy and
 /// vorticity by the measured cells of the same frame.
 #[test]
 fn the_results_row_pins_drift_frames_and_per_cell_values() {
     let md = report::results_markdown(&all(), &context()).unwrap();
-    // mass_below at 60 is 0.0009 · 60 = 0.054.
+    // mass_inside at 60 is 0.0009 · 60 = 0.054.
     // Frame 120: 0.006, 11.1%. Frame 80: 0.002, 3.7%.
     assert!(
         md.contains("| 0.00200 (+3.7%) | 0.00600 (+11.1%) |"),
@@ -369,7 +591,7 @@ fn the_drift_cell_marks_outflow_before_frame_80() {
     for f in &mut early.frames[69..] {
         f.outflow_rate = 0.01;
     }
-    // mass_below goes 0.054 → 0.072 from frame 60 to 80, so a drift of
+    // mass_inside goes 0.054 → 0.072 from frame 60 to 80, so a drift of
     // 0.0234 credits 0.0054 to outflow: 10.0% of 0.054.
     early.drift[20] = 0.0234;
     let late = s
@@ -436,6 +658,32 @@ fn the_notes_compute_the_emitted_mass_ratio() {
     assert!(md.contains("By frame 60 the ratio is 0.50–1.00×"), "{md}");
 }
 
+#[test]
+fn a_pressure_solve_is_named_with_its_count() {
+    use solver::PressureSolve;
+    assert_eq!(report::pressure_label(PressureSolve::Mgpcg(7)), "MGPCG ×7");
+    assert_eq!(
+        report::pressure_label(PressureSolve::GaussSeidel(160)),
+        "Gauss–Seidel ×160"
+    );
+    assert_eq!(
+        report::pressure_label(PressureSolve::Multigrid(3)),
+        "multigrid V-cycles ×3"
+    );
+}
+
+/// The Pressure note names the preview preset's solve from the preset
+/// itself, so it cannot go stale when the preset changes.
+#[test]
+fn the_notes_name_the_preview_presets_pressure_solve() {
+    let md = report::results_markdown(&all(), &context()).unwrap();
+    let solve = report::pressure_label(solver::Quality::Preview.params().pressure());
+    assert!(
+        md.contains(&format!("the preview preset's {solve} per substep")),
+        "{md}"
+    );
+}
+
 /// Mantaflow's twin is built for a cube (one `dx` in `mapping.py`).
 #[test]
 #[should_panic(expected = "needs a cubic domain")]
@@ -451,7 +699,7 @@ fn the_mantaflow_twin_refuses_a_non_cubic_domain() {
 #[should_panic(expected = "bench colliders are static")]
 fn the_bench_mask_refuses_a_keyframed_collider() {
     let mut s = Scene::plume_collider(16);
-    let c = s.collider.as_mut().unwrap();
+    let c = &mut s.colliders[0];
     let mut key = c.transform.keys[0];
     key.frame += 10.0;
     c.transform.keys.push(key);

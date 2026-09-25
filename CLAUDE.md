@@ -19,20 +19,27 @@ gate at 34 ms a step with 160 pressure iterations. **2b** is split into cycles:
 three for the solver and its benchmark, then flame. **2b-1**, solver
 correctness, is complete: CFL substeps, RK2 + MacCormack advection, vorticity
 confinement, dissipation, per-face boundaries, and the `preview` and `final`
-presets (`docs/bench/presets.md`). Preview runs one CFL-clamped substep at about
-92 ms a 128³ frame; why that is so far above 2a's 34 ms is open risk (j) in §6
-of the piece 2 spec. **2b-2**, scene content, is complete: keyframed box and
+presets (`docs/bench/presets.md`). Preview runs one CFL-clamped substep, now
+about 71 ms a 128³ frame. Open risks in §6 of the piece 2 spec: the open
+part of (g), GPU out-of-memory on unified memory; (j), preview's frame cost;
+(k), preview's budget after 2b-2's solids; and (m), preview's ×4
+under-converging around thin colliders.
+**2b-2**, scene content, is complete: keyframed box and
 sphere emitters (with noise and velocity emission) and colliders, unions of
 each, and wind
 (`docs/superpowers/specs/2026-09-23-ember-scene-content-2b2-design.md`).
-**2b-3**, the Mantaflow benchmark, is complete (`docs/bench/results.md`).
-Ember is 3–8× faster than Mantaflow and uses about half its memory or less,
-but leaves far more divergence at high resolution. Its domain-wide wind
-fails at every resolution: smoke is lost inside the domain at 128³ and 256³
-before any reaches the outflow plane, by a mechanism not yet known, and at
-64³ and 128³ the rest leaves quickly through the top: open risk (l). All
-timings were measured under load. **2b-3b**, the side-by-side render and the
-latency measurement, is next. Flame is its own later cycle, 2b-4.
+**2b-3**, the Mantaflow benchmark, is complete
+(`docs/bench/results-2b3/results.md`). It found Ember faster but behind on
+divergence and conservation, and its wind broken. **2b-3c**, solver
+quality, is complete. It added MGPCG pressure (preview ×4, final ×10), a
+global mass correction, and wind as an ambient airflow. In the rerun
+(`docs/bench/results.md`), Ember is 5.8–8.4× faster than Mantaflow. In
+`plume` and `plume_collider` its mass drift is under 1e-6 of the frame-60
+mass at frame 80, and in `plume_collider`, where almost no smoke leaves, it
+stays under 1.5e-6 through frame 120. It leaves less divergence everywhere
+except `plume_collider` and `plume`'s frame 120 at 256³. All timings were
+measured under load. **2b-3b**, the side-by-side render and the latency
+measurement, is next. Flame is its own later cycle, 2b-4.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -47,7 +54,10 @@ latency measurement, is next. Flame is its own later cycle, 2b-4.
 - Ember piece 2b-2 plan: `docs/superpowers/plans/2026-09-23-ember-scene-content-2b2.md`
 - Ember piece 2b-3 spec: `docs/superpowers/specs/2026-09-23-ember-mantaflow-benchmark-2b3-design.md`
 - Ember piece 2b-3 plan: `docs/superpowers/plans/2026-09-23-ember-mantaflow-benchmark-2b3.md`
-- Mantaflow benchmark results and cache notes: `docs/bench/results.md`, `docs/bench/mantaflow-notes.md`
+- Ember piece 2b-3c spec: `docs/superpowers/specs/2026-09-24-ember-solver-quality-2b3c-design.md`
+- Ember piece 2b-3c plan: `docs/superpowers/plans/2026-09-24-ember-solver-quality-2b3c.md`
+- Mantaflow benchmark results and cache notes: `docs/bench/results.md` (2b-3c's rerun; 2b-3's run is in `docs/bench/results-2b3/`), `docs/bench/mantaflow-notes.md`
+- Solver gate (Gauss–Seidel, multigrid and MGPCG): `docs/bench/solver-gate.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
 - Live progress and open risks: `.superpowers/sdd/progress.md`
 
@@ -70,6 +80,7 @@ just golden       # regenerate golden files (review the PNG by eye first)
 just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
 just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
 just bench-presets # the preview preset's substep cap; minutes, real GPU, not in check
+just bench-solver # the 2b-3c solver gate; about an hour, real GPU, not in check
 just bench        # the Mantaflow benchmark; an hour or more, real GPU and Blender, not in check
                   # (positional: `just bench plume 64` for one scene and resolution)
 ```

@@ -49,15 +49,29 @@ def test_rotation_to_normalises_its_direction() -> None:
     assert all(close(g, d) for g, d in zip(got, (0.0, 0.6, 0.8), strict=True)), got
 
 
-def test_wind_at_half_a_metre_per_second_squared() -> None:
-    strength, direction = mapping.wind((0.5, 0.0, 0.0), 24.0)
-    assert close(strength, 0.5 / (0.2 * 24.0)), strength
-    assert round(strength, 4) == 0.1042, strength
+def test_wind_matches_plume_winds_baked_pair() -> None:
+    # plume_wind: 1 m/s along +x at 1/s, 24 fps, a 2 m domain. The bake in
+    # mantaflow-notes.md ("Wind as ambient airflow") used this pair.
+    strength, flow, direction = mapping.wind((1.0, 0.0, 0.0), 1.0, 24.0, 2.0)
+    blend = 1.0 - math.exp(-1.0 / 24.0)
+    assert close(flow, 12.5 * blend * 2.0 / 24.0), flow
+    assert close(strength, 5.0 * blend), strength
+    # The values mantaflow-notes.md gives, rounded to six places. (The fill
+    # bakes there were passed wind=0.204054, one in the sixth place high.)
+    assert close(strength, 0.204053, 1e-6) and close(flow, 0.042511, 1e-6), (strength, flow)
     assert direction == (1.0, 0.0, 0.0), direction
 
 
-def test_no_wind_is_zero_strength() -> None:
-    assert mapping.wind((0.0, 0.0, 0.0), 24.0) == (0.0, (0.0, 0.0, 1.0))
+def test_wind_strength_over_flow_sets_the_target_speed() -> None:
+    # One frame adds 0.2 * strength - 0.08 * fps * flow / L * u, which is zero
+    # at u = |w| whatever the rate.
+    for rate in (0.5, 1.0, 4.0):
+        strength, flow, _ = mapping.wind((0.0, 3.0, 4.0), rate, 30.0, 2.5)
+        assert close(0.2 * strength / (0.08 * 30.0 * flow / 2.5), 5.0), (rate, strength, flow)
+
+
+def test_no_wind_rate_is_no_field() -> None:
+    assert mapping.wind((1.0, 0.0, 0.0), 0.0, 24.0, 2.0) == (0.0, 0.0, (0.0, 0.0, 1.0))
 
 
 def test_inflow_adds_the_rate_per_frame_and_holds_frame_24s_heat() -> None:

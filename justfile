@@ -72,6 +72,11 @@ bench-sweep iterations="160,240,320,400,480,560,640":
 bench-presets:
     cargo run --release -p elements-ember --example presets
 
+# The 2b-3c solver gate: Gauss–Seidel against multigrid and MGPCG (spec §4).
+# Writes docs/bench/solver-gate.md. Takes about an hour, real GPU, not in `check`.
+bench-solver:
+    cargo run --release -p elements-ember --example solver_gate
+
 # The Mantaflow benchmark (2b-3 spec). Takes about an hour or more, needs the
 # real GPU and Blender, and is not part of `check`. Writes
 # docs/bench/results/ per run, then docs/bench/results.md from a complete set.

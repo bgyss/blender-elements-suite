@@ -280,8 +280,8 @@ def inflow(density_rate: float, temperature_rate: float, fps: float) -> tuple[fl
     # needs use_absolute = False, surface_distance = 0, volume_density = 1;
     # raises ValueError if density leaves [0, 1]
 def vorticity(ember_confinement: float, fps: float) -> float
-def wind(ember_accel: tuple[float, float, float], fps: float) -> tuple[float, tuple[float, float, float]]
-    # (strength, unit direction); (0.0, (0, 0, 1)) for no wind
+def wind(wind_velocity: tuple[float, float, float], wind_rate: float, fps: float, domain_size: float) -> tuple[float, float, tuple[float, float, float]]
+    # (strength, flow, unit direction); (0.0, 0.0, (0, 0, 1)) for wind_rate 0 (no field)
 def rotation_to(direction: tuple[float, float, float]) -> tuple[float, float, float, float]
     # (w, x, y, z) turning the field's local +z onto direction
 ```
@@ -289,7 +289,9 @@ def rotation_to(direction: tuple[float, float, float]) -> tuple[float, float, fl
 The brief's signatures lacked the domain size and gravity (`buoyancy`) and
 the fps (`inflow` has it; `vorticity` had dx instead, which cancels; `wind`
 had none). `vorticity` and `wind` assume one solver step per frame, as every
-bench scene uses.
+bench scene uses. 2b-3c Task 7 replaced `wind(ember_accel, fps)` with the
+ambient-airflow form above; it takes the domain size too, since the field's
+drag sees the velocity as a fraction of the domain per time unit.
 
 Unit conversions used below, from the generated script: with domain size
 L (the longest side) and resolution n, a Mantaflow time unit is 0.4 s at any
@@ -302,8 +304,8 @@ gravity is converted to cells per unit² by `scaleAcceleration = (n / L) · 0.4�
 | Buoyancy, density | `buoyancy_density` α: downward accel. α·ρ | domain `alpha`; positive lifts density | `alpha = −α · L / |g|` | as above | yes: sign and size, below |
 | Gravity | none (buoyancy is its own term) | scene gravity × `effector_weights.global_gravity` | keep the defaults, (0, 0, −9.81) and 1, and pass 9.81 | `fluid.cc` `update_final_gravity` | — |
 | Vorticity | `vorticity` ε, 1/s: Δu = h·ε·dx·(N×ω) | domain `vorticity`: Δu = v·(dt / frame)·(N×ω), grid units | `vorticity = ε / fps` (dx cancels) | `extforces.cpp` `KnConfForce`; `smoke_script.h` | no: bench ε = 0, so 0 |
-| Wind | uniform acceleration a, m/s², every cell | `WIND` field, strength S | `S = |a| / (0.2 · fps)`: 0.5 m/s² at 24 fps gives 0.1042 | `fluid.cc` `update_effectors_task_cb` (× 0.2, clamp ±1); `effect.cc` `do_physical_effector` (÷ fps, `vel_to_sec`); then `scaleSpeedFrames` and `addForceField` | yes, below |
-| Wind falloff | none | `falloff_type = "SPHERE"`, `falloff_power = 0`, `use_min_distance = use_max_distance = False`, `z_direction = "BOTH"`, `flow = 0` | power 0 makes the falloff 1 everywhere; `flow` (default 1 for WIND) would add drag towards the smoke's own velocity | `effect.cc` `effector_falloff`, `falloff_func` | yes (used in the check) |
+| Wind | ambient airflow: u += (w − u)(1 − e^{−rate·h}) in every cell (`wind_velocity` w, `wind_rate`) | `WIND` field, strength S and `flow` F: one frame adds 0.2·S − 0.08·fps·F·u / L (m/s) | with k = 1 − e^{−rate / fps}: `F = 12.5 · k · L / fps`, `S = 5 · k · |w|`; `plume_wind` (1 m/s, 1/s, 24 fps, L = 2 m) gives S = 0.204053, F = 0.042511 | `effect.cc` `do_physical_effector` (S·nor ÷ fps, minus F·vel); `fluid.cc` `update_effectors_task_cb` (vel = grid velocity × 1/n, result × 0.2, clamp ±1); then `scaleSpeedFrames` and `addForceField` | yes, below (Wind as ambient airflow) |
+| Wind falloff | none | `falloff_type = "SPHERE"`, `falloff_power = 0`, `use_min_distance = use_max_distance = False`, `z_direction = "BOTH"` | power 0 makes the falloff 1 everywhere, for the force and for the `flow` drag (`flow_falloff`) | `effect.cc` `effector_falloff`, `falloff_func` | yes (used in the checks) |
 | Wind direction | the acceleration vector | the field object's local +z | object rotation `rotation_to(direction)` (quaternion); set `rotation_mode = "QUATERNION"` first, or `rotation_quaternion` is ignored | `effect.cc`, `PFIELD_WIND` uses `efd->nor` | yes for +x |
 | Inflow, density | adds `rate · occupancy · h` each substep | with `use_absolute = False`, adds `density · emission` once per frame and clamps to [0, 1]; with `use_absolute = True` (Blender's default) it holds the value instead | `use_absolute = False`, `density = density_rate / fps` | `fluid.cc` `apply_inflow_fields` (and the reset of the inflow grids to the current grids before emission); `initplugins.cpp` `applyEmission` | yes: mass 0.97–1.03 of Ember's, below |
 | Inflow, temperature | adds `rate · occupancy · h` each substep | raises heat to `temperature` in the emitter (`ADD_IF_LOWER`), never above it, in both modes | `temperature = temperature_rate · 24 / fps`: Ember's emitter-centre value at frame 24 | `fluid.cc` `ADD_IF_LOWER`, `apply_inflow_fields` | yes: held at 1.000, below |
@@ -408,7 +410,7 @@ All baked with the probe. Velocities are converted with the units rule above.
   way (0.08585 at 60, 0.08636 at 61, 0.08700 at 63, 0.09242 at 80), and the
   [1, 30] run *loses* mass after its cut-off (0.04439 at 30, 0.04424 at 31,
   0.03801 at 50), with its emitter draining from 0.540 to 0.500 at frame 31.
-- **Wind strength.** A domain filled with smoke (`fill=1 volume=1 alpha=0
+- **Wind strength (2b-3, superseded by 2b-3c's ambient airflow below).** A domain filled with smoke (`fill=1 volume=1 alpha=0
   beta=0`), all sides open, at 32³, with `wind = S` along +x. With
   S = 0.1042 (0.5 m/s² at 24 fps), the centre's u rose 0.0201, 0.0402 and
   0.0599 m/s by frames 2, 3 and 4, against 0.0208 per frame (96.5%, the
@@ -416,7 +418,8 @@ All baked with the probe. Velocities are converted with the units rule above.
   the effectors are sampled before that frame's emission, when the domain
   holds no smoke yet. My first reading of the source, S = a / (0.2 · fps²),
   missed the ÷ fps in `do_physical_effector` and was 24× too weak.
-- **Wind check with an emitter** (replaces the brief's no-emitter check).
+- **Wind check with an emitter** (2b-3's uniform-acceleration wind,
+  superseded below; replaces the brief's no-emitter check).
   The bench `plume_wind` at 64³ in both solvers. Mantaflow ran with the
   additive inflow mapping (`bench=1 volume=1 surface=0 absolute=0
   density=0.04167 temperature=1 alpha=0 beta=0.2039 wind=0.1042`), and a
@@ -436,17 +439,121 @@ All baked with the probe. Velocities are converted with the units rule above.
   emitter lifts smoke sooner into the region where the wind has acted longest
   (see Inflow).
 
+### Wind as ambient airflow (2b-3c Task 7)
+
+Ember's wind became an ambient airflow the air relaxes towards: each substep,
+u += (w − u)(1 − e^{−rate·h}) on every non-wall face, with `wind_velocity` w
+and `wind_rate`. Blender's `WIND` field has a matching term, its `flow`
+setting, a drag towards the field's own velocity.
+
+**Formula, from the source.** `effect.cc` `do_physical_effector`: a `WIND`
+field's force is strength · falloff · its object's +z (`efd->nor`), divided
+by `vel_to_sec` (the fps, from `pd_point_from_loc`), and with `flow` ≠ 0 it
+also adds −flow · falloff · the point's velocity. `fluid.cc`
+`update_effectors_task_cb` passes the cell's velocity as the grid velocity
+times `fds->dx`, which is 1 / n (`fds->dx = 1.0f / res`), so for u in m/s
+(the units rule, u = u_grid · (L / n) / 0.4) the field sees u · 0.4 / L. The
+result is scaled by 0.2 and clamped to ±1. The script multiplies the force by
+`scaleSpeedFrames` = (n / L) · fps / 2.5 and `addForceField` adds it once a
+step, which is F · fps m/s a frame for a force F (as the 2b-3 strength
+experiment found). One frame therefore adds
+
+  Δu = 0.2 · S − 0.08 · fps · F · u / L   (m/s),
+
+a relaxation towards 2.5 · S · L / (fps · F) with blend 0.08 · fps · F / L a
+frame. Matching Ember's per-step blend k = 1 − e^{−rate / fps} and target w:
+
+  **F = 12.5 · k · L / fps,   S = 5 · k · |w|**,
+
+turned onto w by `rotation_to`. The drag acts on all three components of the
+smoke's velocity, as Ember's relaxation does. The clamp never binds:
+0.2 · S / fps = k · |w| / fps is 0.0017 for `plume_wind`. `mapping.wind`
+returns no field (strength and flow 0) when `wind_rate` is 0, and the scene
+script then adds none. For `plume_wind` (w = 1 m/s along +x, rate 1/s,
+24 fps, L = 2 m): k = 0.040811, **S = 0.204053, F = 0.042511**.
+
+**Bakes.** Probe, domain filled with smoke at rest (`fill=1 volume=1 alpha=0
+beta=0`), `wind=0.204054 wind_flow=0.042511` along +x, domain-centre u
+(mean of the cell-centred u over the 2×2×2 cells about the centre),
+converted by the units rule. Frame 1 gets no force, as before, so the
+prediction is u(f) = 1 − (1 − k)^{f−1}.
+
+- **All six sides open (the brief's setup), 32³, 96 frames.** u = 0.039,
+  0.147, 0.361, 0.554, 0.704, 0.736 at frames 2, 5, 13, 25, 49, 96, against
+  0.041, 0.154, 0.394, 0.632, 0.865, 0.981. It follows the prediction at
+  first (96%) and then levels off near 0.74 m/s. The profile along the
+  centre line in x was not uniform (at frame 96: 0.63 near −x, 0.745 in the
+  middle, 0.68 near +x), probably because the unforced, smoke-free boundary
+  layer on the open ±y and ±z sides lets the flow spread and shear. Closing
+  those sides removes it (next bake).
+- **Only ±x open, the other four sides walls** (`closed=1 open=left,right`),
+  as in `plume_wind`. The interior velocity is then uniform to three places
+  along x, y and z in every frame checked, so each frame is one number. At
+  32³ it reaches 0.683 m/s by frame 96, at 64³ 0.700 by frame 72.
+- **Why it levels off below 1 m/s: the open inlet, not the field.** The same
+  domain with `flow` 0 (`wind=0.204054` alone, a constant force) should
+  gain 0.2 · S = 0.0408 m/s a frame for ever (0.0388 is measured in the
+  first frame, the resolution shortfall below). Its gain instead falls as
+  u²: the
+  shortfall is 0.0213 · u² a frame at 32³ and 0.0227 · u² at 64³, for u
+  above 0.5, against h / L = 0.0208. That is still air entering through the
+  open −x face: the smoke-free inlet layer gets no force, and
+  incompressibility spreads its momentum deficit, u · (u h / L), over the
+  whole channel. It does not depend on the resolution, and it is the same
+  with or without `flow`.
+- **The flow drag, net of the inlet.** Subtracting the force-only run's gain
+  at the same u from the wind run's leaves the drag alone: −k_eff · u with
+  **k_eff = 0.03895 a frame at 32³ (95.4% of k) and 0.04064 at 64³ (99.6%)**.
+  The force term's first-frame gain is 0.03880 (95.1% of 0.2 · S) and
+  0.03981 (97.5%), the same resolution shortfall as the buoyancy
+  experiments. So the target is a / k_eff = **0.996 m/s at 32³ and 0.979 m/s
+  at 64³**, with a **time constant of 1.05 s and 1.00 s** (Ember's: 1 s,
+  1 m/s). The drag scales with `flow`: with S and F both doubled
+  (`wind=0.408108 wind_flow=0.085022`, 32³), k_eff = 0.0777 (95.2% of 2k).
+
+So Blender's `flow` reproduces Ember's relaxation: the right target speed
+and time constant within 5% at 32³ and 2% at 64³. What the fill bakes reach,
+0.68 to 0.74 m/s, is the inlet's drag on a domain whose every cell moves; it
+is a property of Mantaflow's open face, not of the mapping.
+
+**Check with an emitter: `plume_wind` at 64³.** Mantaflow through
+`tests/bench/mantaflow_scene.py` (scene JSON from `benchmark scene-json`),
+Ember through the same `Scene::plume_wind(64)` that `benchmark ember
+plume_wind 64` runs (at 4345f9a; its mass and centroid height matched the
+benchmark's CSV to every printed digit). Drift is the density centroid's x
+minus the no-wind `plume`'s, which is 1.0000 m in both solvers:
+
+| Frame | Ember drift (m) | Ember mass | Mantaflow drift (m) | Mantaflow mass |
+|---|---|---|---|---|
+| 12 | +0.073 | 0.0169 | +0.031 | 0.0164 |
+| 24 | +0.246 | 0.0337 | +0.145 | 0.0341 |
+| **30** | **+0.355** | 0.0421 | **+0.219** | 0.0432 |
+| 36 | +0.474 | 0.0506 | +0.296 | 0.0521 |
+| 48 | +0.564 | 0.0475 | +0.448 | 0.0696 |
+| **60** | **+0.517** | 0.0385 | **+0.564** | 0.0799 |
+
+Both drift +x. The drifts differ early (Ember's is 1.6× Mantaflow's at
+frame 30) and meet by frames 48–60. Ember's smoke moves sooner, because its
+whole domain of air is set moving, while Mantaflow drags only the smoke and
+the smoke must push the still air around it. From frame 36 Ember's smoke
+leaves through the +x face (its mass falls while it is still emitting), so
+its centroid then stops describing the whole plume, and its frame-60 drift
+is below its frame-48 one. Mantaflow keeps most of its smoke to frame 60 and
+loses it later (0.0319 at frame 80). The earlier, uniform-acceleration wind
+drifted +0.368 m (Ember) and +0.413 m (Mantaflow) by frame 60.
+
 ### Force fields act only on smoke
 
 Mantaflow applies a force field only in cells that hold smoke:
 `update_effectors_task_cb` in `source/blender/blenkernel/intern/fluid.cc`
 skips every cell whose density (or fuel, when fire is active) is below
-`FLT_EPSILON`, and cells inside obstacles. Ember's wind accelerates every
-cell. **`plume_wind` is kept as it is.** Its results must say that
-Mantaflow's wind pushes only the smoke, while Ember's pushes all the air, so
-the drift compares shape, not a matched force field. The wind force is also
-added once per solver step with no dt, so the mapping holds only for one step
-per frame, which every bench scene uses.
+`FLT_EPSILON`, and cells inside obstacles. This holds for the `flow` drag
+too. Ember's air relaxes towards the ambient airflow in every cell.
+**`plume_wind` is kept as it is.** Its results must say that Mantaflow's
+wind drags only the smoke towards the airflow, while Ember's moves all the
+air, so the drift compares shape, not a matched force field. The wind force
+is also computed once a frame and added once per solver step with no dt, so
+the mapping holds only for one step per frame, which every bench scene uses.
 
 ### Other solver notes
 

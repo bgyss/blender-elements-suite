@@ -236,6 +236,15 @@ pub fn cpu_advect(
     out
 }
 
+/// Mirrors `beyond_open` in `maccormack.wgsl`: a cell-grid position past
+/// the last cell centre towards an open face.
+fn beyond_open(cells: FieldDims, mask: u32, p: [f32; 3]) -> bool {
+    let n = [cells.x, cells.y, cells.z];
+    (0..3).any(|a| {
+        (p[a] < 0.0 && is_open(mask, a, 0)) || (p[a] > n[a] as f32 - 1.0 && is_open(mask, a, 1))
+    })
+}
+
 /// Mirrors `advect.wgsl`'s forward and backward passes and `maccormack.wgsl`.
 pub fn cpu_maccormack(
     faces: &[Vec<f32>; 3],
@@ -259,10 +268,19 @@ pub fn cpu_maccormack(
                 }
                 let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
                 let b = backtrace(faces, cells, x, k);
+                let at = index(d, i, j, kk);
+                // A cell whose trace reaches past an open face takes q̂.
+                let ahead = backtrace(faces, cells, x, -k);
+                if matches!(grid, Grid::Cell)
+                    && (beyond_open(cells, mask, sub(b, off))
+                        || beyond_open(cells, mask, sub(ahead, off)))
+                {
+                    out[at] = fwd[at] * decay;
+                    continue;
+                }
                 let (c, _) = corners(src, d, grid_open(grid, mask), sub(b, off));
                 let lo = c.iter().copied().fold(c[0], f32::min);
                 let hi = c.iter().copied().fold(c[0], f32::max);
-                let at = index(d, i, j, kk);
                 let corrected = fwd[at] + 0.5 * (src[at] - bwd[at]);
                 out[at] = corrected.max(lo).min(hi) * decay;
             }

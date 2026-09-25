@@ -1,5 +1,8 @@
-// Wind (2b-2 spec §3.4): u += h·a on one axis's faces, where a is the wind
-// along that axis. Wall faces stay as they are.
+// Wind (2b-3c spec §6): the air relaxes towards an ambient airflow,
+// u += (w − u)·blend on one axis's faces, where w is the wind velocity along
+// that axis and blend = 1 − exp(−rate·h). The emitter's velocity blend has
+// the same form: exact for any h, so it never carries u past w. Wall faces
+// stay as they are.
 
 @group(0) @binding(0) var face: texture_storage_3d<r32float, read_write>;
 @group(0) @binding(1) var<uniform> params: Params;
@@ -16,6 +19,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (is_wall(axis, gid[axis]) || face_solid(axis, p)) {
         return;
     }
-    let u = textureLoad(face, p).x + params.h * params.face_accel;
+    let u0 = textureLoad(face, p).x;
+    let u = u0 + (params.face_wind - u0) * params.wind_blend;
     textureStore(face, p, vec4<f32>(u, 0.0, 0.0, 0.0));
 }
