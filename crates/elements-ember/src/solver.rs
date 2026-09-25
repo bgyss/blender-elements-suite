@@ -37,6 +37,14 @@ pub const TEMPERATURE: &str = "temperature";
 const PRESSURE: &str = "pressure";
 const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
 
+/// Blender's fire defaults in Ember's units at 24 fps
+/// (`tests/bench/mapping.py` `EMBER_FIRE_DEFAULTS`, 2b-4 spec §4.3).
+pub const DEFAULT_BURNING_RATE: f32 = 1.875;
+pub const DEFAULT_FLAME_SMOKE: f32 = 1.0;
+pub const DEFAULT_FLAME_VORTICITY: f32 = 12.0;
+pub const DEFAULT_IGNITION_TEMPERATURE: f32 = 1.5;
+pub const DEFAULT_MAX_TEMPERATURE: f32 = 3.0;
+
 const MAX_SUBSTEPS: u32 = 16;
 const MAX_PRESSURE_ITERATIONS: u32 = 1000;
 const MAX_PRESSURE_CYCLES: u32 = 64;
@@ -89,6 +97,11 @@ impl Quality {
             pressure_solver: PressureSolver::Mgpcg,
             pressure_cycles,
             conserve_mass: true,
+            burning_rate: DEFAULT_BURNING_RATE,
+            flame_smoke: DEFAULT_FLAME_SMOKE,
+            flame_vorticity: DEFAULT_FLAME_VORTICITY,
+            ignition_temperature: DEFAULT_IGNITION_TEMPERATURE,
+            max_temperature: DEFAULT_MAX_TEMPERATURE,
         }
     }
 }
@@ -167,6 +180,19 @@ pub struct SolverParams {
     /// and cold emitters) is left uncorrected for that substep, since a
     /// proportional rescale assumes values of one sign.
     pub conserve_mass: bool,
+    /// Fuel burnt per second where there is fuel (2b-4 spec §3.2). Fire
+    /// parameters act only while the fuel input is connected.
+    pub burning_rate: f32,
+    /// Smoke made per unit of fuel burnt, Mantaflow's `flame_smoke` factor.
+    pub flame_smoke: f32,
+    /// Extra vorticity confinement per unit fuel, 1/s: the per-cell
+    /// strength is `vorticity + flame_vorticity · fuel`.
+    pub flame_vorticity: f32,
+    /// Temperature at the flame's edge (flame → 0).
+    pub ignition_temperature: f32,
+    /// Temperature at the flame's core (flame = 1); at least
+    /// `ignition_temperature`.
+    pub max_temperature: f32,
 }
 
 impl Default for SolverParams {
@@ -201,6 +227,11 @@ struct DocParams {
     pressure_solver: Option<PressureSolver>,
     pressure_cycles: Option<u32>,
     conserve_mass: Option<bool>,
+    burning_rate: Option<f32>,
+    flame_smoke: Option<f32>,
+    flame_vorticity: Option<f32>,
+    ignition_temperature: Option<f32>,
+    max_temperature: Option<f32>,
 }
 
 /// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
@@ -252,6 +283,13 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
         pressure_solver: doc.pressure_solver.unwrap_or(preset.pressure_solver),
         pressure_cycles: doc.pressure_cycles.unwrap_or(preset.pressure_cycles),
         conserve_mass: doc.conserve_mass.unwrap_or(preset.conserve_mass),
+        burning_rate: doc.burning_rate.unwrap_or(preset.burning_rate),
+        flame_smoke: doc.flame_smoke.unwrap_or(preset.flame_smoke),
+        flame_vorticity: doc.flame_vorticity.unwrap_or(preset.flame_vorticity),
+        ignition_temperature: doc
+            .ignition_temperature
+            .unwrap_or(preset.ignition_temperature),
+        max_temperature: doc.max_temperature.unwrap_or(preset.max_temperature),
     };
     validate(&p)?;
     Ok(p)
@@ -317,6 +355,28 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
             "vorticity and dissipation rates must be at least 0",
         ));
     }
+    let fire = [p.burning_rate, p.flame_smoke, p.flame_vorticity];
+    params::finite(KIND, "fire rates", &fire)?;
+    if fire.iter().any(|&r| r < 0.0) {
+        return Err(params::bad(
+            KIND,
+            "burning_rate, flame_smoke and flame_vorticity must be at least 0",
+        ));
+    }
+    params::finite(
+        KIND,
+        "flame temperatures",
+        &[p.ignition_temperature, p.max_temperature],
+    )?;
+    if p.ignition_temperature > p.max_temperature {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "ignition_temperature {} is above max_temperature {}",
+                p.ignition_temperature, p.max_temperature
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -344,6 +404,11 @@ impl SolverParams {
             wind_velocity: self.wind_velocity,
             wind_rate: self.wind_rate,
             conserve_mass: self.conserve_mass,
+            burning_rate: self.burning_rate,
+            flame_smoke: self.flame_smoke,
+            flame_vorticity: self.flame_vorticity,
+            ignition_temperature: self.ignition_temperature,
+            max_temperature: self.max_temperature,
             ..StepConstants::new(cells, h, dx)
         }
     }

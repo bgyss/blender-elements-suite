@@ -63,6 +63,18 @@ pub struct StepConstants {
     /// Whether each scalar advection is followed by the global mass
     /// correction (2b-3c spec §5).
     pub conserve_mass: bool,
+    /// Whether this substep burns fuel: the solver's fuel input is
+    /// connected (2b-4 spec §3). Off, every fire field below is ignored.
+    pub fire: bool,
+    /// Fuel burnt per second.
+    pub burning_rate: f32,
+    /// Smoke per unit fuel burnt.
+    pub flame_smoke: f32,
+    /// Confinement per unit fuel, 1/s.
+    pub flame_vorticity: f32,
+    /// The flame's edge and core temperatures.
+    pub ignition_temperature: f32,
+    pub max_temperature: f32,
 }
 
 impl StepConstants {
@@ -86,11 +98,17 @@ impl StepConstants {
             wind_rate: 0.0,
             has_solids: false,
             conserve_mass: false,
+            fire: false,
+            burning_rate: 0.0,
+            flame_smoke: 0.0,
+            flame_vorticity: 0.0,
+            ignition_temperature: 0.0,
+            max_temperature: 0.0,
         }
     }
 }
 
-/// Matches `Params` in `common.wgsl`, 64 bytes.
+/// Matches `Params` in `common.wgsl`, 96 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct KernelParams {
@@ -108,12 +126,18 @@ struct KernelParams {
     face_wind: f32,
     has_solids: u32,
     wind_blend: f32,
+    flame_confinement: f32,
+    burn: f32,
+    flame_smoke: f32,
+    ignition_temperature: f32,
+    max_temperature: f32,
+    _pad: [u32; 3],
 }
 
-// `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
+// `Params` in `shaders/common.wgsl` is 96 bytes; a field added here without
 // its WGSL twin (or padding) fails the build instead of silently shifting
 // every uniform the kernels read.
-const _: () = assert!(std::mem::size_of::<KernelParams>() == 64);
+const _: () = assert!(std::mem::size_of::<KernelParams>() == 96);
 
 pub(crate) fn axis_index(axis: Axis) -> u32 {
     match axis {
@@ -165,6 +189,18 @@ impl Uniforms {
                 // The fraction of the way to the wind one substep closes:
                 // exact for any h, so the stage cannot overshoot.
                 wind_blend: 1.0 - (-c.wind_rate * c.h).exp(),
+                // Fire off leaves both at 0, so confinement and the burn
+                // are exactly what they were before fire (2b-4 spec §3.4).
+                flame_confinement: if c.fire {
+                    c.flame_vorticity * c.dx
+                } else {
+                    0.0
+                },
+                burn: if c.fire { c.burning_rate * c.h } else { 0.0 },
+                flame_smoke: c.flame_smoke,
+                ignition_temperature: c.ignition_temperature,
+                max_temperature: c.max_temperature,
+                _pad: [0; 3],
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {

@@ -141,6 +141,63 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(serde_json::json!({ "pressure_cycles": 65 })));
 }
 
+#[test]
+fn fire_parameters_are_validated() {
+    for bad in [
+        serde_json::json!({ "burning_rate": -1.0 }),
+        serde_json::json!({ "flame_smoke": -0.5 }),
+        serde_json::json!({ "flame_vorticity": -2.0 }),
+        serde_json::json!({ "burning_rate": 1e39 }),
+        serde_json::json!({ "ignition_temperature": 3.0, "max_temperature": 1.5 }),
+    ] {
+        assert!(rejected(bad.clone()), "{bad} was accepted");
+    }
+    let p = resolve_params(&serde_json::json!({
+        "burning_rate": 2.0, "flame_smoke": 0.5, "flame_vorticity": 3.0,
+        "ignition_temperature": 1.0, "max_temperature": 1.0 }))
+    .unwrap();
+    assert_eq!(
+        (
+            p.burning_rate,
+            p.flame_smoke,
+            p.flame_vorticity,
+            p.ignition_temperature,
+            p.max_temperature
+        ),
+        (2.0, 0.5, 3.0, 1.0, 1.0)
+    );
+}
+
+#[test]
+fn fire_defaults_are_blenders_mapped_and_the_same_in_both_presets() {
+    use elements_ember::solver::{
+        DEFAULT_BURNING_RATE, DEFAULT_FLAME_SMOKE, DEFAULT_FLAME_VORTICITY,
+        DEFAULT_IGNITION_TEMPERATURE, DEFAULT_MAX_TEMPERATURE, Quality,
+    };
+    // tests/bench/mapping.py EMBER_FIRE_DEFAULTS (Task 1).
+    assert_eq!(DEFAULT_BURNING_RATE, 1.875);
+    assert_eq!(DEFAULT_FLAME_SMOKE, 1.0);
+    assert_eq!(DEFAULT_FLAME_VORTICITY, 12.0);
+    assert_eq!(
+        (DEFAULT_IGNITION_TEMPERATURE, DEFAULT_MAX_TEMPERATURE),
+        (1.5, 3.0)
+    );
+    for q in [Quality::Preview, Quality::Final] {
+        let p = q.params();
+        assert_eq!(
+            (
+                p.burning_rate,
+                p.flame_smoke,
+                p.flame_vorticity,
+                p.ignition_temperature,
+                p.max_temperature
+            ),
+            (1.875, 1.0, 12.0, 1.5, 3.0),
+            "{q:?}"
+        );
+    }
+}
+
 /// 2b-3c spec §6: `wind` was an acceleration and is gone. A document still
 /// using it must fail, and the message must name what replaced it.
 #[test]
@@ -193,7 +250,9 @@ fn step_constants_carry_every_solver_parameter() {
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
         "boundaries": { "-x": "open" },
         "wind_velocity": [0.5, 0.0, -1.0], "wind_rate": 2.5,
-        "conserve_mass": false
+        "conserve_mass": false,
+        "burning_rate": 2.0, "flame_smoke": 0.5, "flame_vorticity": 3.0,
+        "ignition_temperature": 1.0, "max_temperature": 2.0
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -207,6 +266,12 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.wind_velocity, [0.5, 0.0, -1.0]);
     assert_eq!(c.wind_rate, 2.5);
     assert!(!c.conserve_mass);
+    assert!(!c.fire, "step_constants never turns fire on");
+    assert_eq!(c.burning_rate, 2.0);
+    assert_eq!(c.flame_smoke, 0.5);
+    assert_eq!(c.flame_vorticity, 3.0);
+    assert_eq!(c.ignition_temperature, 1.0);
+    assert_eq!(c.max_temperature, 2.0);
     let on = resolve_params(&serde_json::json!({})).unwrap();
     assert!(
         on.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125)
