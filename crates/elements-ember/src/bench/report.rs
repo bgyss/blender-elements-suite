@@ -11,6 +11,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::FrameMetrics;
+use crate::solver::{PressureSolve, PressureSolver, Quality};
 
 /// One solver's run of one scene at one resolution.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -382,6 +383,15 @@ fn sig(v: f64) -> String {
     }
 }
 
+/// A pressure solve as the report names it, e.g. "MGPCG ×4".
+pub fn pressure_label(p: PressureSolve) -> String {
+    match p {
+        PressureSolve::GaussSeidel(n) => format!("Gauss–Seidel ×{n}"),
+        PressureSolve::Multigrid(n) => format!("multigrid V-cycles ×{n}"),
+        PressureSolve::Mgpcg(n) => format!("MGPCG ×{n}"),
+    }
+}
+
 /// What every number in the table does and does not compare
 /// (`docs/bench/mantaflow-notes.md`). The emitted-mass comparison is
 /// computed from the runs, so it cannot go stale when they are redone.
@@ -401,6 +411,18 @@ fn notes<'a>(find: &impl Fn(&str, &str, u32) -> Option<&'a RunSummary>) -> Strin
         ratio(cut_off..=cut_off),
     );
     let floor = MASS_FLOOR;
+    let preview = Quality::Preview.params();
+    let preview_pressure = pressure_label(preview.pressure());
+    let preview_method = if preview.pressure_solver == PressureSolver::Mgpcg {
+        "the same method for a fixed count"
+    } else {
+        "a fixed count"
+    };
+    let preview_mass = if preview.conserve_mass {
+        ", and then its global mass correction on density and temperature"
+    } else {
+        ", with no mass correction"
+    };
     format!(
         "## Notes\n\n\
 - **Velocity metrics** (divergence, kinetic energy, vorticity) cover only measured cells: \
@@ -419,8 +441,8 @@ towards the ambient airflow in every cell. `plume_wind` compares the plume's sha
 frame 24), not added at Ember's rate, so Mantaflow's emitter is hotter before frame 24 and \
 cooler after it. Plume centroid and top carry that difference. {emitted}\n\
 - **Pressure.** Mantaflow solves with multigrid-preconditioned conjugate gradients to a \
-tolerance; Ember runs the same method for a fixed count, the preview preset's MGPCG ×4 per \
-substep, and then its global mass correction on density and temperature.\n\
+tolerance; Ember runs {preview_method}, the preview preset's {preview_pressure} per \
+substep{preview_mass}.\n\
 - **Drift** is (mass inside the outflow planes + outflow since frame 60) − that mass at frame \
 60, with outflow estimated at frame resolution as the net upwind flux out through a plane two \
 cells in from each open face (the top, and in `plume_wind` both x sides), and mass summed \

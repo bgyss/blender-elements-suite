@@ -5,7 +5,8 @@
 //! over fluid cells, so `r = div − A p` is the multigrid residual. The
 //! V-cycle from zero is symmetric, so it is a valid preconditioner, and CG
 //! converges where plain V-cycles do not: around thin colliders, a one-cell
-//! wall vanishes on coarse levels and plain cycles diverge slowly.
+//! wall vanishes on coarse levels and plain cycles nearly stall (about 2%
+//! per cycle).
 //!
 //! Every scalar stays on the GPU (`shaders/pcg.wgsl`): the dot products
 //! reduce into slots of one `ReduceTarget`, and the update kernels compute α

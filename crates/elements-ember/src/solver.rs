@@ -162,7 +162,10 @@ pub struct SolverParams {
     /// totals change only by what left through open faces, what solids
     /// removed and dissipation (2b-3c spec §5). The correction is global:
     /// it removes advection's net gain or loss, spread over the field in
-    /// proportion to each cell's value, and cannot fix where mass sits.
+    /// proportion to each cell's value, and cannot fix where mass sits. A
+    /// field with any negative cell before advection (temperature with hot
+    /// and cold emitters) is left uncorrected for that substep, since a
+    /// proportional rescale assumes values of one sign.
     pub conserve_mass: bool,
 }
 
@@ -451,8 +454,11 @@ impl<'a> Sources<'a> {
     }
 }
 
-/// One substep being recorded. Every stage records into one batch, so a
-/// substep is one queue submission (spec §3).
+/// One substep being recorded. Every stage records into one batch, which is
+/// submitted once at the end (spec §3). The pressure solve may flush it
+/// part-way: MGPCG and plain V-cycles once per iteration, and Gauss–Seidel
+/// in chunks of `iterations_per_submit` sweeps, to stay inside GPU watchdog
+/// limits. Order is unchanged either way.
 ///
 /// A field a stage replaces cannot go back to the pool until the batch has
 /// run, or a later stage could be handed the same texture while an earlier
@@ -463,7 +469,9 @@ pub struct Substep {
     uniforms: Uniforms,
     batch: ComputeBatch,
     retired: Vec<Field>,
-    /// The mass corrections' slots, kept with `retired` until the batch runs.
+    /// The mass corrections' slots. The bind groups that read them already
+    /// keep their buffers alive until the batch has run; holding them here
+    /// until `submit` or `abandon` as well is belt-and-braces.
     targets: Vec<ReduceTarget>,
     advection: Advection,
     vorticity: bool,
@@ -488,6 +496,7 @@ impl Substep {
 
     /// Dispatches recorded and not yet flushed, for tests that count the
     /// work a stage adds.
+    #[doc(hidden)]
     pub fn recorded_dispatches(&self) -> usize {
         self.batch.len()
     }
@@ -677,23 +686,18 @@ impl Substep {
             PressureSolve::GaussSeidel(iterations) => {
                 kernels::solve_pressure(gpu, cache, &mut self.batch, u, p, div, iterations, solids)?
             }
-            PressureSolve::Multigrid(count) | PressureSolve::Mgpcg(count) => {
-                let h = Hierarchy::new(
-                    gpu,
-                    cache,
-                    &mut self.batch,
-                    pool,
-                    &self.constants,
-                    solids.map(|s| s.mask),
-                )?;
-                let solved = match pressure {
-                    PressureSolve::Multigrid(_) => {
-                        kernels::v_cycles(gpu, cache, &mut self.batch, &h, p, div, count)
-                    }
-                    _ => kernels::mgpcg(gpu, cache, &mut self.batch, pool, &h, p, div, count),
-                };
+            PressureSolve::Multigrid(count) => {
+                let h = self.hierarchy(gpu, cache, pool, solids)?;
+                let solved = kernels::v_cycles(gpu, cache, &mut self.batch, &h, p, div, count);
                 // The batch may reference the hierarchy whether or not
                 // recording finished.
+                self.retired.extend(h.into_fields());
+                solved?;
+            }
+            PressureSolve::Mgpcg(count) => {
+                let h = self.hierarchy(gpu, cache, pool, solids)?;
+                let solved = kernels::mgpcg(gpu, cache, &mut self.batch, pool, &h, p, div, count);
+                // As above.
                 self.retired.extend(h.into_fields());
                 solved?;
             }
@@ -706,6 +710,25 @@ impl Substep {
             &state.velocity,
             &state.pressure,
             solids,
+        )
+    }
+
+    /// A multigrid hierarchy for this substep's pressure solve, recorded
+    /// into the batch.
+    fn hierarchy(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+        solids: Option<Solids<'_>>,
+    ) -> Result<Hierarchy, GpuError> {
+        Hierarchy::new(
+            gpu,
+            cache,
+            &mut self.batch,
+            pool,
+            &self.constants,
+            solids.map(|s| s.mask),
         )
     }
 

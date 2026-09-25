@@ -417,6 +417,7 @@ impl Hierarchy {
     /// With solids, level `l`'s fluid fractions φ (none on level 0) and its
     /// prolongation weights (none on the coarsest level), for tests: with an
     /// all-fluid mask the solid path must reduce to the plain one.
+    #[doc(hidden)]
     pub fn solid_weights(&self, l: usize) -> (Option<&Field>, Option<&Field>) {
         let level = &self.levels[l];
         (level.phi.as_ref(), level.norm.as_ref())
@@ -848,6 +849,7 @@ pub fn residual(
 
 /// `residual` on level `level` of `h`, with that level's weights and mask:
 /// `p`, `div` and `out` must have the level's dims. For tests.
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)] // every arg is load-bearing; see the doc above.
 pub fn residual_at(
     gpu: &GpuContext,

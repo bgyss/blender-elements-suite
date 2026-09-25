@@ -1235,7 +1235,8 @@ fn plume_32_divergence_rms(solver: &str) -> f64 {
 
 /// 2b-3c spec §3: four V-cycles leave less divergence in the smoke than 40
 /// red-black Gauss–Seidel iterations, so the document's choice reaches the
-/// projection.
+/// projection. Four MGPCG iterations leave less than four V-cycles (about
+/// 47× less), so `multigrid` and `mgpcg` each reach their own kernel.
 #[test]
 fn multigrid_leaves_less_divergence_than_gauss_seidel() {
     // Every run sets 40 iterations, so a solver choice that were ignored
@@ -1254,6 +1255,7 @@ fn multigrid_leaves_less_divergence_than_gauss_seidel() {
     );
     assert!(multigrid < gauss_seidel, "{multigrid} vs {gauss_seidel}");
     assert!(mgpcg < gauss_seidel, "{mgpcg} vs {gauss_seidel}");
+    assert!(mgpcg < multigrid, "{mgpcg} vs {multigrid}");
 }
 
 /// Like `a_substep_failing_after_retiring_fields_returns_them_all`, with a

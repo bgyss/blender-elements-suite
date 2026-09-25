@@ -658,6 +658,32 @@ fn the_notes_compute_the_emitted_mass_ratio() {
     assert!(md.contains("By frame 60 the ratio is 0.50–1.00×"), "{md}");
 }
 
+#[test]
+fn a_pressure_solve_is_named_with_its_count() {
+    use solver::PressureSolve;
+    assert_eq!(report::pressure_label(PressureSolve::Mgpcg(7)), "MGPCG ×7");
+    assert_eq!(
+        report::pressure_label(PressureSolve::GaussSeidel(160)),
+        "Gauss–Seidel ×160"
+    );
+    assert_eq!(
+        report::pressure_label(PressureSolve::Multigrid(3)),
+        "multigrid V-cycles ×3"
+    );
+}
+
+/// The Pressure note names the preview preset's solve from the preset
+/// itself, so it cannot go stale when the preset changes.
+#[test]
+fn the_notes_name_the_preview_presets_pressure_solve() {
+    let md = report::results_markdown(&all(), &context()).unwrap();
+    let solve = report::pressure_label(solver::Quality::Preview.params().pressure());
+    assert!(
+        md.contains(&format!("the preview preset's {solve} per substep")),
+        "{md}"
+    );
+}
+
 /// Mantaflow's twin is built for a cube (one `dx` in `mapping.py`).
 #[test]
 #[should_panic(expected = "needs a cubic domain")]
