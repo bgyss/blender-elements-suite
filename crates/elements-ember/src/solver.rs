@@ -8,6 +8,12 @@
 //! Each frame first measures the fastest face and picks its substep count
 //! by CFL.
 //!
+//! Input socket 6 is the fuel emission rate (a `Field`); connecting it turns
+//! fire on for the node's lifetime and adds the `fuel` and `react` state
+//! slots alongside velocity, density, temperature and pressure. Output
+//! socket 3 is the flame, `sqrt(clamp(react, 0, 1))`, zero while fire is off
+//! (2b-4 spec §3.1, §4.3).
+//!
 //! The projection's pressure solve is chosen by `pressure_solver`: red-black
 //! Gauss–Seidel for `pressure_iterations` sweeps, or, on a multigrid
 //! hierarchy built each substep, `pressure_cycles` V-cycles or MGPCG
@@ -39,6 +45,14 @@ pub const TEMPERATURE: &str = "temperature";
 /// Holds p. The warm start stays valid when h changes (spec §4.3).
 const PRESSURE: &str = "pressure";
 const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
+
+/// Fuel, while fire is on (2b-4 spec §3.1).
+pub const FUEL: &str = "fuel";
+/// The reaction coordinate, while fire is on.
+pub const REACT: &str = "react";
+const FIRE_SLOTS: [&str; 2] = [FUEL, REACT];
+/// The fuel rate input; connected turns fire on.
+const FUEL_INPUT: u32 = 6;
 
 /// Blender's fire defaults in Ember's units at 24 fps
 /// (`tests/bench/mapping.py` `EMBER_FIRE_DEFAULTS`, 2b-4 spec §4.3).
@@ -1165,10 +1179,13 @@ pub struct SmokeSolver {
 }
 
 impl SmokeSolver {
-    /// Take the four state slots, or a zeroed state on the first step.
-    fn take_state(ctx: &mut EvalCtx<'_>) -> Result<SolverState, NodeError> {
+    /// Take the state slots, or a zeroed state on the first step. With fire
+    /// on the fuel and react slots must be present too, and with it off
+    /// they must be absent: a state from the other mode is `StateShape`,
+    /// which the timeline answers with a reset.
+    fn take_state(ctx: &mut EvalCtx<'_>, fire: bool) -> Result<SolverState, NodeError> {
         let mut taken: Vec<(&'static str, Value)> = Vec::new();
-        for slot in SLOTS {
+        for slot in SLOTS.into_iter().chain(FIRE_SLOTS) {
             match ctx.take_state(slot) {
                 Ok(Some(value)) => taken.push((slot, value)),
                 Ok(None) => {}
@@ -1182,16 +1199,31 @@ impl SmokeSolver {
         }
         if taken.is_empty() {
             let cells = ctx.dims();
-            return ctx
-                .with_gpu_pool(|gpu, cache, pool| SolverState::zeroed(gpu, cache, pool, cells));
+            return ctx.with_gpu_pool(|gpu, cache, pool| {
+                let mut state = SolverState::zeroed(gpu, cache, pool, cells)?;
+                if fire && let Err(e) = state.add_fire(gpu, cache, pool) {
+                    state.release_to(pool);
+                    return Err(e);
+                }
+                Ok(state)
+            });
         }
 
         let node = ctx.node_id();
-        let missing = SLOTS
-            .into_iter()
+        let expected: Vec<&'static str> = if fire {
+            SLOTS.into_iter().chain(FIRE_SLOTS).collect()
+        } else {
+            SLOTS.to_vec()
+        };
+        let missing = expected
+            .iter()
+            .copied()
             .find(|slot| !taken.iter().any(|(name, _)| name == slot));
-        // When every slot is present, name the first one whose value holds
-        // the wrong `Value` variant, rather than always blaming `velocity`.
+        let unexpected = taken
+            .iter()
+            .map(|(name, _)| *name)
+            .find(|name| !expected.contains(name));
+        // Name the first slot holding the wrong `Value` variant.
         let wrong_shape = taken.iter().find_map(|(slot, value)| {
             let matches_shape = if *slot == VELOCITY {
                 matches!(value, Value::VectorField(_))
@@ -1200,37 +1232,51 @@ impl SmokeSolver {
             };
             if matches_shape { None } else { Some(*slot) }
         });
-        let mut values = taken.into_iter().map(|(_, value)| value);
-        match (values.next(), values.next(), values.next(), values.next()) {
-            (
-                Some(Value::VectorField(velocity)),
-                Some(Value::Field(density)),
-                Some(Value::Field(temperature)),
-                Some(Value::Field(pressure)),
-            ) if missing.is_none() => Ok(SolverState {
-                velocity,
-                density,
-                temperature,
-                pressure,
-                fire: None,
-            }),
-            (a, b, c, d) => {
-                for value in [a, b, c, d].into_iter().flatten() {
-                    ctx.release(value);
-                }
-                Err(NodeError::StateShape {
-                    node,
-                    slot: missing.or(wrong_shape).unwrap_or(VELOCITY),
-                })
+        if let Some(slot) = missing.or(unexpected).or(wrong_shape) {
+            for (_, value) in taken {
+                ctx.release(value);
             }
+            return Err(NodeError::StateShape { node, slot });
         }
+        let mut field = |slot: &str| -> Field {
+            let at = taken
+                .iter()
+                .position(|(name, _)| *name == slot)
+                .expect("checked present");
+            match taken.swap_remove(at).1 {
+                Value::Field(f) => f,
+                _ => unreachable!("shapes checked above"),
+            }
+        };
+        let density = field(DENSITY);
+        let temperature = field(TEMPERATURE);
+        let pressure = field(PRESSURE);
+        let fire = fire.then(|| FireState {
+            fuel: field(FUEL),
+            react: field(REACT),
+        });
+        let Some((_, Value::VectorField(velocity))) = taken.pop() else {
+            unreachable!("only velocity remains")
+        };
+        Ok(SolverState {
+            velocity,
+            density,
+            temperature,
+            pressure,
+            fire,
+        })
     }
 
     fn put_state(ctx: &mut EvalCtx<'_>, state: SolverState) -> Result<(), NodeError> {
         ctx.put_state(VELOCITY, Value::VectorField(state.velocity))?;
         ctx.put_state(DENSITY, Value::Field(state.density))?;
         ctx.put_state(TEMPERATURE, Value::Field(state.temperature))?;
-        ctx.put_state(PRESSURE, Value::Field(state.pressure))
+        ctx.put_state(PRESSURE, Value::Field(state.pressure))?;
+        if let Some(fire) = state.fire {
+            ctx.put_state(FUEL, Value::Field(fire.fuel))?;
+            ctx.put_state(REACT, Value::Field(fire.react))?;
+        }
+        Ok(())
     }
 
     fn run(&self, ctx: &mut EvalCtx<'_>, state: &mut SolverState) -> Result<Vec<Value>, NodeError> {
@@ -1241,6 +1287,9 @@ impl SmokeSolver {
         if pair(ctx, 4, 5)? {
             wanted.extend([4, 5]);
         }
+        if ctx.input_connected(FUEL_INPUT) {
+            wanted.push(FUEL_INPUT);
+        }
         let inputs = take_listed(ctx, &wanted)?;
         let stepped = self.step(ctx, state, &inputs);
         for (_, value) in inputs {
@@ -1250,8 +1299,9 @@ impl SmokeSolver {
 
         // The outputs are copies: the state stays in the store for the next
         // frame. Outputs nobody reads are not copied at all.
-        let wanted: [bool; 3] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
-        ctx.with_gpu_pool(|gpu, _, pool| copy_outputs(gpu, pool, state, wanted))
+        let wanted: [bool; 4] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
+        let dx = ctx.voxel_size();
+        ctx.with_gpu_pool(|gpu, cache, pool| copy_outputs(gpu, cache, pool, state, wanted, dx))
     }
 
     fn step(
@@ -1295,6 +1345,9 @@ impl SmokeSolver {
             (Some(_), Some(_)) => Some((field(4)?, vector(5)?)),
             _ => None,
         };
+        if find(FUEL_INPUT).is_some() {
+            sources = sources.with_fuel(field(FUEL_INPUT)?);
+        }
         let cells = ctx.dims();
         let dx = ctx.voxel_size();
         let mask = match collider {
@@ -1346,6 +1399,7 @@ impl SmokeSolver {
         }
         let constants = StepConstants {
             has_solids: sources.solids.is_some(),
+            fire: sources.fuel.is_some(),
             ..self
                 .params
                 .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx)
@@ -1374,11 +1428,13 @@ impl Node for SmokeSolver {
                 SocketType::VectorField,
                 SocketType::Field,
                 SocketType::VectorField,
+                SocketType::Field,
             ],
             outputs: vec![
                 SocketType::Field,
                 SocketType::Field,
                 SocketType::VectorField,
+                SocketType::Field,
             ],
         }
     }
@@ -1388,7 +1444,8 @@ impl Node for SmokeSolver {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let mut state = Self::take_state(ctx)?;
+        let fire = ctx.input_connected(FUEL_INPUT);
+        let mut state = Self::take_state(ctx, fire)?;
         match self.run(ctx, &mut state) {
             Ok(outputs) => {
                 Self::put_state(ctx, state)?;
@@ -1418,11 +1475,13 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
 /// `EvalCtx::output_wanted`). On failure, copies already made go back.
 fn copy_outputs(
     gpu: &GpuContext,
+    cache: &mut PipelineCache,
     pool: &mut FieldPool,
     state: &SolverState,
-    wanted: [bool; 3],
+    wanted: [bool; 4],
+    dx: f32,
 ) -> Result<Vec<Value>, GpuError> {
-    let mut outputs: Vec<Value> = Vec::with_capacity(3);
+    let mut outputs: Vec<Value> = Vec::with_capacity(4);
     for (index, wanted) in wanted.into_iter().enumerate() {
         let copied = if !wanted {
             Ok(Value::Scalar(0.0))
@@ -1430,7 +1489,9 @@ fn copy_outputs(
             match index {
                 0 => pool.duplicate(gpu, &state.density).map(Value::Field),
                 1 => pool.duplicate(gpu, &state.temperature).map(Value::Field),
-                _ => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
+                2 => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
+                3 => flame_output(gpu, cache, pool, state, dx).map(Value::Field),
+                _ => unreachable!("only four outputs exist"),
             }
         };
         match copied {
@@ -1444,6 +1505,33 @@ fn copy_outputs(
         }
     }
     Ok(outputs)
+}
+
+/// The flame output: sqrt(react) with fire on, zero without (spec §4.3).
+fn flame_output(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    pool: &mut FieldPool,
+    state: &SolverState,
+    dx: f32,
+) -> Result<Field, GpuError> {
+    let cells = state.density.dims();
+    let Some(fire) = &state.fire else {
+        return pool.acquire_zeroed(gpu, cache, cells);
+    };
+    let dst = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
+    let built = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).and_then(|u| {
+        let mut batch = ComputeBatch::new();
+        kernels::flame(gpu, cache, &mut batch, &u, &fire.react, &dst)?;
+        batch.submit(gpu)
+    });
+    match built {
+        Ok(()) => Ok(dst),
+        Err(e) => {
+            pool.release(dst);
+            Err(e)
+        }
+    }
 }
 
 /// A pooled copy of all three faces. On failure, faces already copied go back to the pool.
