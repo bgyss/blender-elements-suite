@@ -1,6 +1,7 @@
-// Stages 3 and 5: one RK2 semi-Lagrangian pass over one grid, either a
+// Stages 3 and 5: one semi-Lagrangian pass over one grid, either a
 // velocity face (params.axis 0–2) or a cell-centred scalar (params.axis =
-// CELL). MacCormack runs `forward`, then `backward`, then the correction in
+// CELL), traced back by `backtrace` in velocity.wgsl (RK2, or Euler for
+// faces while fire burns). MacCormack runs `forward`, then `backward`, then the correction in
 // `maccormack.wgsl`. Plain semi-Lagrangian runs `semi_lagrangian` alone,
 // which applies the scalar's dissipation too.
 

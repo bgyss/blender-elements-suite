@@ -1,7 +1,13 @@
 // Fuel emission (2b-4 spec §3.2 step 1): fuel += rate·h, and react blends
 // towards 1 by the fresh fuel's share of the new total, as Mantaflow's
 // inflow does (Ember blends towards 1 rather than towards Mantaflow's
-// occupancy-dependent value; spec §3.3).
+// occupancy-dependent value; spec §3.3). Fuel is clamped at MAX_FUEL
+// first, and react blends by Δ over the clamped fuel.
+
+// Mantaflow's inflow clamps a cell's fuel to [0, 10] (docs/bench/mantaflow-notes.md,
+// "Fire"). Without the clamp fuel in an emitter's core keeps growing, and
+// flame vorticity with it (2b-4 spec §3.2 step 1).
+const MAX_FUEL: f32 = 10.0;
 
 @group(0) @binding(0) var fuel: texture_storage_3d<r32float, read_write>;
 @group(0) @binding(1) var react: texture_storage_3d<r32float, read_write>;
@@ -15,7 +21,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let p = vec3<i32>(gid);
     let d = textureLoad(src, p, 0).x * params.h;
-    let f1 = textureLoad(fuel, p).x + d;
+    let f1 = min(textureLoad(fuel, p).x + d, MAX_FUEL);
     textureStore(fuel, p, vec4<f32>(f1, 0.0, 0.0, 0.0));
     if (f1 > 1e-6) {
         let r0 = textureLoad(react, p).x;

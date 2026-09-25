@@ -255,8 +255,28 @@ pub fn velocity_at(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3]) -> [f32
     v
 }
 
-/// Mirrors `backtrace` in `velocity.wgsl`: an RK2 midpoint step. `k` is
-/// direction · h / dx; a negative `k` traces forward in time.
+/// How a backtrace steps: `backtrace` in `velocity.wgsl` takes one Euler
+/// step where the uniform's `euler_faces` is set (velocity faces while fire
+/// burns, 2b-4 spec §3.2 step 5) and the RK2 midpoint otherwise.
+#[derive(Clone, Copy, Debug)]
+pub enum Trace {
+    Rk2,
+    Euler,
+}
+
+/// Mirrors `backtrace` in `velocity.wgsl`. `k` is direction · h / dx; a
+/// negative `k` traces forward in time.
+fn trace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], k: f32, how: Trace) -> [f32; 3] {
+    match how {
+        Trace::Rk2 => backtrace(faces, cells, x, k),
+        Trace::Euler => {
+            let v = velocity_at(faces, cells, x);
+            [x[0] - k * v[0], x[1] - k * v[1], x[2] - k * v[2]]
+        }
+    }
+}
+
+/// The RK2 midpoint step of `backtrace` in `velocity.wgsl`.
 fn backtrace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], k: f32) -> [f32; 3] {
     let v = velocity_at(faces, cells, x);
     let mid = [
@@ -303,7 +323,7 @@ fn is_wall_texel(cells: FieldDims, mask: u32, grid: Grid, ijk: [u32; 3]) -> bool
     }
 }
 
-/// Mirrors `pass_over` in `advect.wgsl`.
+/// Mirrors `pass_over` in `advect.wgsl`, with the RK2 backtrace.
 pub fn cpu_advect(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
@@ -312,6 +332,21 @@ pub fn cpu_advect(
     src: &[f32],
     k: f32,
     decay: f32,
+) -> Vec<f32> {
+    cpu_advect_traced(faces, cells, mask, grid, src, k, decay, Trace::Rk2)
+}
+
+/// `cpu_advect` with the backtrace `how`.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_advect_traced(
+    faces: &[Vec<f32>; 3],
+    cells: FieldDims,
+    mask: u32,
+    grid: Grid,
+    src: &[f32],
+    k: f32,
+    decay: f32,
+    how: Trace,
 ) -> Vec<f32> {
     let d = grid_dims(cells, grid);
     let off = grid_offset(grid);
@@ -323,7 +358,7 @@ pub fn cpu_advect(
                     continue;
                 }
                 let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
-                let b = backtrace(faces, cells, x, k);
+                let b = trace(faces, cells, x, k, how);
                 out[index(d, i, j, kk)] =
                     sample_grid(src, d, grid_open(grid, mask), sub(b, off)) * decay;
             }
@@ -341,7 +376,8 @@ fn beyond_open(cells: FieldDims, mask: u32, p: [f32; 3]) -> bool {
     })
 }
 
-/// Mirrors `advect.wgsl`'s forward and backward passes and `maccormack.wgsl`.
+/// Mirrors `advect.wgsl`'s forward and backward passes and `maccormack.wgsl`,
+/// with the RK2 backtrace.
 pub fn cpu_maccormack(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
@@ -351,8 +387,23 @@ pub fn cpu_maccormack(
     k: f32,
     decay: f32,
 ) -> Vec<f32> {
-    let fwd = cpu_advect(faces, cells, mask, grid, src, k, 1.0);
-    let bwd = cpu_advect(faces, cells, mask, grid, &fwd, -k, 1.0);
+    cpu_maccormack_traced(faces, cells, mask, grid, src, k, decay, Trace::Rk2)
+}
+
+/// `cpu_maccormack` with the backtrace `how` in every pass.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_maccormack_traced(
+    faces: &[Vec<f32>; 3],
+    cells: FieldDims,
+    mask: u32,
+    grid: Grid,
+    src: &[f32],
+    k: f32,
+    decay: f32,
+    how: Trace,
+) -> Vec<f32> {
+    let fwd = cpu_advect_traced(faces, cells, mask, grid, src, k, 1.0, how);
+    let bwd = cpu_advect_traced(faces, cells, mask, grid, &fwd, -k, 1.0, how);
     let d = grid_dims(cells, grid);
     let off = grid_offset(grid);
     let mut out = vec![0.0; d.voxel_count()];
@@ -363,10 +414,10 @@ pub fn cpu_maccormack(
                     continue;
                 }
                 let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
-                let b = backtrace(faces, cells, x, k);
+                let b = trace(faces, cells, x, k, how);
                 let at = index(d, i, j, kk);
                 // A cell whose trace reaches past an open face takes q̂.
-                let ahead = backtrace(faces, cells, x, -k);
+                let ahead = trace(faces, cells, x, -k, how);
                 if matches!(grid, Grid::Cell)
                     && (beyond_open(cells, mask, sub(b, off))
                         || beyond_open(cells, mask, sub(ahead, off)))

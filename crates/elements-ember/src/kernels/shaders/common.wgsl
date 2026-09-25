@@ -22,7 +22,7 @@ struct Params {
     flame_smoke: f32,        // smoke per unit fuel burnt
     ignition_temperature: f32,
     max_temperature: f32,
-    _pad0: u32,
+    euler_faces: u32,        // 1 on face uniforms with fire on: backtrace with one Euler step
     _pad1: u32,
     _pad2: u32,
 };

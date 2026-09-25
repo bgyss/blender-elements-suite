@@ -2,9 +2,11 @@
 //!
 //! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
 //! project, and advect scalars with dissipation, each followed by the mass
-//! correction when `conserve_mass` is set. With fire on, fuel is emitted
-//! and its react blended right after density and temperature, and fuel and
-//! react are advected alongside them, never dissipated (2b-4 spec §3.2).
+//! correction when `conserve_mass` is set. With fire on, fuel is emitted,
+//! clamped at 10, and its react blended right after density and
+//! temperature; velocity faces are traced back with one Euler step rather
+//! than RK2's midpoint; and fuel and react are advected alongside the other
+//! scalars, never dissipated (2b-4 spec §3.2).
 //! Each frame first measures the fastest face and picks its substep count
 //! by CFL.
 //!

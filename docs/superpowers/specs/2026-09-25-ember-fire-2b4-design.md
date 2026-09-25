@@ -196,8 +196,10 @@ failing output recorded.
   T_max; where fuel is 0, temperature is untouched by the burn.
 - **Smoke from burning.** Density added equals the CPU formula summed over
   cells.
-- **No fuel, no flame.** Fire on with `fuel_rate = 0`: flame exactly 0, and
-  velocity, density and temperature bit-identical to the fire-off run.
+- **No fuel, no flame.** Fire on with `fuel_rate = 0`: fuel and flame
+  exactly 0. (Velocity, density and temperature are no longer bit-identical
+  to the fire-off run, since fire on traces velocity faces with Euler,
+  §3.2 step 5.)
 - **Fire off is unchanged.** `plume` frame 40 is bit-identical to a hash
   recorded from the pre-2b-4 build.
 - **Flame vorticity.** With `vorticity = 0`, a fuel-laden swirl gains

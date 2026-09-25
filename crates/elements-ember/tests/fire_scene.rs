@@ -8,7 +8,7 @@ use elements_core::graph::{Document, Graph, NodeError, NodeId, StateStore, Time}
 use elements_ember::bench::{FIRE_FUEL_RATE, Scene};
 use elements_ember::collider::ColliderParams;
 use elements_ember::metrics::centroid_z;
-use elements_ember::solver::{FUEL, REACT};
+use elements_ember::solver::{FUEL, REACT, VELOCITY};
 use elements_ember::transform::{Shape, Transform};
 
 const SOLVER: NodeId = NodeId(1);
@@ -95,6 +95,19 @@ impl Run {
             .read_back(&self.gpu)
             .unwrap()
     }
+
+    /// The solver's velocity state, every face of all three axes.
+    fn velocity(&self) -> Vec<f32> {
+        let v = self
+            .state
+            .get(SOLVER, VELOCITY)
+            .unwrap()
+            .as_vector_field()
+            .unwrap();
+        AXES.iter()
+            .flat_map(|&a| v.face(a).read_back(&self.gpu).unwrap())
+            .collect()
+    }
 }
 
 #[test]
@@ -117,23 +130,18 @@ fn the_flame_output_is_the_square_root_of_react() {
 }
 
 #[test]
-fn fuel_at_zero_rate_changes_nothing() {
-    let mut off = Run::new(&doc(None, 0));
-    let mut on = Run::new(&doc(Some(0.0), 0));
+fn fuel_at_zero_rate_makes_no_fuel_or_flame() {
+    // Fire on at rate 0 is not bit-identical to fire off: with fire on,
+    // velocity faces trace back with one Euler step (2b-4 spec §3.2 step 5),
+    // so density moves differently. What it must not do is make fuel or flame.
+    let mut on = Run::new(&doc(Some(0.0), 3));
     for f in 1..=20 {
-        let (a, b) = (off.frame(f).unwrap(), on.frame(f).unwrap());
-        // IEEE ==, so −0 equals +0.
         assert!(
-            a.iter().zip(&b).all(|(x, y)| x == y),
-            "density differs at frame {f}"
+            on.frame(f).unwrap().iter().all(|&v| v == 0.0),
+            "no fuel, no flame at frame {f}"
         );
+        assert!(on.slot(FUEL).iter().all(|&v| v == 0.0), "fuel at frame {f}");
     }
-    assert!(on.slot(FUEL).iter().all(|&v| v == 0.0));
-    let mut flame = Run::new(&doc(Some(0.0), 3));
-    assert!(
-        flame.frame(1).unwrap().iter().all(|&v| v == 0.0),
-        "no fuel, no flame"
-    );
 }
 
 #[test]
@@ -250,4 +258,32 @@ fn no_fuel_or_flame_enters_a_collider() {
             }
         }
     }
+}
+
+#[test]
+fn the_fire_scene_stays_bounded_at_one_substep() {
+    // At preview's single substep the RK2 velocity backtrace let flame
+    // vorticity amplify a spike at the emitter's corner: NaN by frame 40 at
+    // 32³ (.superpowers/sdd/fire-diagnosis.md). Euler velocity faces while
+    // fire burns, with the fuel clamp, peaked at 9.5 m/s there; Mantaflow
+    // peaks at 15.3.
+    let scene = Scene::fire(32);
+    assert_eq!(scene.solver.max_substeps, 1, "preview's single substep");
+    let mut r = scene_run(&scene, 0);
+    let mut peak = 0.0_f32;
+    for f in 1..=scene.frames {
+        r.frame(f).unwrap();
+        let u = r.velocity();
+        assert!(
+            u.iter().all(|v| v.is_finite()),
+            "velocity is not finite at frame {f}"
+        );
+        let max = u.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        assert!(max < 50.0, "max |u| {max} m/s at frame {f}");
+        peak = peak.max(max);
+    }
+    println!(
+        "fire 32³ peak max |u| over {} frames: {peak} m/s",
+        scene.frames
+    );
 }

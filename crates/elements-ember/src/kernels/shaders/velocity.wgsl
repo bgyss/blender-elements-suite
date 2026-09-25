@@ -8,11 +8,17 @@ fn velocity_at(x: vec3<f32>) -> vec3<f32> {
     );
 }
 
-// RK2 (midpoint) backtrace from `x`, in cell units, over one substep.
-// `direction` 1 traces back in time; -1 traces forward, for MacCormack's
-// backward pass.
+// Backtrace from `x`, in cell units, over one substep. `direction` 1 traces
+// back in time; -1 traces forward, for MacCormack's backward pass. RK2
+// (midpoint) by default; one Euler step where the uniform's `euler_faces`
+// is set, which is velocity faces while fire burns (2b-4 spec §3.2 step 5):
+// at preview's CFL of 5–30 in a fire's core the midpoint lands beside a
+// velocity spike and advects it onto itself, and flame vorticity grows it.
 fn backtrace(x: vec3<f32>, direction: f32) -> vec3<f32> {
     let k = direction * params.h * params.inv_dx;
+    if (params.euler_faces == 1u) {
+        return x - k * velocity_at(x);
+    }
     let mid = x - 0.5 * k * velocity_at(x);
     return x - k * velocity_at(mid);
 }

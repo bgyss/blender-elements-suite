@@ -3,8 +3,9 @@
 mod common;
 
 use common::*;
-use elements_core::gpu::{FieldDims, FieldPool, PipelineCache};
-use elements_ember::kernels::StepConstants;
+use elements_core::gpu::{Field, FieldDims, FieldFormat, FieldPool, PipelineCache};
+use elements_ember::boundaries::DEFAULT_OPEN_MASK;
+use elements_ember::kernels::{Advection, Carried, Pass, StepConstants, advect, maccormack};
 use elements_ember::solver::{PressureSolve, SolverState, Sources, Substep, substep};
 
 const CELLS: FieldDims = FieldDims { x: 8, y: 6, z: 5 };
@@ -113,14 +114,14 @@ fn block_source(cells: FieldDims, rate: f32) -> Vec<f32> {
     out
 }
 
-/// Fuel and react track density bit-for-bit through advection and the mass
-/// correction: they start identical to density (one substep at rate 1/h,
+/// Fuel tracks density bit-for-bit through advection and the mass
+/// correction, and react to within 1e-6 (see the last assertion): they start identical to density (one substep at rate 1/h,
 /// still air, puts density = fuel = react = 1.0 in the block and 0
 /// elsewhere exactly, spec §3.2 step 1), then all three see the same
 /// velocity, the same zero sources, and the same `conserve_mass` for three
 /// more substeps. Nothing but their own field distinguishes them from
-/// density in this setup, so any divergence is a bug in how fuel or react
-/// is carried, not a property of the test data.
+/// density in this setup but react's 1e-6 fuel cut-off, so any other
+/// divergence is a bug in how fuel or react is carried.
 #[test]
 fn fuel_and_react_are_advected_and_mass_corrected_as_density_is() {
     let gpu = gpu();
@@ -181,15 +182,13 @@ fn fuel_and_react_are_advected_and_mass_corrected_as_density_is() {
         fuel_diffs, 0,
         "fuel differs from density at {fuel_diffs} cells"
     );
-    let react_diffs = react
-        .iter()
-        .zip(&density)
-        .filter(|(r, d)| r.to_bits() != d.to_bits())
-        .count();
-    assert_eq!(
-        react_diffs, 0,
-        "react differs from density at {react_diffs} cells"
-    );
+    // React is not bit-exact: the burn zeroes it wherever fuel is at or
+    // below 1e-6 (spec §3.2), even with nothing burning, so trace cells that
+    // fall that low lose their react, and react's global correction then
+    // scales by a factor an ULP away from density's. Since fire traces
+    // velocity with Euler (§3.2 step 5) this pattern reaches such cells, and
+    // react sits within about 1e-7 of density; a carrying bug would not.
+    assert_close(&react, &density, 1e-6, "react against density");
 }
 
 #[test]
@@ -599,7 +598,6 @@ fn a_substep_burns_after_it_emits() {
     );
 }
 
-use elements_core::gpu::FieldFormat;
 use elements_ember::kernels::{confine, curl};
 
 /// Velocity after one confinement pass of `c` on the walled pattern, with
@@ -715,4 +713,163 @@ fn a_substep_confines_with_flame_vorticity_alone() {
         state.read_velocity(&gpu).unwrap()
     };
     assert_ne!(run(0.0), run(4.0), "flame vorticity changed nothing");
+}
+
+// Fuel clamp and the Euler velocity backtrace (2b-4 spec §3.2 steps 1 and 5).
+
+#[test]
+fn emitted_fuel_is_clamped_at_ten() {
+    use elements_ember::kernels::emit_fuel;
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let n = CELLS.voxel_count();
+    // Cell 0 would reach 11.5 and is clamped; cell 1 reaches 3 and is not.
+    let mut f0 = vec![0.0; n];
+    f0[0] = 9.5;
+    f0[1] = 1.0;
+    let mut rate = vec![0.0; n];
+    rate[0] = 8.0; // Δ = 8 · 0.25 = 2
+    rate[1] = 8.0;
+    let fuel = upload(&gpu, &mut pool, CELLS, &f0);
+    let react = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let src = upload(&gpu, &mut pool, CELLS, &rate);
+    let u = Uniforms::new(&gpu, &transport_only()).unwrap();
+    let mut batch = ComputeBatch::new();
+    emit_fuel(&gpu, &mut cache, &mut batch, &u, &fuel, &react, &src).unwrap();
+    batch.submit(&gpu).unwrap();
+    let fuel = fuel.read_back(&gpu).unwrap();
+    let react = react.read_back(&gpu).unwrap();
+    assert_eq!(fuel[0], 10.0, "fuel is clamped at 10");
+    assert_eq!(fuel[1], 3.0, "fuel below the clamp is untouched");
+    assert!(fuel[2..].iter().all(|&f| f == 0.0));
+    // React blends by Δ over the clamped fuel: 2 / 10, and 2 / 3 below it.
+    assert_close(&react[..2], &[0.2, 2.0 / 3.0], 1e-6, "react");
+    assert!(react[2..].iter().all(|&r| r == 0.0));
+}
+
+/// One advection of the velocity pattern's faces through themselves, and of
+/// a density pattern, with `advection`, under `c`'s uniforms.
+fn advect_faces_and_density(c: &StepConstants, advection: Advection) -> ([Vec<f32>; 3], Vec<f32>) {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let velocity = upload_staggered(&gpu, &mut pool, CELLS, &velocity_pattern(CELLS));
+    let density = upload(&gpu, &mut pool, CELLS, &abs_pattern(31));
+    let u = Uniforms::new(&gpu, c).unwrap();
+    let out_faces = pool.acquire_staggered_uninit(&gpu, CELLS).unwrap();
+    let out_density = pool.acquire(&gpu, CELLS, FieldFormat::R32Float).unwrap();
+    let grids: Vec<(Carried, &Field, &Field)> = AXES
+        .iter()
+        .map(|&a| (Carried::Face(a), velocity.face(a), out_faces.face(a)))
+        .chain([(Carried::Density, &density, &out_density)])
+        .collect();
+    for (carried, src, dst) in grids {
+        let mut batch = ComputeBatch::new();
+        match advection {
+            Advection::SemiLagrangian => advect(
+                &gpu,
+                &mut cache,
+                &mut batch,
+                &u,
+                carried,
+                Pass::SemiLagrangian,
+                &velocity,
+                src,
+                dst,
+                None,
+            )
+            .unwrap(),
+            Advection::MacCormack => {
+                let fwd = pool
+                    .acquire(&gpu, src.dims(), FieldFormat::R32Float)
+                    .unwrap();
+                let bwd = pool
+                    .acquire(&gpu, src.dims(), FieldFormat::R32Float)
+                    .unwrap();
+                for (pass, from, to) in [(Pass::Forward, src, &fwd), (Pass::Backward, &fwd, &bwd)] {
+                    advect(
+                        &gpu, &mut cache, &mut batch, &u, carried, pass, &velocity, from, to, None,
+                    )
+                    .unwrap();
+                }
+                maccormack(
+                    &gpu, &mut cache, &mut batch, &u, carried, &velocity, src, &fwd, &bwd, dst,
+                    None,
+                )
+                .unwrap();
+                batch.submit(&gpu).unwrap();
+                pool.release(fwd);
+                pool.release(bwd);
+                continue;
+            }
+        }
+        batch.submit(&gpu).unwrap();
+    }
+    (
+        read_staggered(&gpu, &out_faces),
+        out_density.read_back(&gpu).unwrap(),
+    )
+}
+
+#[test]
+fn velocity_faces_trace_with_euler_only_while_fire_burns() {
+    // k = h / dx = 2, so the pattern's ±0.6 m/s moves up to 1.2 cells: far
+    // enough for the RK2 midpoint and one Euler step to land apart.
+    let off = StepConstants::new(CELLS, 0.25, 0.125);
+    let on = StepConstants { fire: true, ..off };
+    let faces = velocity_pattern(CELLS);
+    let k = off.h / off.dx;
+    for advection in [Advection::SemiLagrangian, Advection::MacCormack] {
+        let (faces_off, density_off) = advect_faces_and_density(&off, advection);
+        let (faces_on, density_on) = advect_faces_and_density(&on, advection);
+        assert!(faces_on != faces_off, "{advection:?}: fire changed no face");
+        // Scalars keep RK2 either way, bit for bit.
+        let moved = density_on
+            .iter()
+            .zip(&density_off)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            moved, 0,
+            "{advection:?}: fire changed density at {moved} cells"
+        );
+        for a in 0..3 {
+            let reference = |how| match advection {
+                Advection::SemiLagrangian => cpu_advect_traced(
+                    &faces,
+                    CELLS,
+                    DEFAULT_OPEN_MASK,
+                    Grid::Face(a),
+                    &faces[a],
+                    k,
+                    1.0,
+                    how,
+                ),
+                Advection::MacCormack => cpu_maccormack_traced(
+                    &faces,
+                    CELLS,
+                    DEFAULT_OPEN_MASK,
+                    Grid::Face(a),
+                    &faces[a],
+                    k,
+                    1.0,
+                    how,
+                ),
+            };
+            let what = format!("{advection:?} face {a}");
+            assert_close(
+                &faces_on[a],
+                &reference(Trace::Euler),
+                1e-5,
+                &format!("{what}, fire on"),
+            );
+            assert_close(
+                &faces_off[a],
+                &reference(Trace::Rk2),
+                1e-5,
+                &format!("{what}, fire off"),
+            );
+        }
+    }
 }

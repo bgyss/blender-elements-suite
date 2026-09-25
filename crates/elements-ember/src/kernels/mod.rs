@@ -66,7 +66,9 @@ pub struct StepConstants {
     /// correction (2b-3c spec §5).
     pub conserve_mass: bool,
     /// Whether this substep burns fuel: the solver's fuel input is
-    /// connected (2b-4 spec §3). Off, every fire field below is ignored.
+    /// connected (2b-4 spec §3). On, velocity faces are also traced back
+    /// with one Euler step instead of RK2's midpoint (§3.2 step 5). Off,
+    /// every fire field below is ignored.
     pub fire: bool,
     /// Fuel burnt per second.
     pub burning_rate: f32,
@@ -133,7 +135,8 @@ struct KernelParams {
     flame_smoke: f32,
     ignition_temperature: f32,
     max_temperature: f32,
-    _pad: [u32; 3],
+    euler_faces: u32,
+    _pad: [u32; 2],
 }
 
 // `Params` in `shaders/common.wgsl` is 96 bytes; a field added here without
@@ -152,9 +155,11 @@ pub(crate) fn axis_index(axis: Axis) -> u32 {
 /// One uniform buffer per grid an advection pass can carry, built once per
 /// substep and shared by every kernel in it.
 pub struct Uniforms {
-    /// One per face axis: `axis` 0, 1, 2 and `decay` 1.
+    /// One per face axis: `axis` 0, 1, 2 and `decay` 1. With fire on they
+    /// set `euler_faces`, so advection traces faces with one Euler step.
     faces: [wgpu::Buffer; 3],
-    /// Cell grids (`axis` = CELL), each with its scalar's `decay`.
+    /// Cell grids (`axis` = CELL), each with its scalar's `decay`. They
+    /// always trace with RK2.
     density: wgpu::Buffer,
     temperature: wgpu::Buffer,
     /// Fuel and react: decay 1, never dissipated (2b-4 spec §3.2).
@@ -172,6 +177,7 @@ pub struct Uniforms {
 
 impl Uniforms {
     pub fn new(gpu: &GpuContext, c: &StepConstants) -> Result<Self, GpuError> {
+        const CELL: u32 = 3; // `CELL` in common.wgsl
         let make = |axis: u32, decay: f32| {
             let params = KernelParams {
                 dims: [c.cells.x, c.cells.y, c.cells.z],
@@ -205,7 +211,11 @@ impl Uniforms {
                 flame_smoke: c.flame_smoke,
                 ignition_temperature: c.ignition_temperature,
                 max_temperature: c.max_temperature,
-                _pad: [0; 3],
+                // Velocity faces trace back with one Euler step while fire
+                // burns; scalars keep RK2, and so does everything with fire
+                // off (2b-4 spec §3.2 step 5).
+                euler_faces: u32::from(c.fire && axis != CELL),
+                _pad: [0; 2],
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -214,7 +224,6 @@ impl Uniforms {
                     usage: wgpu::BufferUsages::UNIFORM,
                 })
         };
-        const CELL: u32 = 3; // `CELL` in common.wgsl
         let (faces, density, temperature, cell) = gpu.scoped(|| {
             (
                 [make(0, 1.0), make(1, 1.0), make(2, 1.0)],

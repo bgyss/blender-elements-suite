@@ -9,7 +9,8 @@ const EMIT_FUEL: &str = concat!(
     include_str!("shaders/emit_fuel.wgsl"),
 );
 
-/// `fuel += src·h`, and react blends towards 1 by the fresh fuel's share
+/// `fuel = min(fuel + src·h, 10)`, Mantaflow's inflow clamp, and react
+/// blends towards 1 by the fresh fuel's share of the clamped total
 /// (spec §3.2 step 1).
 pub fn emit_fuel(
     gpu: &GpuContext,
