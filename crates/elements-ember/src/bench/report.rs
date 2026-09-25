@@ -648,10 +648,10 @@ fn latency_notes(summaries: &[LatencySummary], recipe_load: Option<&str>) -> Str
     };
     let outside = match recipe_load {
         Some(l) => format!(
-            "There was outside load too: before the benchmark started, `vm.loadavg` \
+            "There was outside load too: before the recipe's load wait, `vm.loadavg` \
              (1, 5 and 15 minutes) was `{l}`."
         ),
-        None => "The load before the benchmark started was not recorded.".to_owned(),
+        None => "The load before the recipe's load wait was not recorded.".to_owned(),
     };
     let gaps: Vec<f64> = summaries
         .iter()

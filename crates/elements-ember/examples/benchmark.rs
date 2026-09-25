@@ -590,7 +590,7 @@ fn run_mantaflow_latency(name: &str, res: u32) -> Res<()> {
 
 /// Build `docs/bench/latency.md` from every latency file, or name the
 /// missing ones and fail. `recipe_load` is `sysctl -n vm.loadavg` from
-/// before the benchmark started, when the caller recorded it.
+/// before the recipe's load wait, when the caller recorded it.
 fn latency_report(recipe_load: Option<&str>) -> Res<()> {
     let dir = results_dir();
     let mut summaries = Vec::new();
