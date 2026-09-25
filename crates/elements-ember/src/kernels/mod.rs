@@ -163,6 +163,7 @@ pub struct Uniforms {
     open_mask: u32,
     wind: bool,
     has_solids: bool,
+    fire: bool,
     /// Bound as `solid` and `obstacle` when there are no solids. Kept so it
     /// outlives its view.
     _placeholder: wgpu::Texture,
@@ -248,6 +249,7 @@ impl Uniforms {
             open_mask: c.open_mask,
             wind: c.wind_rate > 0.0,
             has_solids: c.has_solids,
+            fire: c.fire,
             _placeholder: placeholder,
             placeholder_view,
         })
@@ -271,6 +273,11 @@ impl Uniforms {
     /// Whether kernels read a solid mask, as in `StepConstants::has_solids`.
     pub(crate) fn has_solids(&self) -> bool {
         self.has_solids
+    }
+
+    /// Whether fire is on, as in `StepConstants::fire`.
+    pub(crate) fn fire(&self) -> bool {
+        self.fire
     }
 
     /// A 1×1×1 texture bound where a kernel has no mask or no obstacle to read.

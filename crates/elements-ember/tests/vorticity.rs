@@ -95,6 +95,7 @@ fn confinement_matches_the_cpu_reference() {
         &velocity,
         [&omega[0], &omega[1], &omega[2], &omega[3]],
         None,
+        None,
     )
     .unwrap();
     batch.submit(&gpu).unwrap();

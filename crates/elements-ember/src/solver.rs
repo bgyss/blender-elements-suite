@@ -605,7 +605,8 @@ impl Substep {
             retired: Vec::new(),
             targets: Vec::new(),
             advection: constants.advection,
-            vorticity: constants.vorticity > 0.0,
+            vorticity: constants.vorticity > 0.0
+                || (constants.fire && constants.flame_vorticity > 0.0),
             wind: constants.wind_rate > 0.0,
             conserve_mass: constants.conserve_mass,
             fire: constants.fire,
@@ -771,6 +772,11 @@ impl Substep {
             solids,
         )
         .and_then(|()| {
+            let fuel = if self.fire {
+                state.fire.as_ref().map(|f| &f.fuel)
+            } else {
+                None
+            };
             kernels::confine(
                 gpu,
                 cache,
@@ -778,6 +784,7 @@ impl Substep {
                 u,
                 &state.velocity,
                 refs,
+                fuel,
                 solids,
             )
         });

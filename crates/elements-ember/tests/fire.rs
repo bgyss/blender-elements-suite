@@ -456,9 +456,8 @@ fn temperature_clamps_react_above_one_to_max_temperature() {
 /// Spec §3.2: react' = 0 where fuel is at or below 1e-6, even with burning
 /// off (`burn` 0, so `f1 == f0` and the fuel itself is untouched). Cell 0
 /// has fuel just below the threshold (5e-7) with react 0.5; cell 1 has no
-/// fuel at all. Both must have their react zeroed, and since react starts
-/// at 0.5 (no flame) or 0 already, temperature must stay bit-unchanged in
-/// both cells.
+/// fuel at all. Both must have their react zeroed by the fuel-epsilon rule,
+/// so there is no flame and temperature is untouched.
 #[test]
 fn react_is_zeroed_at_or_below_the_fuel_epsilon_even_without_burning() {
     let gpu = gpu();
@@ -598,4 +597,122 @@ fn a_substep_burns_after_it_emits() {
         1e-6,
         "fuel",
     );
+}
+
+use elements_core::gpu::FieldFormat;
+use elements_ember::kernels::{confine, curl};
+
+/// Velocity after one confinement pass of `c` on the walled pattern, with
+/// `fuel` bound when fire is on.
+fn confined(c: &StepConstants, fuel: Option<&[f32]>) -> [Vec<f32>; 3] {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let v = upload_staggered(&gpu, &mut pool, CELLS, &walled_velocity_pattern(CELLS));
+    let omega: Vec<_> = (0..4)
+        .map(|_| pool.acquire(&gpu, CELLS, FieldFormat::R32Float).unwrap())
+        .collect();
+    let omega = [&omega[0], &omega[1], &omega[2], &omega[3]];
+    let fuel = fuel.map(|f| upload(&gpu, &mut pool, CELLS, f));
+    let u = Uniforms::new(&gpu, c).unwrap();
+    let mut batch = ComputeBatch::new();
+    curl(&gpu, &mut cache, &mut batch, &u, &v, omega, None).unwrap();
+    confine(
+        &gpu,
+        &mut cache,
+        &mut batch,
+        &u,
+        &v,
+        omega,
+        fuel.as_ref(),
+        None,
+    )
+    .unwrap();
+    batch.submit(&gpu).unwrap();
+    read_staggered(&gpu, &v)
+}
+
+#[test]
+fn flame_vorticity_on_unit_fuel_is_uniform_confinement() {
+    let n = CELLS.voxel_count();
+    let uniform = confined(
+        &StepConstants {
+            vorticity: 2.0,
+            ..StepConstants::new(CELLS, 0.25, 0.125)
+        },
+        None,
+    );
+    let flame = confined(
+        &StepConstants {
+            fire: true,
+            flame_vorticity: 2.0,
+            ..StepConstants::new(CELLS, 0.25, 0.125)
+        },
+        Some(&vec![1.0; n]),
+    );
+    for a in 0..3 {
+        assert!(
+            uniform[a]
+                .iter()
+                .zip(&flame[a])
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "axis {a}"
+        );
+    }
+}
+
+#[test]
+fn without_fuel_flame_vorticity_does_nothing() {
+    let n = CELLS.voxel_count();
+    let before = walled_velocity_pattern(CELLS);
+    let after = confined(
+        &StepConstants {
+            fire: true,
+            flame_vorticity: 2.0,
+            ..StepConstants::new(CELLS, 0.25, 0.125)
+        },
+        Some(&vec![0.0; n]),
+    );
+    for a in 0..3 {
+        assert!(
+            before[a].iter().zip(&after[a]).all(|(x, y)| x == y),
+            "axis {a} moved with no fuel"
+        );
+    }
+}
+
+#[test]
+fn a_substep_confines_with_flame_vorticity_alone() {
+    // vorticity 0, flame_vorticity > 0, fuel present: velocity must differ
+    // from the same substep with flame_vorticity 0.
+    let run = |fv: f32| {
+        let gpu = gpu();
+        let mut pool = FieldPool::new();
+        let mut cache = PipelineCache::new();
+        let zero = vec![0.0; CELLS.voxel_count()];
+        let src = upload(&gpu, &mut pool, CELLS, &zero);
+        let fuel_src = upload(&gpu, &mut pool, CELLS, &vec![4.0; CELLS.voxel_count()]);
+        let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, CELLS).unwrap();
+        state.add_fire(&gpu, &mut cache, &mut pool).unwrap();
+        let moving = upload_staggered(&gpu, &mut pool, CELLS, &walled_velocity_pattern(CELLS));
+        for face in std::mem::replace(&mut state.velocity, moving).into_faces() {
+            pool.release(face);
+        }
+        let c = StepConstants {
+            flame_vorticity: fv,
+            ..burning()
+        };
+        let mut step = Substep::new(&gpu, &c).unwrap();
+        step.pre_projection(
+            &gpu,
+            &mut cache,
+            &mut pool,
+            &mut state,
+            Sources::new(&src, &src).with_fuel(&fuel_src),
+        )
+        .unwrap();
+        step.submit(&gpu, &mut pool).unwrap();
+        state.read_velocity(&gpu).unwrap()
+    };
+    assert_ne!(run(0.0), run(4.0), "flame vorticity changed nothing");
 }
