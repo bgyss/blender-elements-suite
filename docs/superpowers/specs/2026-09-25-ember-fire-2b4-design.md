@@ -50,9 +50,12 @@ From the smoke script embedded in the Blender binary
 ### 3.1 State
 
 With fire on, the solver keeps two more slots, `fuel` and `react`, both
-cell-centred `R32Float`. `flame` is not stored: it is `sqrt(react)` (0 where
-`react ≤ 0`), computed when the output is copied, which matches step 4
-above. A snapshot for frame N remains the state entering N.
+cell-centred `R32Float`. `flame` is not stored: it is
+`sqrt(clamp(react, 0, 1))`, computed when the output is copied, which
+matches step 4 above. The upper clamp is Ember's (decided 2026-09-25 in
+Task 4): the mass correction can lift react slightly above 1, which would
+otherwise put the flame's heat above `max_temperature`. React itself is
+stored unclamped, and the burn's heat profile uses the same clamped flame. A snapshot for frame N remains the state entering N.
 
 With fire off there are no fire slots. A stored state whose slots do not
 match the document (fuel connected or disconnected since) is a
