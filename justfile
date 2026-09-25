@@ -81,7 +81,7 @@ bench-solver:
 # The Mantaflow benchmark (2b-3 spec). Takes about an hour or more, needs the
 # real GPU and Blender, and is not part of `check`. Writes
 # docs/bench/results/ per run, then docs/bench/results.md from a complete set.
-bench scenes="plume plume_collider plume_wind" resolutions="64 128 256":
+bench scenes="plume plume_collider plume_wind fire" resolutions="64 128 256":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p elements-ember --example benchmark

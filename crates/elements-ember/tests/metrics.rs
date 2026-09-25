@@ -303,3 +303,14 @@ fn drift_is_zero_before_its_start() {
     let d = drift(&[5.0, 6.0, 7.0], &[0.0; 3], 1.0, 1);
     assert_eq!(d, vec![0.0, 0.0, 1.0]);
 }
+
+#[test]
+fn fire_metrics_sum_fuel_and_count_flame_cells() {
+    use elements_ember::metrics::{FLAME_THRESHOLD, fire_metrics};
+    let fuel = [1.0, 2.0, 0.0, 0.5];
+    let flame = [0.0, FLAME_THRESHOLD, 0.5, 0.02];
+    let (mass, volume) = fire_metrics(&fuel, &flame, 0.5);
+    assert_eq!(mass, 3.5 * 0.125);
+    // Strictly above the threshold: two cells.
+    assert_eq!(volume, 2.0 * 0.125);
+}

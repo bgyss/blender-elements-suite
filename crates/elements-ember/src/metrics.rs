@@ -140,6 +140,14 @@ pub struct FrameMetrics {
     /// face (for the top, z-faces at index nz − 2; for −x, x-faces at index
     /// 2), each plane spanning the control volume's cross-section.
     pub outflow_rate: f64,
+    /// Σ fuel dV over every cell, fuel × m³ (2b-4 spec §6.2). `None` in
+    /// scenes without fire, and in result files written before it.
+    #[serde(default)]
+    pub fuel_mass: Option<f64>,
+    /// The volume of cells whose flame is above [`FLAME_THRESHOLD`], m³.
+    /// `None` in scenes without fire, and in result files written before it.
+    #[serde(default)]
+    pub flame_volume: Option<f64>,
 }
 
 /// Face velocities resampled to cell centres: along each axis, the mean of
@@ -357,7 +365,27 @@ pub fn measure(sample: &Sample<'_>) -> FrameMetrics {
         centroid_m: centroid_z(sample.density, c).map(|z| z * dx),
         top_m,
         outflow_rate: flux * dx * dx,
+        fuel_mass: None,
+        flame_volume: None,
     }
+}
+
+/// Flame above which a cell counts as burning (2b-4 spec §6.2).
+pub const FLAME_THRESHOLD: f32 = 0.01;
+
+/// The fire metrics of one frame, from its fuel and flame (x-fastest, one
+/// entry per cell) and voxel edge `dx` metres: (Σ fuel · dx³, the count of
+/// cells with flame strictly above [`FLAME_THRESHOLD`] · dx³).
+///
+/// # Panics
+///
+/// If `fuel` and `flame` differ in length.
+pub fn fire_metrics(fuel: &[f32], flame: &[f32], dx: f64) -> (f64, f64) {
+    assert_eq!(fuel.len(), flame.len(), "one flame value per fuel cell");
+    let dv = dx * dx * dx;
+    let mass = fuel.iter().map(|&f| f as f64).sum::<f64>() * dv;
+    let burning = flame.iter().filter(|&&f| f > FLAME_THRESHOLD).count();
+    (mass, burning as f64 * dv)
 }
 
 /// Mass drift at every frame index from `from` (0-based into the series),

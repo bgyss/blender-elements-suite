@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::FrameMetrics;
+use crate::metrics::{FLAME_THRESHOLD, FrameMetrics};
 use crate::solver::{PressureSolve, PressureSolver, Quality};
 
 /// One solver's run of one scene at one resolution.
@@ -34,7 +34,7 @@ pub struct RunSummary {
     /// Blender's version string for Mantaflow runs; `None` for Ember.
     pub blender: Option<String>,
     /// The Ember commit the run was built from, with `-dirty` for a changed
-    /// tree. The report refuses to mix commits.
+    /// tree. The report refuses to mix commits within a scene.
     pub commit: String,
     /// One entry per frame, frame 1 first.
     pub frames: Vec<FrameMetrics>,
@@ -62,12 +62,12 @@ fn frames_csv(frames: &[FrameMetrics]) -> String {
     let opt = |v: Option<f64>| v.map(|v| v.to_string()).unwrap_or_default();
     let mut out = String::from(
         "frame,divergence_max,divergence_rms,kinetic_energy,vorticity,measured_cells,\
-         mass,mass_inside,centroid_m,top_m,outflow_rate\n",
+         mass,mass_inside,centroid_m,top_m,outflow_rate,fuel_mass,flame_volume\n",
     );
     for (n, f) in frames.iter().enumerate() {
         let _ = writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}",
             n + 1,
             f.divergence_max,
             f.divergence_rms,
@@ -79,6 +79,8 @@ fn frames_csv(frames: &[FrameMetrics]) -> String {
             opt(f.centroid_m),
             opt(f.top_m),
             f.outflow_rate,
+            opt(f.fuel_mass),
+            opt(f.flame_volume),
         );
     }
     out
@@ -101,8 +103,14 @@ pub fn load_average() -> f64 {
         .unwrap_or(-1.0)
 }
 
-/// Every scene, resolution and solver the results table needs (spec §1).
-pub const SCENES: [&str; 3] = ["plume", "plume_collider", "plume_wind"];
+/// Every scene, resolution and solver the results table needs (spec §1;
+/// `fire` from the 2b-4 spec §6.2).
+pub const SCENES: [&str; 4] = ["plume", "plume_collider", "plume_wind", "fire"];
+/// The scenes whose smoke comes from an emitter. In `fire` it comes from
+/// burning, so the emitted-mass note leaves `fire` out.
+pub const SMOKE_SCENES: [&str; 3] = ["plume", "plume_collider", "plume_wind"];
+/// The scenes the latency table needs (2b-3b spec §2), which predates fire.
+pub const LATENCY_SCENES: [&str; 3] = SMOKE_SCENES;
 pub const RESOLUTIONS: [u32; 3] = [64, 128, 256];
 pub const SOLVERS: [&str; 2] = ["ember", "mantaflow"];
 
@@ -166,6 +174,59 @@ pub struct Context {
     pub commit: String,
     pub blender: String,
     pub date: String,
+}
+
+/// The commit each scene's summaries were built from: one commit when
+/// every scene shares it, or else each commit followed by its scenes, in
+/// [`SCENES`] order, e.g. "31cfeb2 (`plume`, `plume_collider`,
+/// `plume_wind`); abc1234 (`fire`)". A scene's table compares its two
+/// solvers, so each scene must come from one commit, and the lines naming
+/// every summary of each scene that mixes commits are the error. Scenes may
+/// differ, since a scene added later is run at a later commit.
+pub fn scene_commits(summaries: &[RunSummary]) -> Result<String, Vec<String>> {
+    let mut scenes: Vec<&str> = SCENES.to_vec();
+    for s in summaries {
+        if !scenes.contains(&s.scene.as_str()) {
+            scenes.push(&s.scene);
+        }
+    }
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut errors = Vec::new();
+    for scene in scenes {
+        let of_scene: Vec<&RunSummary> = summaries.iter().filter(|s| s.scene == scene).collect();
+        if of_scene.is_empty() {
+            continue;
+        }
+        let labelled = of_scene.iter().map(|s| {
+            (
+                format!("{}-{}-{}", s.solver, s.scene, s.resolution),
+                &*s.commit,
+            )
+        });
+        match one_commit(labelled) {
+            Ok(commit) => match groups.iter_mut().find(|(c, _)| *c == commit) {
+                Some((_, names)) => names.push(scene),
+                None => groups.push((commit, vec![scene])),
+            },
+            Err(lines) => errors.extend(lines),
+        }
+    }
+    if !errors.is_empty() {
+        errors.sort();
+        return Err(errors);
+    }
+    Ok(match groups.as_slice() {
+        [] => String::new(),
+        [(commit, _)] => commit.clone(),
+        _ => groups
+            .iter()
+            .map(|(commit, names)| {
+                let names: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+                format!("{commit} ({})", names.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    })
 }
 
 /// The whole table, or the list of result files that are missing. Never a
@@ -246,8 +307,38 @@ pub fn results_markdown(summaries: &[RunSummary], ctx: &Context) -> Result<Strin
         md.push('\n');
     }
 
+    md.push_str(&fire_table(&find));
     md.push_str(&notes(&find));
     Ok(md)
+}
+
+/// The fire scene's fuel and flame at frames 30, 60 and 90 (2b-4 spec §6.2).
+fn fire_table<'a>(find: &impl Fn(&str, &str, u32) -> Option<&'a RunSummary>) -> String {
+    let mut md = String::from(
+        "## `fire`: fuel and flame\n\n\
+         | solver | cells | fuel mass (30 / 60 / 90) | flame volume m³ (30 / 60 / 90) |\n\
+         |---|---|---|---|\n",
+    );
+    for res in RESOLUTIONS {
+        for solver in SOLVERS {
+            let Some(s) = find(solver, "fire", res) else {
+                continue;
+            };
+            let at = |f: fn(&FrameMetrics) -> Option<f64>| {
+                [30, 60, 90]
+                    .map(|n| s.frames.get(n - 1).and_then(f).map_or("—".to_owned(), sig))
+                    .join(" / ")
+            };
+            let _ = writeln!(
+                md,
+                "| {solver} | {res}³ | {} | {} |",
+                at(|m| m.fuel_mass),
+                at(|m| m.flame_volume)
+            );
+        }
+    }
+    md.push('\n');
+    md
 }
 
 /// Ember's mass over Mantaflow's, as the least and greatest ratio over
@@ -258,7 +349,7 @@ fn mass_ratio_range<'a>(
     frames: std::ops::RangeInclusive<usize>,
 ) -> Option<(f64, f64)> {
     let mut range: Option<(f64, f64)> = None;
-    for scene in SCENES {
+    for scene in SMOKE_SCENES {
         for res in RESOLUTIONS {
             let (Some(e), Some(m)) = (find("ember", scene, res), find("mantaflow", scene, res))
             else {
@@ -491,7 +582,7 @@ pub fn latency_markdown(
     };
     let missing: Vec<String> = SOLVERS
         .into_iter()
-        .flat_map(|solver| SCENES.into_iter().map(move |scene| (solver, scene)))
+        .flat_map(|solver| LATENCY_SCENES.into_iter().map(move |scene| (solver, scene)))
         .filter(|(solver, scene)| find(solver, scene).is_none())
         .map(|(solver, scene)| format!("latency-{solver}-{scene}-{res}"))
         .collect();
@@ -515,7 +606,7 @@ pub fn latency_markdown(
         "| run | load before | load after | above {IDLE_LOAD} |\n|---|---|---|---|\n"
     );
     let mut loaded = Vec::new();
-    for scene in SCENES {
+    for scene in LATENCY_SCENES {
         for solver in SOLVERS {
             let s = find(solver, scene).expect("checked above");
             let high = s.load_before > IDLE_LOAD || s.load_after > IDLE_LOAD;
@@ -540,7 +631,7 @@ pub fn latency_markdown(
             loaded.join(", ")
         }
     );
-    for scene in SCENES {
+    for scene in LATENCY_SCENES {
         let e = find("ember", scene).expect("checked above");
         if let Some(n) = e.pipelines_compiled.filter(|&n| n > 0) {
             let _ = writeln!(
@@ -550,7 +641,7 @@ pub fn latency_markdown(
             );
         }
     }
-    for scene in SCENES {
+    for scene in LATENCY_SCENES {
         let e = find("ember", scene).expect("checked above");
         let m = find("mantaflow", scene).expect("checked above");
         let _ = write!(md, "## `{scene}` ({res}³)\n\n");
@@ -629,7 +720,7 @@ fn latency_notes(summaries: &[LatencySummary], recipe_load: Option<&str>) -> Str
     // load_after shows the inheritance directly. Ember reads `sysctl`, which
     // prints two decimals, and Mantaflow Python's full-precision
     // `os.getloadavg`, so they are compared at two decimals.
-    let inherited: Vec<String> = SCENES
+    let inherited: Vec<String> = LATENCY_SCENES
         .windows(2)
         .filter_map(|w| {
             let (m, e) = (find("mantaflow", w[0])?, find("ember", w[1])?);
@@ -779,6 +870,13 @@ of three runs' medians; the min–max range pools every timed frame.\n\
 - **Peak memory** is in MiB (2²⁰ bytes), and the two solvers' figures count different \
 things. Ember's is the field pool's allocated bytes, with the frame cache off: textures only, \
 not buffers, pipelines or the driver. Mantaflow's is Blender's peak resident memory while \
-baking, minus the same scene's peak without a bake.\n"
+baking, minus the same scene's peak without a bake.\n\
+- **Fire.** `fire` emits fuel, not smoke, so its mass, drift, centroid and top describe the \
+smoke made by burning, and it is left out of the emitted-mass comparison above. Mantaflow's \
+burn clamps density to [0, 1] in every cell on every step; Ember does not clamp it. Fuel mass \
+is Σ fuel dV. Mantaflow's cache stores fuel only where it stores density (above 1e-6), so fuel \
+in a cell with no smoke is not counted there. Flame volume is the volume of cells whose flame \
+is above {flame}; both solvers' flame is √react, with Ember's react clamped to [0, 1].\n",
+        flame = FLAME_THRESHOLD,
     )
 }
