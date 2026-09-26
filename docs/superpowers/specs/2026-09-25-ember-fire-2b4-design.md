@@ -1,7 +1,12 @@
 # Ember Piece 2b-4 — Fire Design
 
 **Date:** 2026-09-25
-**Status:** Design approved in conversation; awaiting review of this document.
+**Status:** Complete (2026-09-26). Plan: `docs/superpowers/plans/2026-09-25-ember-fire-2b4.md`.
+Results: the fire benchmark in `docs/bench/results.md` (Fire), the render in
+`docs/bench/render/` (`fire`, verdict pending the user), and the preview cost
+in `docs/bench/presets-fire.md` (103.5 ms under load, open risk (n) in piece
+2's spec §6). While fire burns, velocity is traced with Euler rather than
+MacCormack, and fuel is clamped to [0, 10] at emission.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2), whose list
 included flame. 2b-2 (`2026-09-23-ember-scene-content-2b2-design.md` §1)
 deferred it to this cycle, after the benchmark.
@@ -243,10 +248,14 @@ regenerated with the new rows.
 
 ### 6.3 Render
 
-`just bench-render` gains `fire`: flame drawn as emission (blackbody from
-temperature) over smoke density, the same shader for both solvers. The
-bench's Ember VDB writer adds a `flame` grid. The verdict is recorded as
-2b-3b's was, scoped to what the images show.
+`just bench-render` gains `fire`: flame drawn as emission over smoke
+density, the same shader for both solvers. The emission is `flame` × 8
+coloured by a blackbody at a fixed 1500 K, not by temperature: that was
+changed at plan time so both solvers get the same colour mapping. Ember's
+`flame` grid is baked from the solver's flame output (`benchmark document
+fire RES flame`); Mantaflow's is the `flame` grid its resumable cache
+writes. The verdict is recorded as 2b-3b's was, scoped to what the images
+show.
 
 ### 6.4 Cost
 
