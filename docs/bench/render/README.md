@@ -123,4 +123,4 @@ Each solver has a second Volume object at the same place for its flame. Ember's 
 
 ![fire 128³ frame 90](fire-128-f090.png)
 
-Fire verdict: _pending: recorded by the user_
+Fire verdict: At 128³ the two fires have the same base and reach the top by frame 60, but Ember's flame is a narrower column and burns much longer: at frame 90 it is still alight while Mantaflow's has burned out to smoke (fuel 0.072 against 2e-8). The images compare flame shape, extent and duration; both cores saturate at this flame strength, so they say little about brightness.
