@@ -566,6 +566,208 @@ the mapping holds only for one step per frame, which every bench scene uses.
   does nothing, and the flame-vorticity term that `vorticityConfinement` adds
   (`strengthCell = fuel · flame_vorticity`) is zero.
 
+## Fire (2b-4 Task 1)
+
+Probes for Ember's fire (spec
+`docs/superpowers/specs/2026-09-25-ember-fire-2b4-design.md` §6.1). Blender
+5.2.2, 2026-09-25, the same machine under load. Sources read, never copied:
+`extern/mantaflow/preprocessed/plugin/fire.cpp` (`KnProcessBurn`,
+`KnUpdateFlame`) and `plugin/extforces.cpp` (`KnConfForce`) in
+github.com/blender/blender at `main`, which match
+`source/plugin/fire.cpp` and `extforces.cpp` in github.com/tum-pbs/mantaflow
+(Apache-2.0); `source/blender/blenkernel/intern/fluid.cc`
+(`apply_inflow_fields`); and the generated script (`script=1`).
+
+### Commands
+
+With `B=/Applications/Blender.app/Contents/MacOS/Blender` and
+`P="$B --background --factory-startup --python-exit-code 1 --python tests/bench/probe_mantaflow.py --"`,
+per-frame sums and maxima come from
+`cargo run -p elements-ember --example cache_sums -- DIR RES FRAMES GRID...`
+(`DIR` is the one that holds `data/`):
+
+| Bake | Command |
+|---|---|
+| inventory, smoke-style cache | `$P $S/inv 32 10 fire=1 bench=1 volume=1 surface=0 absolute=0 script=1` |
+| inventory, resumable cache | the same plus `resumable=1` (`$S/inv_r`) |
+| emission | `$P $S/emit 32 10 fire=1 bench=1 volume=1 surface=0 absolute=0 resumable=1 burning=0`, and again with `clipping=0` |
+| burn, smoke and heat | `$P $S/burn 32 14 fill=1 behavior=GEOMETRY fire=1 fuel=1 closed=1 alpha=0 beta=0 burning=0.75 flame_smoke=1 volume=1 resumable=1` |
+
+Which cells each grid stores was read with the `openvdb` module in Blender's
+own Python (`import openvdb`, `copyToArray`, `citerOnValues`), a scratch
+check that is not part of the repository.
+
+### Blender's defaults and ranges
+
+Read back from the inventory bake and from RNA (`bl_rna.properties`):
+
+| Setting | Default | Hard range |
+|---|---|---|
+| domain `burning_rate` | 0.75 | [0.01, 4] |
+| domain `flame_smoke` | 1.0 | [0, 8] |
+| domain `flame_vorticity` | 0.5 | [0, 2] |
+| domain `flame_ignition` | 1.5 | [0.5, 5] |
+| domain `flame_max_temp` | 3.0 | [1, 10] |
+| flow `fuel_amount` | 1.0 | [0, 10] |
+
+**Blender clamps a value outside the range without an error**: the emission
+probe asked for `burning=0` and read back 0.01. `mapping.fire` therefore
+raises for a value outside these ranges.
+
+### Grid inventory: fuel and react need a resumable cache
+
+The generated script puts `flame` in the final data dictionary but `fuel`,
+`react`, `fuel_inflow` and `react_inflow` in the *resume* dictionary, which
+is written only when the cache is resumable. At frame 5 of the 32³
+inventory bakes:
+
+| Grid | default cache | `cache_resumable = True` |
+|---|---|---|
+| `density`, `temperature`, `velocity` | yes (656 voxels) | yes (656) |
+| `flame` | yes (444) | yes (444) |
+| `fuel`, `react` | **absent** | yes (444 each) |
+| `fuel_inflow`, `react_inflow` | absent | yes (348 each) |
+| `heat` | absent (heat is written as `temperature`) | absent |
+| other resume grids | absent | `density_inflow`, `temperature_inflow`, `emission`, `flags`, `phi_*`, `velocity_previous` |
+
+The resumable bake is the same simulation: its density, flame and
+temperature sums equal the default bake's to every printed digit in all ten
+frames. **The benchmark's fire scene must set `cache_resumable = True`** to
+compare fuel. The Rust reader asks for grids by name, so the extra grids do
+no harm.
+
+### Emission: fuel as density's, react as a blend
+
+Fuel is emitted like density's additive inflow. `fluid.cc` adds
+`fuel_amount · emission` to the cell once per frame, clamped to **[0, 10]**
+(not [0, 1] as density is), and a `FIRE` flow emits no density. Its
+temperature is still raised to the flow's (`ADD_IF_LOWER`). Measured in the
+emission bake (`burning` at its minimum, 0.01): `fuel_inflow` at frame 1 is
+140.000000 over the sphere's 140 cells, max 1.000000; and
+`fuel_inflow(f) − fuel(f − 1)` is 140.0000 in every frame 2–10 of the
+`clipping=0` bake. Cells keep accumulating: `fuel_inflow` reached 7.8 per cell by
+frame 8 at `fuel_amount` 1.
+
+**React is not fuel emission added to react (spec §3.2 step 1 is
+contradicted).** `fluid.cc` sets, where `fuel_in > FLT_EPSILON` and
+`value > react`:
+
+    value  = 1 − (1 − emission)²
+    f      = fuel_flow / fuel_in        (fuel_in: the cell's fuel after this emission)
+    react' = clamp(value · f + (1 − f) · react, 0, value)
+
+so react is a fraction in [0, 1] that blends towards `value` by the share of
+the cell's fuel that is fresh. Measured: at frame 1 `react_inflow` = 1 on
+all 140 cells (sum 140.000000); at frame 2, in the emission bake, the
+emitter-centre cell has fuel 0.998958 and react 0.998958 after frame 1, fuel
+1.998958 after emission, and `react_inflow` max 0.999479, which is
+`0.50026 · 1 + 0.49974 · 0.998958` (the additive rule would give 1.998958).
+In the default-rate inventory bake, `react_inflow` max is 0.962525 at frame
+2 against the formula's 0.96253. Over ten frames at fuel_amount 1 the react
+maximum stays below 1 while `fuel_inflow` reaches 7.4. Under the spec's additive rule
+react would equal fuel, `flame = √react` would exceed 1, and the burn would
+write a temperature above `max_temperature`. **Ember must follow
+Mantaflow's blend** (the spec allows this), in Ember's terms per substep:
+with Δ = the fuel emitted into the cell, fuel' = fuel + Δ and `value` from
+the cell's occupancy, `react += (Δ / fuel') · (value − react)` where
+fuel' > 1e-6 and value > react. With a whole-cell occupancy of 1, value = 1.
+
+### Burn rate
+
+The fill bake (a domain-filling `GEOMETRY` fire flow, fuel 1, all walls
+closed, no buoyancy, so nothing moves). Fuel per cell, frame 1 to 13:
+1 − 0.078125 · f exactly (0.921875, 0.843750, 0.765624, …, 0.062497 at frame
+12, then 0). So **d = 0.078125 a frame at `burning_rate` 0.75 and 24 fps;
+d / 0.75 = 0.104167 = 2.5 / 24**, the frame length in time units, as
+`KnProcessBurn`'s `burningRate · dt` says. Ember's rate per second is
+d · fps = 0.75 / 0.4 = **1.875**. React equals fuel in every frame of this
+bake (react starts at 1 and is scaled by fuel' / fuel), and flame is its
+square root: 0.960143 at frame 1, 0.249994 at frame 12.
+
+### Smoke and heat
+
+In the same bake, per interior cell (max = every interior cell; nothing
+moves). The spec's `Δdensity = (0.5 + 0.5 · max(1 − fuel, 0)) · (fuel − fuel') · 0.1 · flame_smoke`
+predicts, with the recorded fuels:
+
+| Frame | fuel before | predicted Δ | cumulative | measured density |
+|---|---|---|---|---|
+| 1 | 1.000000 | 0.00390625 | 0.00390625 | 0.003906 |
+| 2 | 0.921875 | 0.00421143 | 0.00811768 | 0.008118 |
+| 3 | 0.843750 | 0.00451660 | 0.01263428 | 0.012634 |
+| 13 | 0.062497 | 0.00605440 | 0.07307 | 0.073071 |
+
+(frame 13 burns only the 0.0625 left.) The density clamp to [0, 1] in
+`KnProcessBurn` never binds here.
+
+Heat: `(1 − flame) · 1.5 + flame · 3.0` gives 2.940215 at frame 1
+(flame 0.960143) and 1.874991 at frame 12 (flame 0.249994); the measured
+temperature maxima are 2.940215 and 1.874991. At frame 13, with no fuel,
+flame is 0 and temperature stays at 1.874991: the overwrite happens only
+where flame > 0, as the spec says.
+
+### Flame vorticity: `KnConfForce` adds
+
+`KnConfForce` computes `if (strGrid) str += (*strGrid)(i, j, k);` and then
+`force = str · (N × curl)`, with no dx. The generated script fills the
+strength grid with `fuel · flameVorticity · timestep / frameLengthUnscaled`
+(it borrows the `flame` grid for this and recomputes flame after the step)
+and passes `vorticity · timestep / frameLengthUnscaled` as the uniform
+strength. So the per-cell strength is **a sum**, `vorticity + flameVorticity
+· fuel` under the same scaling, which is spec §3.2 step 4's
+`ε + flame_vorticity · fuel`. By `mapping.vorticity`'s derivation Ember's
+equivalent of Mantaflow's `V` is **V · fps** (1/s per unit fuel): 12 for
+Blender's 0.5 at 24 fps. Confirmed from the source, not by a bake.
+
+Mantaflow runs confinement after advection, so the strength uses the
+advected fuel; the burn runs before advection, straight after emission.
+
+### The mapping
+
+`mapping.fire(fuel_rate, burning_rate, flame_vorticity, fps)`, for one solver
+step per frame and an additive flow:
+
+| Quantity | Ember | Mantaflow | Conversion | Confirmed |
+|---|---|---|---|---|
+| Fuel emission | `fuel_rate` per second at occupancy 1 | flow `fuel_amount`, added once a frame | `fuel_amount = fuel_rate / fps`, in [0, 10] | yes: 140.000 a frame into 140 cells |
+| Burn rate | `burning_rate`, fuel per second | domain `burning_rate`, per time unit (0.4 s) | `burning_rate_M = burning_rate · 0.4`, in [0.01, 4] | yes: 0.078125 a frame at 0.75, 24 fps |
+| Flame vorticity | `flame_vorticity`, 1/s per unit fuel | domain `flame_vorticity`, grid units per frame | `flame_vorticity / fps`, in [0, 2] | source only (`KnConfForce` adds) |
+| Flame smoke | `flame_smoke` | domain `flame_smoke` | equal | yes: the smoke table above |
+| Ignition, max temperature | `ignition_temperature`, `max_temperature` | domain `flame_ignition`, `flame_max_temp` | equal | yes: the heat values above |
+
+`mapping.EMBER_FIRE_DEFAULTS` holds Blender's defaults in Ember's units at
+24 fps: `burning_rate` 1.875, `flame_smoke` 1.0, `flame_vorticity` 12.0,
+`ignition_temperature` 1.5, `max_temperature` 3.0.
+
+### Differences from Mantaflow (spec §3.3)
+
+- **Density clamp.** `KnProcessBurn` clamps density to [0, 1] in every cell
+  on every step (fuel or not). Ember does not clamp.
+- **Fuel clamp.** Additive emission clamps a cell's fuel to [0, 10]. Ember
+  does not clamp.
+- **No colour grids** (`flame_smoke_color`).
+- **Units.** Ember's `burning_rate` and `flame_vorticity` are per second;
+  Mantaflow's are per time unit and per frame, converted as above.
+- **React emission** follows Mantaflow's blend (above), not the spec's
+  additive rule.
+
+### What the cache stores where there is fuel
+
+The data file is clipped to density's voxels (`clipGrid = density`, see
+Clipping), and that holds for the fire grids too. In every frame of the
+inventory and emission bakes, `fuel`, `react` and `flame` were never stored
+in a cell without stored density, and velocity was stored on exactly
+density's voxels (no cell with one and not the other). So **the cache stores
+no velocity, and no fuel, where there is fuel but no density**. Burning
+makes density wherever fuel burns, so this loses little: at the default
+rate, `fuel_inflow(f) − fuel(f − 1)` was 140.000 in frames 2–9, so no fuel
+was dropped. At the minimum rate, where density stays tiny, the saved fuel
+at frame 2 was 277.5485 at `clipping` 1e-6 against 277.8176 at 0 (0.1%
+lost in cells whose density was below 1e-6). For `check_coverage` (Task 9)
+this means the existing rule, velocity against density, still covers every
+cell the cache holds; a fuel cell with no density is simply absent, not a
+missing velocity.
+
 ## 256³ run time
 
 Probe scene (sphere inflow, default buoyancy, open borders), 10 frames,

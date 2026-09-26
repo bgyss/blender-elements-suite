@@ -49,7 +49,20 @@ SIDES = {
 }
 
 
-def build_domain(sc: dict, cache_dir: str) -> bpy.types.Object:
+def fire_settings(sc: dict) -> dict | None:
+    """Mantaflow's fire settings for a scene with fire, through mapping.fire;
+    None for a smoke scene."""
+    if not sc.get("fire"):
+        return None
+    return mapping.fire(
+        sc["emitter"]["fuel_rate"],
+        sc["fire"]["burning_rate"],
+        sc["fire"]["flame_vorticity"],
+        sc["fps"],
+    )
+
+
+def build_domain(sc: dict, cache_dir: str, m: dict | None) -> bpy.types.Object:
     size = sc["domain_size"]
     # Ember's domain runs from the origin to (size, size, size).
     bpy.ops.mesh.primitive_cube_add(size=size, location=(size / 2,) * 3)
@@ -87,10 +100,21 @@ def build_domain(sc: dict, cache_dir: str) -> bpy.types.Object:
     # Blender opens all six borders by default; Ember's walls must be closed.
     for side, prop in SIDES.items():
         setattr(d, prop, sc["boundaries"][side] == "wall")
+    if m is not None:
+        # Only a resumable cache writes the fuel and react grids, and it bakes
+        # the same simulation (mantaflow-notes.md, Fire: grid inventory).
+        d.cache_resumable = True
+        # mapping.fire converts the per-second rates (notes, Fire: the mapping).
+        d.burning_rate = m["burning_rate"]
+        d.flame_vorticity = m["flame_vorticity"]
+        # No time unit: equal in both solvers (notes, Fire: smoke and heat).
+        d.flame_smoke = sc["fire"]["flame_smoke"]
+        d.flame_ignition = sc["fire"]["ignition_temperature"]
+        d.flame_max_temp = sc["fire"]["max_temperature"]
     return domain
 
 
-def build_emitter(sc: dict) -> None:
+def build_emitter(sc: dict, m: dict | None) -> None:
     e = sc["emitter"]
     bpy.ops.mesh.primitive_uv_sphere_add(radius=e["radius"], location=e["center"])
     f = bpy.context.active_object.modifiers.new("Fluid", "FLUID")
@@ -103,6 +127,12 @@ def build_emitter(sc: dict) -> None:
     fs.surface_distance = 0.0  # no emission band outside the mesh
     fs.volume_density = 1.0  # emit through the volume, not just the shell
     fs.density, fs.temperature = mapping.inflow(e["density_rate"], e["temperature_rate"], sc["fps"])
+    if m is not None:
+        # A FIRE flow emits fuel and no density; BOTH emits the two (fluid.cc
+        # apply_inflow_fields; notes, Fire: emission).
+        fs.flow_type = "FIRE" if e["density_rate"] == 0 else "BOTH"
+        # Added once a frame like density, clamped to [0, 10] (notes, Fire).
+        fs.fuel_amount = m["fuel_amount"]
     # Mantaflow has no frame range: key "Use Flow" on through the last active
     # frame and off after it. Confirmed by a bake (mantaflow-notes.md, Inflow).
     first, last = e["active_frames"]
@@ -158,8 +188,10 @@ def build(sc: dict, cache_dir: str) -> bpy.types.Object:
         sys.exit(f"Blender's fps is an integer, got {sc['fps']}")
     scene.render.fps = int(sc["fps"])
     scene.render.fps_base = 1.0
-    domain = build_domain(sc, cache_dir)
-    build_emitter(sc)
+    # Mantaflow's fire settings, or None for a smoke scene.
+    fire = fire_settings(sc)
+    domain = build_domain(sc, cache_dir, fire)
+    build_emitter(sc, fire)
     build_collider(sc)
     build_wind(sc)
     return domain

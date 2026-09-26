@@ -7,6 +7,7 @@ whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
 Piece 2b-1 (solver correctness) is complete; see `2026-09-22-ember-solver-2b1-design.md`.
 2b-2 (scene content) is complete; see `2026-09-23-ember-scene-content-2b2-design.md`.
 Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e), the open part of (g), (j) and (k) remain.
+2b-4 (fire) added (n).
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
 ## 1. Goal and split
@@ -361,8 +362,8 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 
 Found by piece 2a's whole-branch review. (a) and (i) were resolved in 2a, and
 (g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). 2b-3c resolved (e) and
-(l). Still open: the open part of (g), (j), (k), which 2b-2 added, and (m),
-which 2b-3c added. Future work that is not a risk is listed after them.
+(l). Still open: the open part of (g), (j), (k), which 2b-2 added, (m),
+which 2b-3c added, and (n), which 2b-4 added. Future work that is not a risk is listed after them.
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
@@ -613,6 +614,15 @@ which 2b-3c added. Future work that is not a risk is listed after them.
   with one-cell walls or thin tubes should be run in `final` or given more
   `pressure_cycles`. An adaptive count, stopping on a residual target, is
   out of scope for now (2b-3c spec §2).
+- **(n) Fire preview cost (2026-09-26, 2b-4).** A 128³ `fire` preview frame
+  at one substep takes 103.5 ms (range 80.5–109.0), over preview's 100 ms
+  budget (`docs/bench/presets-fire.md`). The load average was 10.7 before
+  the run and 6.8 after it, so this is an upper bound, like (k)'s numbers.
+  The benchmark's own 128³ fire frame agrees: 104 ms (`docs/bench/results.md`).
+  The graph read only density; reading the flame output adds one small
+  submit per frame. `plume` at the same settings took 71.5 ms in a
+  separate run under similar load, so fire adds roughly 30 ms, but the two
+  were not measured together. An idle rerun is owed, with (k)'s.
 
 **Future work.**
 

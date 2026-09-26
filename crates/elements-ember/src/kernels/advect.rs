@@ -1,5 +1,6 @@
 //! Advection (stages 3 and 5): RK2 semi-Lagrangian passes, and MacCormack's
-//! correction (spec §4.1).
+//! correction (spec §4.1). With fire on, velocity faces trace back with one
+//! Euler step instead (2b-4 spec §3.2 step 5).
 
 use elements_core::gpu::{
     Axis, ComputeBatch, Field, FieldDims, GpuContext, GpuError, PipelineCache, StaggeredField,
@@ -41,6 +42,10 @@ pub enum Carried {
     Face(Axis),
     Density,
     Temperature,
+    /// Fuel, never dissipated (2b-4).
+    Fuel,
+    /// The reaction coordinate, never dissipated.
+    React,
 }
 
 impl Carried {
@@ -48,7 +53,7 @@ impl Carried {
     fn axis(self) -> Option<Axis> {
         match self {
             Self::Face(axis) => Some(axis),
-            Self::Density | Self::Temperature => None,
+            Self::Density | Self::Temperature | Self::Fuel | Self::React => None,
         }
     }
 
@@ -56,7 +61,7 @@ impl Carried {
     pub fn dims(self, cells: FieldDims) -> FieldDims {
         match self {
             Self::Face(axis) => StaggeredField::face_dims(cells, axis),
-            Self::Density | Self::Temperature => cells,
+            Self::Density | Self::Temperature | Self::Fuel | Self::React => cells,
         }
     }
 }

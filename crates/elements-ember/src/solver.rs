@@ -2,8 +2,19 @@
 //!
 //! Per substep: emit, buoyancy, vorticity confinement, advect velocity,
 //! project, and advect scalars with dissipation, each followed by the mass
-//! correction when `conserve_mass` is set. Each frame first measures
-//! the fastest face and picks its substep count by CFL.
+//! correction when `conserve_mass` is set. With fire on, fuel is emitted,
+//! clamped at 10, and its react blended right after density and
+//! temperature; velocity faces are traced back with one Euler step rather
+//! than RK2's midpoint; and fuel and react are advected alongside the other
+//! scalars, never dissipated (2b-4 spec §3.2).
+//! Each frame first measures the fastest face and picks its substep count
+//! by CFL.
+//!
+//! Input socket 6 is the fuel emission rate (a `Field`); connecting it turns
+//! fire on for the node's lifetime and adds the `fuel` and `react` state
+//! slots alongside velocity, density, temperature and pressure. Output
+//! socket 3 is the flame, `sqrt(clamp(react, 0, 1))`, zero while fire is off
+//! (2b-4 spec §3.1, §4.3).
 //!
 //! The projection's pressure solve is chosen by `pressure_solver`: red-black
 //! Gauss–Seidel for `pressure_iterations` sweeps, or, on a multigrid
@@ -36,6 +47,22 @@ pub const TEMPERATURE: &str = "temperature";
 /// Holds p. The warm start stays valid when h changes (spec §4.3).
 const PRESSURE: &str = "pressure";
 const SLOTS: [&str; 4] = [VELOCITY, DENSITY, TEMPERATURE, PRESSURE];
+
+/// Fuel, while fire is on (2b-4 spec §3.1).
+pub const FUEL: &str = "fuel";
+/// The reaction coordinate, while fire is on.
+pub const REACT: &str = "react";
+const FIRE_SLOTS: [&str; 2] = [FUEL, REACT];
+/// The fuel rate input; connected turns fire on.
+const FUEL_INPUT: u32 = 6;
+
+/// Blender's fire defaults in Ember's units at 24 fps
+/// (`tests/bench/mapping.py` `EMBER_FIRE_DEFAULTS`, 2b-4 spec §4.3).
+pub const DEFAULT_BURNING_RATE: f32 = 1.875;
+pub const DEFAULT_FLAME_SMOKE: f32 = 1.0;
+pub const DEFAULT_FLAME_VORTICITY: f32 = 12.0;
+pub const DEFAULT_IGNITION_TEMPERATURE: f32 = 1.5;
+pub const DEFAULT_MAX_TEMPERATURE: f32 = 3.0;
 
 const MAX_SUBSTEPS: u32 = 16;
 const MAX_PRESSURE_ITERATIONS: u32 = 1000;
@@ -89,6 +116,11 @@ impl Quality {
             pressure_solver: PressureSolver::Mgpcg,
             pressure_cycles,
             conserve_mass: true,
+            burning_rate: DEFAULT_BURNING_RATE,
+            flame_smoke: DEFAULT_FLAME_SMOKE,
+            flame_vorticity: DEFAULT_FLAME_VORTICITY,
+            ignition_temperature: DEFAULT_IGNITION_TEMPERATURE,
+            max_temperature: DEFAULT_MAX_TEMPERATURE,
         }
     }
 }
@@ -167,6 +199,19 @@ pub struct SolverParams {
     /// and cold emitters) is left uncorrected for that substep, since a
     /// proportional rescale assumes values of one sign.
     pub conserve_mass: bool,
+    /// Fuel burnt per second where there is fuel (2b-4 spec §3.2). Fire
+    /// parameters act only while the fuel input is connected.
+    pub burning_rate: f32,
+    /// Smoke made per unit of fuel burnt, Mantaflow's `flame_smoke` factor.
+    pub flame_smoke: f32,
+    /// Extra vorticity confinement per unit fuel, 1/s: the per-cell
+    /// strength is `vorticity + flame_vorticity · fuel`.
+    pub flame_vorticity: f32,
+    /// Temperature at the flame's edge (flame → 0).
+    pub ignition_temperature: f32,
+    /// Temperature at the flame's core (flame = 1); at least
+    /// `ignition_temperature`.
+    pub max_temperature: f32,
 }
 
 impl Default for SolverParams {
@@ -201,6 +246,11 @@ struct DocParams {
     pressure_solver: Option<PressureSolver>,
     pressure_cycles: Option<u32>,
     conserve_mass: Option<bool>,
+    burning_rate: Option<f32>,
+    flame_smoke: Option<f32>,
+    flame_vorticity: Option<f32>,
+    ignition_temperature: Option<f32>,
+    max_temperature: Option<f32>,
 }
 
 /// Parse `ember.smoke_solver`'s parameters from an untrusted document, fill
@@ -252,6 +302,13 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
         pressure_solver: doc.pressure_solver.unwrap_or(preset.pressure_solver),
         pressure_cycles: doc.pressure_cycles.unwrap_or(preset.pressure_cycles),
         conserve_mass: doc.conserve_mass.unwrap_or(preset.conserve_mass),
+        burning_rate: doc.burning_rate.unwrap_or(preset.burning_rate),
+        flame_smoke: doc.flame_smoke.unwrap_or(preset.flame_smoke),
+        flame_vorticity: doc.flame_vorticity.unwrap_or(preset.flame_vorticity),
+        ignition_temperature: doc
+            .ignition_temperature
+            .unwrap_or(preset.ignition_temperature),
+        max_temperature: doc.max_temperature.unwrap_or(preset.max_temperature),
     };
     validate(&p)?;
     Ok(p)
@@ -317,6 +374,28 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
             "vorticity and dissipation rates must be at least 0",
         ));
     }
+    let fire = [p.burning_rate, p.flame_smoke, p.flame_vorticity];
+    params::finite(KIND, "fire rates", &fire)?;
+    if fire.iter().any(|&r| r < 0.0) {
+        return Err(params::bad(
+            KIND,
+            "burning_rate, flame_smoke and flame_vorticity must be at least 0",
+        ));
+    }
+    params::finite(
+        KIND,
+        "flame temperatures",
+        &[p.ignition_temperature, p.max_temperature],
+    )?;
+    if p.ignition_temperature > p.max_temperature {
+        return Err(params::bad(
+            KIND,
+            format!(
+                "ignition_temperature {} is above max_temperature {}",
+                p.ignition_temperature, p.max_temperature
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -344,9 +423,21 @@ impl SolverParams {
             wind_velocity: self.wind_velocity,
             wind_rate: self.wind_rate,
             conserve_mass: self.conserve_mass,
+            burning_rate: self.burning_rate,
+            flame_smoke: self.flame_smoke,
+            flame_vorticity: self.flame_vorticity,
+            ignition_temperature: self.ignition_temperature,
+            max_temperature: self.max_temperature,
             ..StepConstants::new(cells, h, dx)
         }
     }
+}
+
+/// Fuel and the reaction coordinate: the state fire adds (2b-4 spec §3.1).
+pub struct FireState {
+    pub fuel: Field,
+    /// 1 for fresh fuel, falling as it burns; flame is its square root.
+    pub react: Field,
 }
 
 /// Everything the solver carries from one step to the next.
@@ -356,6 +447,8 @@ pub struct SolverState {
     pub temperature: Field,
     /// p, kept as the next solve's warm start.
     pub pressure: Field,
+    /// Fuel and react, present once fire is on (2b-4 spec §3.1).
+    pub fire: Option<FireState>,
 }
 
 impl SolverState {
@@ -389,6 +482,7 @@ impl SolverState {
             density,
             temperature,
             pressure,
+            fire: None,
         })
     }
 
@@ -397,6 +491,33 @@ impl SolverState {
         pool.release(self.density);
         pool.release(self.temperature);
         pool.release(self.pressure);
+        if let Some(fire) = self.fire {
+            pool.release(fire.fuel);
+            pool.release(fire.react);
+        }
+    }
+
+    /// Zeroed fuel and react, for a state that starts burning.
+    pub fn add_fire(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+    ) -> Result<(), GpuError> {
+        let cells = self.density.dims();
+        let fuel = pool.acquire_zeroed(gpu, cache, cells)?;
+        let react = match pool.acquire_zeroed(gpu, cache, cells) {
+            Ok(field) => field,
+            Err(e) => {
+                pool.release(fuel);
+                return Err(e);
+            }
+        };
+        if let Some(old) = self.fire.replace(FireState { fuel, react }) {
+            pool.release(old.fuel);
+            pool.release(old.react);
+        }
+        Ok(())
     }
 
     /// The X, Y and Z faces, x-fastest, for tests and the speed gate.
@@ -427,6 +548,8 @@ pub struct Sources<'a> {
     pub emission: Option<Emission<'a>>,
     /// The frame's collider, when its SDF and velocity are connected (spec §3.2).
     pub solids: Option<Solids<'a>>,
+    /// The fuel emission rate per second, when fire is on (2b-4 spec §4.3).
+    pub fuel: Option<&'a Field>,
 }
 
 impl<'a> Sources<'a> {
@@ -436,6 +559,7 @@ impl<'a> Sources<'a> {
             temperature,
             emission: None,
             solids: None,
+            fuel: None,
         }
     }
 
@@ -449,6 +573,14 @@ impl<'a> Sources<'a> {
     pub fn with_solids(self, solids: Solids<'a>) -> Self {
         Self {
             solids: Some(solids),
+            ..self
+        }
+    }
+
+    /// The fuel emission rate per second: turns fire on (2b-4 spec §4.3).
+    pub fn with_fuel(self, fuel: &'a Field) -> Self {
+        Self {
+            fuel: Some(fuel),
             ..self
         }
     }
@@ -477,6 +609,7 @@ pub struct Substep {
     vorticity: bool,
     wind: bool,
     conserve_mass: bool,
+    fire: bool,
 }
 
 impl Substep {
@@ -488,9 +621,11 @@ impl Substep {
             retired: Vec::new(),
             targets: Vec::new(),
             advection: constants.advection,
-            vorticity: constants.vorticity > 0.0,
+            vorticity: constants.vorticity > 0.0
+                || (constants.fire && constants.flame_vorticity > 0.0),
             wind: constants.wind_rate > 0.0,
             conserve_mass: constants.conserve_mass,
+            fire: constants.fire,
         })
     }
 
@@ -529,6 +664,33 @@ impl Substep {
             &state.temperature,
             sources.temperature,
         )?;
+        if self.fire {
+            let (Some(fire), Some(fuel)) = (state.fire.as_ref(), sources.fuel) else {
+                return Err(GpuError::Validation(
+                    "a fire substep needs the fuel state and a fuel source".to_owned(),
+                ));
+            };
+            // Fresh fuel is unburnt: react blends towards 1 (spec §3.2 step 1).
+            kernels::emit_fuel(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &fire.fuel,
+                &fire.react,
+                fuel,
+            )?;
+            kernels::burn(
+                gpu,
+                cache,
+                &mut self.batch,
+                u,
+                &fire.fuel,
+                &fire.react,
+                &state.density,
+                &state.temperature,
+            )?;
+        }
         if let Some(e) = sources.emission {
             kernels::blend_velocity(
                 gpu,
@@ -626,6 +788,11 @@ impl Substep {
             solids,
         )
         .and_then(|()| {
+            let fuel = if self.fire {
+                state.fire.as_ref().map(|f| &f.fuel)
+            } else {
+                None
+            };
             kernels::confine(
                 gpu,
                 cache,
@@ -633,6 +800,7 @@ impl Substep {
                 u,
                 &state.velocity,
                 refs,
+                fuel,
                 solids,
             )
         });
@@ -764,6 +932,33 @@ impl Substep {
         )?;
         self.retired
             .push(std::mem::replace(&mut state.temperature, temperature));
+        if self.fire {
+            let Some(fire) = state.fire.as_mut() else {
+                return Err(GpuError::Validation(
+                    "a fire substep needs the fuel state".to_owned(),
+                ));
+            };
+            let fuel = self.advect_scalar(
+                gpu,
+                cache,
+                pool,
+                Carried::Fuel,
+                &state.velocity,
+                &fire.fuel,
+                solids,
+            )?;
+            self.retired.push(std::mem::replace(&mut fire.fuel, fuel));
+            let react = self.advect_scalar(
+                gpu,
+                cache,
+                pool,
+                Carried::React,
+                &state.velocity,
+                &fire.react,
+                solids,
+            )?;
+            self.retired.push(std::mem::replace(&mut fire.react, react));
+        }
         Ok(())
     }
 
@@ -986,10 +1181,13 @@ pub struct SmokeSolver {
 }
 
 impl SmokeSolver {
-    /// Take the four state slots, or a zeroed state on the first step.
-    fn take_state(ctx: &mut EvalCtx<'_>) -> Result<SolverState, NodeError> {
+    /// Take the state slots, or a zeroed state on the first step. With fire
+    /// on the fuel and react slots must be present too, and with it off
+    /// they must be absent: a state from the other mode is `StateShape`,
+    /// which the timeline answers with a reset.
+    fn take_state(ctx: &mut EvalCtx<'_>, fire: bool) -> Result<SolverState, NodeError> {
         let mut taken: Vec<(&'static str, Value)> = Vec::new();
-        for slot in SLOTS {
+        for slot in SLOTS.into_iter().chain(FIRE_SLOTS) {
             match ctx.take_state(slot) {
                 Ok(Some(value)) => taken.push((slot, value)),
                 Ok(None) => {}
@@ -1003,16 +1201,31 @@ impl SmokeSolver {
         }
         if taken.is_empty() {
             let cells = ctx.dims();
-            return ctx
-                .with_gpu_pool(|gpu, cache, pool| SolverState::zeroed(gpu, cache, pool, cells));
+            return ctx.with_gpu_pool(|gpu, cache, pool| {
+                let mut state = SolverState::zeroed(gpu, cache, pool, cells)?;
+                if fire && let Err(e) = state.add_fire(gpu, cache, pool) {
+                    state.release_to(pool);
+                    return Err(e);
+                }
+                Ok(state)
+            });
         }
 
         let node = ctx.node_id();
-        let missing = SLOTS
-            .into_iter()
+        let expected: Vec<&'static str> = if fire {
+            SLOTS.into_iter().chain(FIRE_SLOTS).collect()
+        } else {
+            SLOTS.to_vec()
+        };
+        let missing = expected
+            .iter()
+            .copied()
             .find(|slot| !taken.iter().any(|(name, _)| name == slot));
-        // When every slot is present, name the first one whose value holds
-        // the wrong `Value` variant, rather than always blaming `velocity`.
+        let unexpected = taken
+            .iter()
+            .map(|(name, _)| *name)
+            .find(|name| !expected.contains(name));
+        // Name the first slot holding the wrong `Value` variant.
         let wrong_shape = taken.iter().find_map(|(slot, value)| {
             let matches_shape = if *slot == VELOCITY {
                 matches!(value, Value::VectorField(_))
@@ -1021,36 +1234,51 @@ impl SmokeSolver {
             };
             if matches_shape { None } else { Some(*slot) }
         });
-        let mut values = taken.into_iter().map(|(_, value)| value);
-        match (values.next(), values.next(), values.next(), values.next()) {
-            (
-                Some(Value::VectorField(velocity)),
-                Some(Value::Field(density)),
-                Some(Value::Field(temperature)),
-                Some(Value::Field(pressure)),
-            ) if missing.is_none() => Ok(SolverState {
-                velocity,
-                density,
-                temperature,
-                pressure,
-            }),
-            (a, b, c, d) => {
-                for value in [a, b, c, d].into_iter().flatten() {
-                    ctx.release(value);
-                }
-                Err(NodeError::StateShape {
-                    node,
-                    slot: missing.or(wrong_shape).unwrap_or(VELOCITY),
-                })
+        if let Some(slot) = missing.or(unexpected).or(wrong_shape) {
+            for (_, value) in taken {
+                ctx.release(value);
             }
+            return Err(NodeError::StateShape { node, slot });
         }
+        let mut field = |slot: &str| -> Field {
+            let at = taken
+                .iter()
+                .position(|(name, _)| *name == slot)
+                .expect("checked present");
+            match taken.swap_remove(at).1 {
+                Value::Field(f) => f,
+                _ => unreachable!("shapes checked above"),
+            }
+        };
+        let density = field(DENSITY);
+        let temperature = field(TEMPERATURE);
+        let pressure = field(PRESSURE);
+        let fire = fire.then(|| FireState {
+            fuel: field(FUEL),
+            react: field(REACT),
+        });
+        let Some((_, Value::VectorField(velocity))) = taken.pop() else {
+            unreachable!("only velocity remains")
+        };
+        Ok(SolverState {
+            velocity,
+            density,
+            temperature,
+            pressure,
+            fire,
+        })
     }
 
     fn put_state(ctx: &mut EvalCtx<'_>, state: SolverState) -> Result<(), NodeError> {
         ctx.put_state(VELOCITY, Value::VectorField(state.velocity))?;
         ctx.put_state(DENSITY, Value::Field(state.density))?;
         ctx.put_state(TEMPERATURE, Value::Field(state.temperature))?;
-        ctx.put_state(PRESSURE, Value::Field(state.pressure))
+        ctx.put_state(PRESSURE, Value::Field(state.pressure))?;
+        if let Some(fire) = state.fire {
+            ctx.put_state(FUEL, Value::Field(fire.fuel))?;
+            ctx.put_state(REACT, Value::Field(fire.react))?;
+        }
+        Ok(())
     }
 
     fn run(&self, ctx: &mut EvalCtx<'_>, state: &mut SolverState) -> Result<Vec<Value>, NodeError> {
@@ -1061,6 +1289,9 @@ impl SmokeSolver {
         if pair(ctx, 4, 5)? {
             wanted.extend([4, 5]);
         }
+        if ctx.input_connected(FUEL_INPUT) {
+            wanted.push(FUEL_INPUT);
+        }
         let inputs = take_listed(ctx, &wanted)?;
         let stepped = self.step(ctx, state, &inputs);
         for (_, value) in inputs {
@@ -1070,8 +1301,9 @@ impl SmokeSolver {
 
         // The outputs are copies: the state stays in the store for the next
         // frame. Outputs nobody reads are not copied at all.
-        let wanted: [bool; 3] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
-        ctx.with_gpu_pool(|gpu, _, pool| copy_outputs(gpu, pool, state, wanted))
+        let wanted: [bool; 4] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
+        let dx = ctx.voxel_size();
+        ctx.with_gpu_pool(|gpu, cache, pool| copy_outputs(gpu, cache, pool, state, wanted, dx))
     }
 
     fn step(
@@ -1115,6 +1347,9 @@ impl SmokeSolver {
             (Some(_), Some(_)) => Some((field(4)?, vector(5)?)),
             _ => None,
         };
+        if find(FUEL_INPUT).is_some() {
+            sources = sources.with_fuel(field(FUEL_INPUT)?);
+        }
         let cells = ctx.dims();
         let dx = ctx.voxel_size();
         let mask = match collider {
@@ -1166,6 +1401,7 @@ impl SmokeSolver {
         }
         let constants = StepConstants {
             has_solids: sources.solids.is_some(),
+            fire: sources.fuel.is_some(),
             ..self
                 .params
                 .step_constants(ctx.dims(), (dt / f64::from(plan.count)) as f32, dx)
@@ -1194,11 +1430,13 @@ impl Node for SmokeSolver {
                 SocketType::VectorField,
                 SocketType::Field,
                 SocketType::VectorField,
+                SocketType::Field,
             ],
             outputs: vec![
                 SocketType::Field,
                 SocketType::Field,
                 SocketType::VectorField,
+                SocketType::Field,
             ],
         }
     }
@@ -1208,7 +1446,8 @@ impl Node for SmokeSolver {
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let mut state = Self::take_state(ctx)?;
+        let fire = ctx.input_connected(FUEL_INPUT);
+        let mut state = Self::take_state(ctx, fire)?;
         match self.run(ctx, &mut state) {
             Ok(outputs) => {
                 Self::put_state(ctx, state)?;
@@ -1238,11 +1477,13 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
 /// `EvalCtx::output_wanted`). On failure, copies already made go back.
 fn copy_outputs(
     gpu: &GpuContext,
+    cache: &mut PipelineCache,
     pool: &mut FieldPool,
     state: &SolverState,
-    wanted: [bool; 3],
+    wanted: [bool; 4],
+    dx: f32,
 ) -> Result<Vec<Value>, GpuError> {
-    let mut outputs: Vec<Value> = Vec::with_capacity(3);
+    let mut outputs: Vec<Value> = Vec::with_capacity(4);
     for (index, wanted) in wanted.into_iter().enumerate() {
         let copied = if !wanted {
             Ok(Value::Scalar(0.0))
@@ -1250,7 +1491,9 @@ fn copy_outputs(
             match index {
                 0 => pool.duplicate(gpu, &state.density).map(Value::Field),
                 1 => pool.duplicate(gpu, &state.temperature).map(Value::Field),
-                _ => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
+                2 => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
+                3 => flame_output(gpu, cache, pool, state, dx).map(Value::Field),
+                _ => unreachable!("only four outputs exist"),
             }
         };
         match copied {
@@ -1264,6 +1507,33 @@ fn copy_outputs(
         }
     }
     Ok(outputs)
+}
+
+/// The flame output: sqrt(clamp(react, 0, 1)) with fire on, zero without (spec §4.3).
+fn flame_output(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    pool: &mut FieldPool,
+    state: &SolverState,
+    dx: f32,
+) -> Result<Field, GpuError> {
+    let cells = state.density.dims();
+    let Some(fire) = &state.fire else {
+        return pool.acquire_zeroed(gpu, cache, cells);
+    };
+    let dst = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
+    let built = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).and_then(|u| {
+        let mut batch = ComputeBatch::new();
+        kernels::flame(gpu, cache, &mut batch, &u, &fire.react, &dst)?;
+        batch.submit(gpu)
+    });
+    match built {
+        Ok(()) => Ok(dst),
+        Err(e) => {
+            pool.release(dst);
+            Err(e)
+        }
+    }
 }
 
 /// A pooled copy of all three faces. On failure, faces already copied go back to the pool.

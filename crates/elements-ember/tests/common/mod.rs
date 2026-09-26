@@ -1,9 +1,105 @@
 #![allow(dead_code)]
 
-use elements_core::gpu::{Field, FieldDims, FieldFormat, FieldPool, GpuContext};
+use elements_core::gpu::{Field, FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache};
+use elements_core::graph::{Document, Graph, Timeline, TimelineConfig};
 
 pub fn gpu() -> GpuContext {
     GpuContext::new_headless().expect("no GPU adapter available")
+}
+
+/// A document loaded once, stepped through a `Timeline` as many times as a
+/// test needs. Every integration test that must build a graph, step it
+/// frame by frame and read the output field back shares this session rather
+/// than duplicating `Document::from_json` + `into_graph` + a `FieldPool`.
+pub struct Session {
+    pub gpu: GpuContext,
+    pub pool: FieldPool,
+    pub pipelines: PipelineCache,
+    pub graph: Graph,
+    pub dims: FieldDims,
+}
+
+impl Session {
+    pub fn new(doc: &str) -> Self {
+        let (graph, dims) = Document::from_json(doc)
+            .unwrap()
+            .into_graph(&elements_ember::registry())
+            .unwrap();
+        Self {
+            gpu: gpu(),
+            pool: FieldPool::new(),
+            pipelines: PipelineCache::new(),
+            graph,
+            dims,
+        }
+    }
+
+    /// Evaluate `frame` on `timeline` and read the output field back as bits,
+    /// so callers can hash or compare it bit-exactly.
+    pub fn density_bits(&mut self, timeline: &mut Timeline, frame: u32) -> Vec<u32> {
+        let evaluated = timeline
+            .goto(
+                &self.graph,
+                &self.gpu,
+                &mut self.pool,
+                &mut self.pipelines,
+                self.dims,
+                frame,
+            )
+            .unwrap();
+        let bits = evaluated
+            .value
+            .as_field()
+            .unwrap()
+            .read_back(&self.gpu)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        evaluated.value.release_to(&mut self.pool);
+        bits
+    }
+}
+
+pub fn timeline(budget_bytes: u64) -> Timeline {
+    Timeline::new(TimelineConfig {
+        fps: 24.0,
+        start_frame: 1,
+        cache_budget_bytes: budget_bytes,
+    })
+}
+
+/// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
+/// back and forth, and after eviction forced a recompute.
+pub fn assert_doc_frame_40_is_bit_identical(doc: &str) {
+    let mut s = Session::new(doc);
+
+    let mut in_order = timeline(0);
+    let mut reference = Vec::new();
+    for frame in 1..=40 {
+        reference = s.density_bits(&mut in_order, frame);
+    }
+    assert!(
+        reference.iter().any(|&b| f32::from_bits(b) != 0.0),
+        "the plume must exist"
+    );
+
+    let mut scrubbed = timeline(512 * 1024 * 1024);
+    s.density_bits(&mut scrubbed, 40);
+    s.density_bits(&mut scrubbed, 10);
+    assert!(
+        s.density_bits(&mut scrubbed, 40) == reference,
+        "after scrubbing"
+    );
+
+    // About ten 16³ snapshots fit, so reaching 40 evicts most of them.
+    let mut evicting = timeline(1024 * 1024);
+    s.density_bits(&mut evicting, 40);
+    s.density_bits(&mut evicting, 5);
+    assert!(
+        s.density_bits(&mut evicting, 40) == reference,
+        "after eviction"
+    );
 }
 
 /// Index of voxel `(i, j, k)` in an x-fastest array of `dims`.
@@ -159,8 +255,28 @@ pub fn velocity_at(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3]) -> [f32
     v
 }
 
-/// Mirrors `backtrace` in `velocity.wgsl`: an RK2 midpoint step. `k` is
-/// direction · h / dx; a negative `k` traces forward in time.
+/// How a backtrace steps: `backtrace` in `velocity.wgsl` takes one Euler
+/// step where the uniform's `euler_faces` is set (velocity faces while fire
+/// burns, 2b-4 spec §3.2 step 5) and the RK2 midpoint otherwise.
+#[derive(Clone, Copy, Debug)]
+pub enum Trace {
+    Rk2,
+    Euler,
+}
+
+/// Mirrors `backtrace` in `velocity.wgsl`. `k` is direction · h / dx; a
+/// negative `k` traces forward in time.
+fn trace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], k: f32, how: Trace) -> [f32; 3] {
+    match how {
+        Trace::Rk2 => backtrace(faces, cells, x, k),
+        Trace::Euler => {
+            let v = velocity_at(faces, cells, x);
+            [x[0] - k * v[0], x[1] - k * v[1], x[2] - k * v[2]]
+        }
+    }
+}
+
+/// The RK2 midpoint step of `backtrace` in `velocity.wgsl`.
 fn backtrace(faces: &[Vec<f32>; 3], cells: FieldDims, x: [f32; 3], k: f32) -> [f32; 3] {
     let v = velocity_at(faces, cells, x);
     let mid = [
@@ -207,7 +323,7 @@ fn is_wall_texel(cells: FieldDims, mask: u32, grid: Grid, ijk: [u32; 3]) -> bool
     }
 }
 
-/// Mirrors `pass_over` in `advect.wgsl`.
+/// Mirrors `pass_over` in `advect.wgsl`, with the RK2 backtrace.
 pub fn cpu_advect(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
@@ -216,6 +332,21 @@ pub fn cpu_advect(
     src: &[f32],
     k: f32,
     decay: f32,
+) -> Vec<f32> {
+    cpu_advect_traced(faces, cells, mask, grid, src, k, decay, Trace::Rk2)
+}
+
+/// `cpu_advect` with the backtrace `how`.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_advect_traced(
+    faces: &[Vec<f32>; 3],
+    cells: FieldDims,
+    mask: u32,
+    grid: Grid,
+    src: &[f32],
+    k: f32,
+    decay: f32,
+    how: Trace,
 ) -> Vec<f32> {
     let d = grid_dims(cells, grid);
     let off = grid_offset(grid);
@@ -227,7 +358,7 @@ pub fn cpu_advect(
                     continue;
                 }
                 let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
-                let b = backtrace(faces, cells, x, k);
+                let b = trace(faces, cells, x, k, how);
                 out[index(d, i, j, kk)] =
                     sample_grid(src, d, grid_open(grid, mask), sub(b, off)) * decay;
             }
@@ -245,7 +376,8 @@ fn beyond_open(cells: FieldDims, mask: u32, p: [f32; 3]) -> bool {
     })
 }
 
-/// Mirrors `advect.wgsl`'s forward and backward passes and `maccormack.wgsl`.
+/// Mirrors `advect.wgsl`'s forward and backward passes and `maccormack.wgsl`,
+/// with the RK2 backtrace.
 pub fn cpu_maccormack(
     faces: &[Vec<f32>; 3],
     cells: FieldDims,
@@ -255,8 +387,23 @@ pub fn cpu_maccormack(
     k: f32,
     decay: f32,
 ) -> Vec<f32> {
-    let fwd = cpu_advect(faces, cells, mask, grid, src, k, 1.0);
-    let bwd = cpu_advect(faces, cells, mask, grid, &fwd, -k, 1.0);
+    cpu_maccormack_traced(faces, cells, mask, grid, src, k, decay, Trace::Rk2)
+}
+
+/// `cpu_maccormack` with the backtrace `how` in every pass.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_maccormack_traced(
+    faces: &[Vec<f32>; 3],
+    cells: FieldDims,
+    mask: u32,
+    grid: Grid,
+    src: &[f32],
+    k: f32,
+    decay: f32,
+    how: Trace,
+) -> Vec<f32> {
+    let fwd = cpu_advect_traced(faces, cells, mask, grid, src, k, 1.0, how);
+    let bwd = cpu_advect_traced(faces, cells, mask, grid, &fwd, -k, 1.0, how);
     let d = grid_dims(cells, grid);
     let off = grid_offset(grid);
     let mut out = vec![0.0; d.voxel_count()];
@@ -267,10 +414,10 @@ pub fn cpu_maccormack(
                     continue;
                 }
                 let x = [i as f32 + off[0], j as f32 + off[1], kk as f32 + off[2]];
-                let b = backtrace(faces, cells, x, k);
+                let b = trace(faces, cells, x, k, how);
                 let at = index(d, i, j, kk);
                 // A cell whose trace reaches past an open face takes q̂.
-                let ahead = backtrace(faces, cells, x, -k);
+                let ahead = trace(faces, cells, x, -k, how);
                 if matches!(grid, Grid::Cell)
                     && (beyond_open(cells, mask, sub(b, off))
                         || beyond_open(cells, mask, sub(ahead, off)))

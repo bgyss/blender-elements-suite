@@ -97,16 +97,24 @@ VERDICT_MARK = "@@VERDICT@@"
 PENDING = "Verdict (recorded by the user): _pending_"
 
 
-def kept_verdict(path: str) -> str:
-    """The verdict paragraph already in `path`, so regenerating the README
-    never erases a recorded verdict; `PENDING` when there is none."""
+def pending(label: str) -> str:
+    """A scene section's verdict line before the user has recorded one."""
+    return f"{label}: _pending: recorded by the user_"
+
+
+def kept_verdict(path: str, label: str = "Verdict (recorded", empty: str = PENDING) -> str:
+    """The verdict paragraph already in `path` that starts with `label`, so
+    regenerating the README never erases a recorded verdict; `empty` when
+    there is none. It runs to the next `## ` heading. The contact sheet's own
+    verdict is the default; a scene section's (e.g. "Fire verdict") ends its
+    section."""
     try:
         with open(path) as fh:
             old = fh.read()
     except FileNotFoundError:
-        return PENDING
-    start = old.find("Verdict (recorded")
+        return empty
+    start = old.find(label)
     if start < 0:
-        return PENDING
+        return empty
     end = old.find("\n## ", start)
     return old[start:end].rstrip() if end >= 0 else old[start:].rstrip()

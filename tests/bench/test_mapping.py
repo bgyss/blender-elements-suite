@@ -94,6 +94,40 @@ def test_buoyancy_scales_by_domain_over_gravity_and_flips_density() -> None:
     assert close(alpha, -0.5 * 2.0 / 9.81), alpha
 
 
+def test_fire_converts_ember_rates_to_mantaflows_per_frame_settings() -> None:
+    m = mapping.fire(12.0, 1.875, 12.0, 24.0)
+    assert close(m["fuel_amount"], 0.5), m  # fuel added per frame, like density
+    assert close(m["burning_rate"], 0.75), m  # x 0.4 s per Mantaflow time unit
+    assert close(m["flame_vorticity"], 0.5), m  # / fps, as vorticity's mapping
+
+
+def test_fire_rejects_a_fuel_blender_would_clamp() -> None:
+    # Blender clamps fuel_amount to [0, 10] (RNA), and 2 per frame is inside.
+    assert close(mapping.fire(48.0, 1.875, 12.0, 24.0)["fuel_amount"], 2.0)
+    try:
+        mapping.fire(264.0, 1.875, 12.0, 24.0)
+    except ValueError:
+        return
+    raise AssertionError("fuel of 11 per frame was accepted")
+
+
+def test_fire_rejects_a_burning_rate_blender_would_clamp() -> None:
+    # Blender clamps burning_rate to [0.01, 4]: a probe asking for 0 got 0.01.
+    try:
+        mapping.fire(24.0, 0.0, 12.0, 24.0)
+    except ValueError:
+        return
+    raise AssertionError("a burning rate of 0 was accepted")
+
+
+def test_ember_fire_defaults_are_blenders_converted_at_24_fps() -> None:
+    d = mapping.EMBER_FIRE_DEFAULTS
+    m = mapping.fire(24.0, d["burning_rate"], d["flame_vorticity"], 24.0)
+    # Blender's defaults, recorded in mantaflow-notes.md "Fire".
+    assert close(m["burning_rate"], 0.75) and close(m["flame_vorticity"], 0.5), m
+    assert (d["flame_smoke"], d["ignition_temperature"], d["max_temperature"]) == (1.0, 1.5, 3.0)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

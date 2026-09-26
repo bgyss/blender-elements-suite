@@ -71,8 +71,12 @@ pub fn curl(
     Ok(())
 }
 
-/// Record u += h·ε·dx·(N × ω) on every face of `velocity` that is neither a
-/// wall nor touching `solids`, from the `omega` that `curl` wrote.
+/// Record u += h·strength(c)·(N × ω) on every face of `velocity` that is
+/// neither a wall nor touching `solids`, from the `omega` that `curl` wrote.
+/// `strength` is ε·dx, plus flame_vorticity·dx per unit `fuel` with fire on
+/// (2b-4 spec §3.2); `fuel` must be `Some` exactly when
+/// `StepConstants::fire` is set.
+#[allow(clippy::too_many_arguments)] // every arg is load-bearing; see the doc above.
 pub fn confine(
     gpu: &GpuContext,
     cache: &mut PipelineCache,
@@ -80,9 +84,18 @@ pub fn confine(
     u: &Uniforms,
     velocity: &StaggeredField,
     omega: [&Field; 4],
+    fuel: Option<&Field>,
     solids: Option<Solids<'_>>,
 ) -> Result<(), GpuError> {
     check("confine", u, velocity, omega)?;
+    if fuel.is_some() != u.fire() {
+        return Err(GpuError::Validation(
+            "confine: fuel must be given exactly when StepConstants::fire is set".to_owned(),
+        ));
+    }
+    if let Some(f) = fuel {
+        expect_dims("confine fuel", f, u.cells())?;
+    }
     let (solid, _) = solid_views(u, solids, None)?;
     let pipeline = cache.get_or_create(gpu, "ember.confine", CONFINE, "main")?;
     for axis in Axis::ALL {
@@ -98,6 +111,10 @@ pub fn confine(
                 Bind::Tex(omega[3]),
                 Bind::Buf(u.axis(axis)),
                 Bind::View(solid),
+                match fuel {
+                    Some(f) => Bind::Tex(f),
+                    None => Bind::View(u.placeholder()),
+                },
             ],
         )?;
         batch.dispatch(&pipeline, &group, face.dims());

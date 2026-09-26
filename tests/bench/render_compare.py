@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Render Ember's and Mantaflow's density side by side with one Cycles setup.
+"""Render Ember's and Mantaflow's density (and fire's flame) side by side with one Cycles setup.
 
 Run (headless):
   Blender --background --factory-startup --python-exit-code 1 \
@@ -13,6 +13,11 @@ For frames 30, 60 and 90 it builds a scene from factory settings and writes
 OUT_DIR/{scene}-{res}-f{frame:03}.png: Ember on the left, Mantaflow on the
 right, each Volume object reading its file's `density` grid through the same
 Principled Volume material, placed by placement.py (2b-3b spec §3).
+For the `fire` scene each solver gets a second Volume object at the same
+place, drawing its `flame` grid as emission through one shared flame
+material (2b-4 spec §6.3): Ember's from EMBER_DIR's `flame.NNNN.vdb`,
+Mantaflow's from the same `fluid_data_NNNN.vdb`, whose `flame` grid its
+resumable cache writes.
 
 The Cycles device is written to EMBER_DIR/render-device, next to the bake it
 rendered. `just bench-render` runs the bakes and this script, then the
@@ -41,6 +46,12 @@ SEED = 0
 # The Principled Volume's density: one multiplier on the grid's value, the
 # same for both solvers. Chosen by eye so that neither plume saturates.
 DENSITY = 20.0
+# The flame material's emission: the `flame` grid (√react, in [0, 1] in both
+# solvers) times FLAME_STRENGTH, coloured by a blackbody at a fixed
+# FLAME_KELVIN rather than by temperature, so both solvers get the same
+# colour mapping. The strength was chosen by eye.
+FLAME_STRENGTH = 8.0
+FLAME_KELVIN = 1500.0
 WORLD_GREY = 0.18
 KEY_STRENGTH = 10.0
 FILL_STRENGTH = 2.0
@@ -51,6 +62,14 @@ SOLVERS = ("Ember", "Mantaflow")
 def frame_files(ember_dir: str, manta_cache: str, frame: int) -> tuple[str, str]:
     return (
         os.path.join(ember_dir, f"density.{frame:04d}.vdb"),
+        os.path.join(manta_cache, "data", f"fluid_data_{frame:04d}.vdb"),
+    )
+
+
+def flame_files(ember_dir: str, manta_cache: str, frame: int) -> tuple[str, str]:
+    """Ember's flame bake, and Mantaflow's one data file again, for its `flame` grid."""
+    return (
+        os.path.join(ember_dir, f"flame.{frame:04d}.vdb"),
         os.path.join(manta_cache, "data", f"fluid_data_{frame:04d}.vdb"),
     )
 
@@ -118,6 +137,27 @@ def smoke_material() -> bpy.types.Material:
     return mat
 
 
+def flame_material() -> bpy.types.Material:
+    """Emission only: `flame` × FLAME_STRENGTH, coloured by a fixed blackbody."""
+    mat, nt = node_material("flame")
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    pv = nt.nodes.new("ShaderNodeVolumePrincipled")
+    pv.inputs["Density"].default_value = 0.0  # the smoke object absorbs and scatters
+    pv.inputs["Blackbody Intensity"].default_value = 0.0
+    attr = nt.nodes.new("ShaderNodeAttribute")
+    attr.attribute_name = "flame"
+    scale = nt.nodes.new("ShaderNodeMath")
+    scale.operation = "MULTIPLY"
+    scale.inputs[1].default_value = FLAME_STRENGTH
+    body = nt.nodes.new("ShaderNodeBlackbody")
+    body.inputs["Temperature"].default_value = FLAME_KELVIN
+    nt.links.new(attr.outputs["Fac"], scale.inputs[0])
+    nt.links.new(scale.outputs["Value"], pv.inputs["Emission Strength"])
+    nt.links.new(body.outputs["Color"], pv.inputs["Emission Color"])
+    nt.links.new(pv.outputs["Volume"], out.inputs["Volume"])
+    return mat
+
+
 def flat_material(name: str, grey: float) -> bpy.types.Material:
     """An unlit colour, for the labels and the domain outlines."""
     mat, nt = node_material(name)
@@ -143,7 +183,7 @@ def unlit(obj: bpy.types.Object) -> None:
     obj.visible_volume_scatter = False
 
 
-def add_volume(name: str, path: str, location, material) -> bpy.types.Object:
+def add_volume(name: str, path: str, location, material, grid: str = "density") -> bpy.types.Object:
     if not os.path.isfile(path):
         sys.exit(f"missing {path}")
     vol = bpy.data.volumes.new(name)
@@ -153,8 +193,8 @@ def add_volume(name: str, path: str, location, material) -> bpy.types.Object:
     if not vol.grids.load():
         sys.exit(f"{path}: {vol.grids.error_message}")
     names = [g.name for g in vol.grids]
-    if "density" not in names:
-        sys.exit(f"{path}: no density grid, only {names}")
+    if grid not in names:
+        sys.exit(f"{path}: no {grid} grid, only {names}")
     vol.materials.append(material)
     obj = link(bpy.data.objects.new(name, vol))
     obj.location = location
@@ -217,17 +257,27 @@ def add_camera(size: float) -> None:
     bpy.context.scene.camera = obj
 
 
-def build(files: tuple[str, str], size: float, dx: float, caption: str) -> str:
+def build(
+    files: tuple[str, str],
+    size: float,
+    dx: float,
+    caption: str,
+    flames: tuple[str, str] | None = None,
+) -> str:
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     device = settings(scene)
     smoke = smoke_material()
+    flame = flame_material() if flames else None
     ink = flat_material("ink", 0.0)
     edge = flat_material("edge", 0.06)
     for slot, (solver, path) in enumerate(zip(SOLVERS, files, strict=True)):
         # Both files centre voxel i at i·dx (placement.py), so both get the
         # half cell.
-        add_volume(solver, path, placement.object_location(slot, size, dx, True, GAP), smoke)
+        location = placement.object_location(slot, size, dx, True, GAP)
+        add_volume(solver, path, location, smoke)
+        if flames:
+            add_volume(f"{solver} flame", flames[slot], location, flame, "flame")
         add_outline(slot, size, edge)
         add_text(solver, placement.label_location(slot, size, GAP), 0.09 * size, ink)
     add_text(caption, placement.caption_location(size, GAP), 0.065 * size, ink)
@@ -247,7 +297,8 @@ def render(
     devices = set()
     for frame in FRAMES:
         files = frame_files(ember_dir, manta_cache, frame)
-        device = build(files, size, dx, f"{scene_name}   {res}³   frame {frame}")
+        flames = flame_files(ember_dir, manta_cache, frame) if scene_name == "fire" else None
+        device = build(files, size, dx, f"{scene_name}   {res}³   frame {frame}", flames)
         out = os.path.join(out_dir, f"{scene_name}-{res}-f{frame:03d}.png")
         bpy.context.scene.render.filepath = out
         start = datetime.datetime.now()
@@ -282,7 +333,26 @@ NOTES = {
         "Mantaflow's wind acts only on cells that hold smoke, while Ember's moves "
         "all the air (`docs/bench/mantaflow-notes.md`, Wind as ambient airflow)."
     ),
+    "fire": (
+        "Each solver has a second Volume object at the same place for its flame. "
+        "Ember's is baked from the solver's `flame` output into "
+        "`flame.NNNN.vdb`; Mantaflow's is the `flame` grid of the same "
+        "`fluid_data_NNNN.vdb`, which its resumable cache writes "
+        "(`docs/bench/mantaflow-notes.md`, Grid inventory). Both solvers' flame "
+        "is √react in [0, 1]. The two share one flame material: a Principled "
+        f"Volume of density 0 whose emission strength is `flame` × {FLAME_STRENGTH:g} "
+        f"and whose emission colour is a blackbody at a fixed {FLAME_KELVIN:g} K, "
+        "not the temperature, so both get the same colour mapping. The smoke is "
+        "drawn with the density material above. Fire emits fuel, not smoke, so "
+        "its smoke is made by burning, and the matched emitted masses above do "
+        "not apply to it. Mantaflow's burn clamps density to [0, 1] in every "
+        "cell on every step; Ember does not clamp it "
+        "(`docs/bench/results.md`, Fire)."
+    ),
 }
+
+# Scenes whose section ends with a verdict of its own, kept like the main one.
+SECTION_VERDICTS = {"fire": "Fire verdict"}
 
 
 def record(path: str) -> str:
@@ -294,6 +364,7 @@ def record(path: str) -> str:
 
 
 def readme(out_dir: str, bake_dir: str, cases: list[str]) -> None:
+    readme_path = os.path.join(out_dir, "README.md")
     ember_commits, manta_commits, devices, sizes = set(), set(), set(), set()
     sections = []
     for case in cases:
@@ -312,6 +383,9 @@ def readme(out_dir: str, bake_dir: str, cases: list[str]) -> None:
                 sys.exit(f"missing {name}: render before writing the README")
             images.append(f"![{scene_name} {res}³ frame {frame}]({name})")
         note = f"{NOTES[scene_name]}\n\n" if scene_name in NOTES else ""
+        if scene_name in SECTION_VERDICTS:
+            label = SECTION_VERDICTS[scene_name]
+            images.append(placement.kept_verdict(readme_path, label, placement.pending(label)))
         sections.append(f"## `{scene_name}` ({res}³)\n\n{note}" + "\n\n".join(images) + "\n")
     today = datetime.date.today().isoformat()
     domain = " or ".join(f"{v:g}" for v in sorted(sizes))
@@ -373,9 +447,8 @@ thick core, that changes little in the image).
 {placement.VERDICT_MARK}
 
 {chr(10).join(sections)}"""
-    path = os.path.join(out_dir, "README.md")
-    text = text.replace(placement.VERDICT_MARK, placement.kept_verdict(path))
-    with open(path, "w") as fh:
+    text = text.replace(placement.VERDICT_MARK, placement.kept_verdict(readme_path))
+    with open(readme_path, "w") as fh:
         fh.write(text)
 
 

@@ -1,12 +1,10 @@
 mod common;
 
 use common::*;
-use elements_core::gpu::{
-    Axis, FieldDims, FieldFormat, FieldPool, GpuContext, GpuError, PipelineCache,
-};
+use elements_core::gpu::{Axis, FieldDims, FieldFormat, FieldPool, GpuError, PipelineCache};
 use elements_core::graph::{
     DocError, Document, EvalCtx, Graph, Node, NodeError, NodeId, SocketId, SocketSpec, SocketType,
-    StateStore, Time, Timeline, TimelineConfig, Value,
+    StateStore, Time, Value,
 };
 use elements_ember::cfl;
 use elements_ember::kernels::Advection;
@@ -16,6 +14,51 @@ use elements_ember::solver::{
     KIND, PressureSolve, SolverParams, SolverState, Sources, Substep, resolve_params, substep,
 };
 use std::sync::{Arc, Mutex};
+
+/// FNV-1a over the bits, for recording a field compactly.
+fn fnv1a(bits: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bits {
+        for byte in b.to_le_bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// 2b-4 spec §3.4: with fuel unconnected the solver is exactly the one
+/// before fire. Frame 40's density hashes, recorded from ac62baf (before
+/// any 2b-4 solver change (f77d38f)) on this adapter. Other adapters print
+/// and skip: bit patterns are only comparable within one backend on one
+/// machine.
+#[test]
+fn without_fuel_frame_40_matches_the_solver_before_fire() {
+    const RECORDED_ON: &str = "Apple M1 Max";
+    const RECORDED: [(&str, u64); 2] = [
+        ("mgpcg", 0x7fd4_5178_bbd3_5c70),
+        ("gauss_seidel", 0xfaf6_ca02_96d5_d74a),
+    ];
+    let ctx = gpu();
+    let adapter = ctx.adapter_name();
+    if adapter != RECORDED_ON {
+        eprintln!("skipped: hashes were recorded on {RECORDED_ON}, this is {adapter}");
+        return;
+    }
+    for (name, want) in RECORDED {
+        let doc = match name {
+            "mgpcg" => plume_16(PREVIEW),
+            _ => plume_16(&gauss_seidel(PREVIEW)),
+        };
+        let mut s = Session::new(&doc);
+        let mut t = timeline(0);
+        let mut bits = Vec::new();
+        for frame in 1..=40 {
+            bits = s.density_bits(&mut t, frame);
+        }
+        assert_eq!(fnv1a(&bits), want, "{name}: frame 40 density changed");
+    }
+}
 
 fn rejected(params: serde_json::Value) -> bool {
     matches!(
@@ -96,6 +139,63 @@ fn rejects_out_of_range_solver_parameters() {
     assert!(rejected(serde_json::json!({ "pressure_cycles": 65 })));
 }
 
+#[test]
+fn fire_parameters_are_validated() {
+    for bad in [
+        serde_json::json!({ "burning_rate": -1.0 }),
+        serde_json::json!({ "flame_smoke": -0.5 }),
+        serde_json::json!({ "flame_vorticity": -2.0 }),
+        serde_json::json!({ "burning_rate": 1e39 }),
+        serde_json::json!({ "ignition_temperature": 3.0, "max_temperature": 1.5 }),
+    ] {
+        assert!(rejected(bad.clone()), "{bad} was accepted");
+    }
+    let p = resolve_params(&serde_json::json!({
+        "burning_rate": 2.0, "flame_smoke": 0.5, "flame_vorticity": 3.0,
+        "ignition_temperature": 1.0, "max_temperature": 1.0 }))
+    .unwrap();
+    assert_eq!(
+        (
+            p.burning_rate,
+            p.flame_smoke,
+            p.flame_vorticity,
+            p.ignition_temperature,
+            p.max_temperature
+        ),
+        (2.0, 0.5, 3.0, 1.0, 1.0)
+    );
+}
+
+#[test]
+fn fire_defaults_are_blenders_mapped_and_the_same_in_both_presets() {
+    use elements_ember::solver::{
+        DEFAULT_BURNING_RATE, DEFAULT_FLAME_SMOKE, DEFAULT_FLAME_VORTICITY,
+        DEFAULT_IGNITION_TEMPERATURE, DEFAULT_MAX_TEMPERATURE, Quality,
+    };
+    // tests/bench/mapping.py EMBER_FIRE_DEFAULTS (Task 1).
+    assert_eq!(DEFAULT_BURNING_RATE, 1.875);
+    assert_eq!(DEFAULT_FLAME_SMOKE, 1.0);
+    assert_eq!(DEFAULT_FLAME_VORTICITY, 12.0);
+    assert_eq!(
+        (DEFAULT_IGNITION_TEMPERATURE, DEFAULT_MAX_TEMPERATURE),
+        (1.5, 3.0)
+    );
+    for q in [Quality::Preview, Quality::Final] {
+        let p = q.params();
+        assert_eq!(
+            (
+                p.burning_rate,
+                p.flame_smoke,
+                p.flame_vorticity,
+                p.ignition_temperature,
+                p.max_temperature
+            ),
+            (1.875, 1.0, 12.0, 1.5, 3.0),
+            "{q:?}"
+        );
+    }
+}
+
 /// 2b-3c spec §6: `wind` was an acceleration and is gone. A document still
 /// using it must fail, and the message must name what replaced it.
 #[test]
@@ -148,7 +248,9 @@ fn step_constants_carry_every_solver_parameter() {
         "buoyancy_density": 0.75, "buoyancy_temperature": 2.0,
         "boundaries": { "-x": "open" },
         "wind_velocity": [0.5, 0.0, -1.0], "wind_rate": 2.5,
-        "conserve_mass": false
+        "conserve_mass": false,
+        "burning_rate": 2.0, "flame_smoke": 0.5, "flame_vorticity": 3.0,
+        "ignition_temperature": 1.0, "max_temperature": 2.0
     }))
     .unwrap();
     let c = p.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125);
@@ -162,6 +264,12 @@ fn step_constants_carry_every_solver_parameter() {
     assert_eq!(c.wind_velocity, [0.5, 0.0, -1.0]);
     assert_eq!(c.wind_rate, 2.5);
     assert!(!c.conserve_mass);
+    assert!(!c.fire, "step_constants never turns fire on");
+    assert_eq!(c.burning_rate, 2.0);
+    assert_eq!(c.flame_smoke, 0.5);
+    assert_eq!(c.flame_vorticity, 3.0);
+    assert_eq!(c.ignition_temperature, 1.0);
+    assert_eq!(c.max_temperature, 2.0);
     let on = resolve_params(&serde_json::json!({})).unwrap();
     assert!(
         on.step_constants(FieldDims::new(8, 6, 5), 0.1, 0.125)
@@ -246,97 +354,10 @@ fn gauss_seidel(solver: &str) -> String {
     doc
 }
 
-struct Session {
-    gpu: GpuContext,
-    pool: FieldPool,
-    pipelines: PipelineCache,
-    graph: Graph,
-    dims: FieldDims,
-}
-
-impl Session {
-    fn new(doc: &str) -> Self {
-        let (graph, dims) = Document::from_json(doc)
-            .unwrap()
-            .into_graph(&elements_ember::registry())
-            .unwrap();
-        Self {
-            gpu: gpu(),
-            pool: FieldPool::new(),
-            pipelines: PipelineCache::new(),
-            graph,
-            dims,
-        }
-    }
-
-    fn density_bits(&mut self, timeline: &mut Timeline, frame: u32) -> Vec<u32> {
-        let evaluated = timeline
-            .goto(
-                &self.graph,
-                &self.gpu,
-                &mut self.pool,
-                &mut self.pipelines,
-                self.dims,
-                frame,
-            )
-            .unwrap();
-        let bits = evaluated
-            .value
-            .as_field()
-            .unwrap()
-            .read_back(&self.gpu)
-            .unwrap()
-            .iter()
-            .map(|v| v.to_bits())
-            .collect();
-        evaluated.value.release_to(&mut self.pool);
-        bits
-    }
-}
-
-fn timeline(budget_bytes: u64) -> Timeline {
-    Timeline::new(TimelineConfig {
-        fps: 24.0,
-        start_frame: 1,
-        cache_budget_bytes: budget_bytes,
-    })
-}
-
 /// Umbrella §4 and §6: frame 40 is bit-identical in order, after scrubbing
 /// back and forth, and after eviction forced a recompute.
 fn assert_frame_40_is_bit_identical(solver: &str) {
     assert_doc_frame_40_is_bit_identical(&plume_16(solver));
-}
-
-fn assert_doc_frame_40_is_bit_identical(doc: &str) {
-    let mut s = Session::new(doc);
-
-    let mut in_order = timeline(0);
-    let mut reference = Vec::new();
-    for frame in 1..=40 {
-        reference = s.density_bits(&mut in_order, frame);
-    }
-    assert!(
-        reference.iter().any(|&b| f32::from_bits(b) != 0.0),
-        "the plume must exist"
-    );
-
-    let mut scrubbed = timeline(512 * 1024 * 1024);
-    s.density_bits(&mut scrubbed, 40);
-    s.density_bits(&mut scrubbed, 10);
-    assert!(
-        s.density_bits(&mut scrubbed, 40) == reference,
-        "after scrubbing"
-    );
-
-    // About ten 16³ snapshots fit, so reaching 40 evicts most of them.
-    let mut evicting = timeline(1024 * 1024);
-    s.density_bits(&mut evicting, 40);
-    s.density_bits(&mut evicting, 5);
-    assert!(
-        s.density_bits(&mut evicting, 40) == reference,
-        "after eviction"
-    );
 }
 
 #[test]

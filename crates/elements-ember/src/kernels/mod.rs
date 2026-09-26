@@ -7,6 +7,7 @@
 
 mod advect;
 pub mod conserve;
+mod fire;
 mod forces;
 pub mod mgpcg;
 pub mod multigrid;
@@ -15,6 +16,7 @@ mod solid;
 mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
+pub use fire::{burn, emit_fuel, flame};
 pub use forces::{blend_velocity, buoyancy, emit, wind};
 pub use mgpcg::mgpcg;
 pub use multigrid::{Hierarchy, v_cycle_from_zero, v_cycles};
@@ -63,6 +65,20 @@ pub struct StepConstants {
     /// Whether each scalar advection is followed by the global mass
     /// correction (2b-3c spec §5).
     pub conserve_mass: bool,
+    /// Whether this substep burns fuel: the solver's fuel input is
+    /// connected (2b-4 spec §3). On, velocity faces are also traced back
+    /// with one Euler step instead of RK2's midpoint (§3.2 step 5). Off,
+    /// every fire field below is ignored.
+    pub fire: bool,
+    /// Fuel burnt per second.
+    pub burning_rate: f32,
+    /// Smoke per unit fuel burnt.
+    pub flame_smoke: f32,
+    /// Confinement per unit fuel, 1/s.
+    pub flame_vorticity: f32,
+    /// The flame's edge and core temperatures.
+    pub ignition_temperature: f32,
+    pub max_temperature: f32,
 }
 
 impl StepConstants {
@@ -86,11 +102,17 @@ impl StepConstants {
             wind_rate: 0.0,
             has_solids: false,
             conserve_mass: false,
+            fire: false,
+            burning_rate: 0.0,
+            flame_smoke: 0.0,
+            flame_vorticity: 0.0,
+            ignition_temperature: 0.0,
+            max_temperature: 0.0,
         }
     }
 }
 
-/// Matches `Params` in `common.wgsl`, 64 bytes.
+/// Matches `Params` in `common.wgsl`, 96 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct KernelParams {
@@ -108,12 +130,19 @@ struct KernelParams {
     face_wind: f32,
     has_solids: u32,
     wind_blend: f32,
+    flame_confinement: f32,
+    burn: f32,
+    flame_smoke: f32,
+    ignition_temperature: f32,
+    max_temperature: f32,
+    euler_faces: u32,
+    _pad: [u32; 2],
 }
 
-// `Params` in `shaders/common.wgsl` is 64 bytes; a field added here without
+// `Params` in `shaders/common.wgsl` is 96 bytes; a field added here without
 // its WGSL twin (or padding) fails the build instead of silently shifting
 // every uniform the kernels read.
-const _: () = assert!(std::mem::size_of::<KernelParams>() == 64);
+const _: () = assert!(std::mem::size_of::<KernelParams>() == 96);
 
 pub(crate) fn axis_index(axis: Axis) -> u32 {
     match axis {
@@ -126,15 +155,20 @@ pub(crate) fn axis_index(axis: Axis) -> u32 {
 /// One uniform buffer per grid an advection pass can carry, built once per
 /// substep and shared by every kernel in it.
 pub struct Uniforms {
-    /// One per face axis: `axis` 0, 1, 2 and `decay` 1.
+    /// One per face axis: `axis` 0, 1, 2 and `decay` 1. With fire on they
+    /// set `euler_faces`, so advection traces faces with one Euler step.
     faces: [wgpu::Buffer; 3],
-    /// Cell grids (`axis` = CELL), each with its scalar's `decay`.
+    /// Cell grids (`axis` = CELL), each with its scalar's `decay`. They
+    /// always trace with RK2.
     density: wgpu::Buffer,
     temperature: wgpu::Buffer,
+    /// Fuel and react: decay 1, never dissipated (2b-4 spec §3.2).
+    cell: wgpu::Buffer,
     cells: FieldDims,
     open_mask: u32,
     wind: bool,
     has_solids: bool,
+    fire: bool,
     /// Bound as `solid` and `obstacle` when there are no solids. Kept so it
     /// outlives its view.
     _placeholder: wgpu::Texture,
@@ -143,6 +177,7 @@ pub struct Uniforms {
 
 impl Uniforms {
     pub fn new(gpu: &GpuContext, c: &StepConstants) -> Result<Self, GpuError> {
+        const CELL: u32 = 3; // `CELL` in common.wgsl
         let make = |axis: u32, decay: f32| {
             let params = KernelParams {
                 dims: [c.cells.x, c.cells.y, c.cells.z],
@@ -165,6 +200,22 @@ impl Uniforms {
                 // The fraction of the way to the wind one substep closes:
                 // exact for any h, so the stage cannot overshoot.
                 wind_blend: 1.0 - (-c.wind_rate * c.h).exp(),
+                // Fire off leaves both at 0, so confinement and the burn
+                // are exactly what they were before fire (2b-4 spec §3.4).
+                flame_confinement: if c.fire {
+                    c.flame_vorticity * c.dx
+                } else {
+                    0.0
+                },
+                burn: if c.fire { c.burning_rate * c.h } else { 0.0 },
+                flame_smoke: c.flame_smoke,
+                ignition_temperature: c.ignition_temperature,
+                max_temperature: c.max_temperature,
+                // Velocity faces trace back with one Euler step while fire
+                // burns; scalars keep RK2, and so does everything with fire
+                // off (2b-4 spec §3.2 step 5).
+                euler_faces: u32::from(c.fire && axis != CELL),
+                _pad: [0; 2],
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -173,12 +224,12 @@ impl Uniforms {
                     usage: wgpu::BufferUsages::UNIFORM,
                 })
         };
-        const CELL: u32 = 3; // `CELL` in common.wgsl
-        let (faces, density, temperature) = gpu.scoped(|| {
+        let (faces, density, temperature, cell) = gpu.scoped(|| {
             (
                 [make(0, 1.0), make(1, 1.0), make(2, 1.0)],
                 make(CELL, (-c.density_dissipation * c.h).exp()),
                 make(CELL, (-c.temperature_dissipation * c.h).exp()),
+                make(CELL, 1.0),
             )
         })?;
         let placeholder = gpu.scoped(|| {
@@ -202,10 +253,12 @@ impl Uniforms {
             faces,
             density,
             temperature,
+            cell,
             cells: c.cells,
             open_mask: c.open_mask,
             wind: c.wind_rate > 0.0,
             has_solids: c.has_solids,
+            fire: c.fire,
             _placeholder: placeholder,
             placeholder_view,
         })
@@ -231,6 +284,11 @@ impl Uniforms {
         self.has_solids
     }
 
+    /// Whether fire is on, as in `StepConstants::fire`.
+    pub(crate) fn fire(&self) -> bool {
+        self.fire
+    }
+
     /// A 1×1×1 texture bound where a kernel has no mask or no obstacle to read.
     pub(crate) fn placeholder(&self) -> &wgpu::TextureView {
         &self.placeholder_view
@@ -250,6 +308,7 @@ impl Uniforms {
             Carried::Face(axis) => self.axis(axis),
             Carried::Density => &self.density,
             Carried::Temperature => &self.temperature,
+            Carried::Fuel | Carried::React => &self.cell,
         }
     }
 }

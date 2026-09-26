@@ -169,7 +169,17 @@ pub fn read_frame_with(
     })?;
     let mut reader = VdbReader::new(BufReader::new(file)).map_err(|e| parse(path, e))?;
 
-    check_grid(&reader, path, density_grid, FLOAT_TREE)?;
+    // Density: one value per cell. Every stored voxel counts as smoke for
+    // `missing_velocity`, zero-valued ones included.
+    let Some((density, has_density)) = read_float_grid_stored(path, cells, density_grid)? else {
+        let mut found = reader.available_grids();
+        found.sort();
+        return Err(CacheError::MissingGrid {
+            path: path.to_owned(),
+            grid: density_grid.to_owned(),
+            found,
+        });
+    };
     check_grid(&reader, path, velocity_grid, VEC3_TREE)?;
 
     let out_of_domain = |grid: &str, index: [i32; 3]| CacheError::OutOfDomain {
@@ -178,22 +188,6 @@ pub fn read_frame_with(
         index,
         cells: [cells.x, cells.y, cells.z],
     };
-
-    // Density: one value per cell.
-    let grid = reader
-        .read_grid::<f32>(density_grid)
-        .map_err(|e| parse(path, e))?;
-    let mut density = vec![0.0f32; cells.voxel_count()];
-    let mut has_density = vec![false; cells.voxel_count()];
-    for (at, value, level) in grid.iter() {
-        for index in expand([at.x, at.y, at.z], level) {
-            let [i, j, k] =
-                in_domain(index, cells).ok_or_else(|| out_of_domain(density_grid, index))?;
-            let n = i + cells.x as usize * (j + cells.y as usize * k);
-            density[n] = value;
-            has_density[n] = true;
-        }
-    }
 
     // Velocity: index (i, j, k) is the −x, −y and −z face of cell (i, j, k),
     // which is face index (i, j, k) of each axis's face grid.
@@ -223,6 +217,58 @@ pub fn read_frame_with(
         faces,
         missing_velocity: missing_cells(&has_density, &has_velocity, cells),
     })
+}
+
+/// One float grid of a cache frame (`fuel`, `flame`, `temperature`, …),
+/// x-fastest at `cells`, 0 where the file stores nothing. `None` when the
+/// file has no grid of that name.
+pub fn read_float_grid(
+    path: &Path,
+    cells: FieldDims,
+    grid_name: &str,
+) -> Result<Option<Vec<f32>>, CacheError> {
+    Ok(read_float_grid_stored(path, cells, grid_name)?.map(|(values, _)| values))
+}
+
+/// A float grid's values and, per cell, whether the file stores it.
+type StoredGrid = (Vec<f32>, Vec<bool>);
+
+/// One float grid of a cache frame, x-fastest at `cells`, 0 where the file
+/// stores nothing, with a flag per cell for "stored". `None` when the file
+/// has no grid of that name.
+fn read_float_grid_stored(
+    path: &Path,
+    cells: FieldDims,
+    grid_name: &str,
+) -> Result<Option<StoredGrid>, CacheError> {
+    let file = File::open(path).map_err(|source| CacheError::Open {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut reader = VdbReader::new(BufReader::new(file)).map_err(|e| parse(path, e))?;
+    if !reader.available_grids().iter().any(|g| g == grid_name) {
+        return Ok(None);
+    }
+    check_grid(&reader, path, grid_name, FLOAT_TREE)?;
+    let grid = reader
+        .read_grid::<f32>(grid_name)
+        .map_err(|e| parse(path, e))?;
+    let mut values = vec![0.0f32; cells.voxel_count()];
+    let mut stored = vec![false; cells.voxel_count()];
+    for (at, value, level) in grid.iter() {
+        for index in expand([at.x, at.y, at.z], level) {
+            let [i, j, k] = in_domain(index, cells).ok_or_else(|| CacheError::OutOfDomain {
+                path: path.to_owned(),
+                grid: grid_name.to_owned(),
+                index,
+                cells: [cells.x, cells.y, cells.z],
+            })?;
+            let n = i + cells.x as usize * (j + cells.y as usize * k);
+            values[n] = value;
+            stored[n] = true;
+        }
+    }
+    Ok(Some((values, stored)))
 }
 
 fn parse(path: &Path, e: vdb_rs::ParseError) -> CacheError {

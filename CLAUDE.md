@@ -22,8 +22,8 @@ confinement, dissipation, per-face boundaries, and the `preview` and `final`
 presets (`docs/bench/presets.md`). Preview runs one CFL-clamped substep, now
 about 71 ms a 128³ frame. Open risks in §6 of the piece 2 spec: the open
 part of (g), GPU out-of-memory on unified memory; (j), preview's frame cost;
-(k), preview's budget after 2b-2's solids; and (m), preview's ×4
-under-converging around thin colliders.
+(k), preview's budget after 2b-2's solids; (m), preview's ×4
+under-converging around thin colliders; and (n), fire's preview cost.
 **2b-2**, scene content, is complete: keyframed box and
 sphere emitters (with noise and velocity emission) and colliders, unions of
 each, and wind
@@ -44,7 +44,19 @@ after a parameter change at 128³ Ember reaches frame N about 7–10× sooner th
 Mantaflow re-bakes (under load, which may favour Ember), and the renders show
 Ember matching Mantaflow's large-scale shape in `plume` and `plume_collider` with
 visibly less fine detail (`plume_wind` differs by construction).
-Flame is next, as 2b-4. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
+**2b-4**, fire, is complete
+(`docs/superpowers/specs/2026-09-25-ember-fire-2b4-design.md`): a fuel input
+that burns into heat and smoke, a `flame` output (√react), and a `fire`
+benchmark scene. While fire burns, velocity faces are traced back with one
+Euler step instead of RK2's midpoint (MacCormack still applies); the RK2
+midpoint backtrace blew up flame vorticity at one substep. Fuel is clamped
+to [0, 10] at emission as in Mantaflow. In the fire benchmark
+(`docs/bench/results.md`, Fire) Ember is 4.9–6.0× faster, holds 0.88–1.42×
+Mantaflow's fuel at frame 60, and leaves 4–28× Mantaflow's divergence. A 128³
+fire preview frame takes 103.5 ms under load, over budget: risk (n)
+(`docs/bench/presets-fire.md`). The side-by-side render is in
+`docs/bench/render/`: the fires share a base and height, but Ember's is a
+narrower column and still burns at frame 90 after Mantaflow's has gone out. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
 branch `ember-node-editor`) is designed and planned but paused.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
@@ -64,6 +76,8 @@ branch `ember-node-editor`) is designed and planned but paused.
 - Latency and render comparison: `docs/bench/latency.md`, `docs/bench/render/README.md`
 - Ember piece 2b-3c spec: `docs/superpowers/specs/2026-09-24-ember-solver-quality-2b3c-design.md`
 - Ember piece 2b-3c plan: `docs/superpowers/plans/2026-09-24-ember-solver-quality-2b3c.md`
+- Ember piece 2b-4 spec and plan: `docs/superpowers/specs/2026-09-25-ember-fire-2b4-design.md`, `docs/superpowers/plans/2026-09-25-ember-fire-2b4.md`
+- Fire preview cost: `docs/bench/presets-fire.md`
 - Mantaflow benchmark results and cache notes: `docs/bench/results.md` (2b-3c's rerun; 2b-3's run is in `docs/bench/results-2b3/`), `docs/bench/mantaflow-notes.md`
 - Solver gate (Gauss–Seidel, multigrid and MGPCG): `docs/bench/solver-gate.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
@@ -87,7 +101,7 @@ just blender-test # Blender integration test; finds the macOS app bundle
 just golden       # regenerate golden files (review the PNG by eye first)
 just bench-gate   # the 128³ speed gate; minutes long, real GPU, not in `check`
 just bench-sweep  # pressure-iteration sweep past the gate, for choosing presets
-just bench-presets # the preview preset's substep cap; minutes, real GPU, not in check
+just bench-presets # the preview preset's substep cap (`PRESET_SCENE=fire` for fire's cost); minutes, real GPU
 just bench-solver # the 2b-3c solver gate; about an hour, real GPU, not in check
 just bench-latency # 2b-3b latency, Ember and Mantaflow at 128³; about 30 min, real GPU and Blender
 just bench-render # 2b-3b side-by-side Cycles stills into docs/bench/render/; needs Blender

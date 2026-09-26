@@ -4,9 +4,12 @@
 //!   benchmark ember SCENE RES      time and measure Ember
 //!   benchmark scene-json SCENE RES print the scene's Mantaflow twin as JSON,
 //!                                  for tests/bench/mantaflow_scene.py
-//!   benchmark document SCENE RES   print the scene's `.elements` document,
+//!   benchmark document SCENE RES [OUTPUT]
+//!                                  print the scene's `.elements` document,
 //!                                  for `elements-cli bake` (the render
-//!                                  comparison, 2b-3b §3)
+//!                                  comparison, 2b-3b §3); OUTPUT is the
+//!                                  solver output it ends at, `density`
+//!                                  (the default) or `flame`
 //!   benchmark mantaflow SCENE RES  bake, time and measure Mantaflow in
 //!                                  Blender ($BLENDER_BIN, or the macOS app)
 //!   benchmark latency SCENE RES    time Ember from a parameter change to
@@ -33,11 +36,11 @@ use elements_core::gpu::{Axis, FieldDims, FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::report::{
     Context, LatencyPoint, LatencySummary, RunSummary, latency_markdown, load_average,
-    results_markdown, single_commit, single_latency_blender, single_latency_commit, write_latency,
+    results_markdown, scene_commits, single_latency_blender, single_latency_commit, write_latency,
     write_summary,
 };
 use elements_ember::bench::{EMISSION_FRAMES, SOLVER_NODE, Scene};
-use elements_ember::metrics::{FrameMetrics, Sample, drift, measure};
+use elements_ember::metrics::{FrameMetrics, Sample, drift, fire_metrics, measure};
 use elements_ember::solver;
 
 use common::{commit_label_excluding, median, shell};
@@ -71,6 +74,7 @@ fn scene(name: &str, res: u32) -> Res<Scene> {
         "plume" => Scene::plume(res),
         "plume_collider" => Scene::plume_collider(res),
         "plume_wind" => Scene::plume_wind(res),
+        "fire" => Scene::fire(res),
         _ => return Err(format!("unknown scene {name}").into()),
     })
 }
@@ -139,14 +143,33 @@ fn metrics_run(gpu: &GpuContext, registry: &NodeRegistry, scene: &Scene) -> Res<
             velocity.face(Axis::Y).read_back(gpu)?,
             velocity.face(Axis::Z).read_back(gpu)?,
         ];
-        out.push(measure(&Sample {
+        let mut m = measure(&Sample {
             cells: dims,
             dx,
             density: &density,
             faces: &faces,
             solid: &solid,
             open_mask: scene.solver.boundaries.open_mask(),
-        }));
+        });
+        if scene.emitter.fuel_rate > 0.0 {
+            let read = |slot: &'static str| -> Res<Vec<f32>> {
+                Ok(state
+                    .get(SOLVER_NODE, slot)
+                    .ok_or_else(|| format!("no solver {slot} in state"))?
+                    .as_field()?
+                    .read_back(gpu)?)
+            };
+            let fuel = read(solver::FUEL)?;
+            // The solver's flame output: √react, with react clamped to [0, 1].
+            let flame: Vec<f32> = read(solver::REACT)?
+                .iter()
+                .map(|r| r.clamp(0.0, 1.0).sqrt())
+                .collect();
+            let (fuel_mass, flame_volume) = fire_metrics(&fuel, &flame, dx);
+            m.fuel_mass = Some(fuel_mass);
+            m.flame_volume = Some(flame_volume);
+        }
+        out.push(m);
     }
     state.clear(&mut pool);
     Ok(out)
@@ -474,14 +497,29 @@ fn run_mantaflow(name: &str, res: u32) -> Res<()> {
         // is a collider wall, which no metric reads (notes: Clipping).
         omitted += common::mantaflow::check_coverage(&f, &solid, cells)
             .map_err(|e| context(with_stderr(format!("frame {n}: {e}"), &tail)))?;
-        frames.push(measure(&Sample {
+        let mut m = measure(&Sample {
             cells,
             dx,
             density: &f.density,
             faces: &f.faces,
             solid: &solid,
             open_mask: scene.solver.boundaries.open_mask(),
-        }));
+        });
+        if scene.emitter.fuel_rate > 0.0 {
+            // Only a resumable cache holds `fuel` (notes: Fire, grid
+            // inventory); like `flame`, it is stored on density's voxels.
+            let grid = |name: &str| -> Res<Vec<f32>> {
+                common::mantaflow::read_float_grid(&path, cells, name)
+                    .map_err(|e| context(with_stderr(format!("frame {n}: {e}"), &tail)))?
+                    .ok_or_else(|| {
+                        context(with_stderr(format!("frame {n}: no {name} grid"), &tail))
+                    })
+            };
+            let (fuel_mass, flame_volume) = fire_metrics(&grid("fuel")?, &grid("flame")?, dx);
+            m.fuel_mass = Some(fuel_mass);
+            m.flame_volume = Some(flame_volume);
+        }
+        frames.push(m);
     }
     if omitted > 0 {
         eprintln!(
@@ -670,13 +708,13 @@ fn report() -> Res<()> {
             }
         }
     }
-    // The header names the commit the results came from, not the one that
-    // happens to build the report.
-    let commit = single_commit(&summaries).map_err(|lines| {
+    // The header names the commits the results came from, not the one that
+    // happens to build the report. Each scene must come from one commit.
+    let commit = scene_commits(&summaries).map_err(|lines| {
         for l in &lines {
             eprintln!("{l}");
         }
-        "result files come from more than one commit; results.md not written"
+        "a scene's result files come from more than one commit; results.md not written"
     })?;
     let ctx = Context {
         machine: shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
@@ -736,16 +774,25 @@ fn run() -> Res<()> {
             println!("{}", scene(name, res.parse()?)?.document().to_json()?);
             Ok(())
         }
+        ["document", name, res, output] => {
+            let socket = match *output {
+                "density" => 0,
+                "flame" => 3,
+                o => return Err(format!("unknown output {o}").into()),
+            };
+            let doc = scene(name, res.parse()?)?.document_with_output(socket);
+            println!("{}", doc.to_json()?);
+            Ok(())
+        }
         ["scene-json", name, res] => {
             let json = scene(name, res.parse()?)?.mantaflow_json();
             println!("{}", serde_json::to_string_pretty(&json)?);
             Ok(())
         }
-        _ => Err(
-            "usage: benchmark ember SCENE RES | scene-json SCENE RES | document SCENE RES \
+        _ => Err("usage: benchmark ember SCENE RES | scene-json SCENE RES \
+             | document SCENE RES [density|flame] \
              | mantaflow SCENE RES \
              | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report [LOADAVG]"
-                .into(),
-        ),
+            .into()),
     }
 }

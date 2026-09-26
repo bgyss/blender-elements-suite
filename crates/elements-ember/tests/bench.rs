@@ -393,6 +393,8 @@ fn a_summary_round_trips_through_its_file() {
         centroid_m: if n > 1.0 { Some(0.3 * n) } else { None },
         top_m: Some(0.4 * n),
         outflow_rate: 0.01 * n,
+        fuel_mass: Some(0.5 * n),
+        flame_volume: None,
     };
     let s = report::RunSummary {
         solver: "ember".into(),
@@ -460,6 +462,7 @@ fn the_mantaflow_json_carries_every_matched_parameter() {
 /// A run with 120 frames of made-up metrics; only the shape matters to the
 /// results table.
 fn summary(solver: &str, scene: &str, res: u32) -> report::RunSummary {
+    let fire = scene == "fire";
     let frames = (1..=120)
         .map(|n| {
             let n = f64::from(n);
@@ -474,6 +477,10 @@ fn summary(solver: &str, scene: &str, res: u32) -> report::RunSummary {
                 centroid_m: Some(0.01 * n),
                 top_m: Some(0.015 * n),
                 outflow_rate: 0.0,
+                // Distinct from each other, so a column reading the wrong
+                // field shows up as a wrong number.
+                fuel_mass: fire.then_some(0.1 * n),
+                flame_volume: fire.then_some(0.03 * n),
             }
         })
         .collect();
@@ -562,20 +569,39 @@ fn the_results_row_pins_drift_frames_and_per_cell_values() {
 }
 
 #[test]
-fn the_report_refuses_summaries_from_more_than_one_commit() {
+fn the_report_refuses_a_scene_from_more_than_one_commit() {
     let mut s = all();
-    assert_eq!(report::single_commit(&s), Ok("abc1234".to_owned()));
     s[4].commit = "def5678".into();
-    let lines = report::single_commit(&s).unwrap_err();
-    assert_eq!(lines.len(), s.len(), "every file is listed with its commit");
+    assert_eq!(s[4].scene, "plume_collider");
+    let lines = report::scene_commits(&s).unwrap_err();
     assert!(
         lines.contains(&"ember-plume_collider-128: def5678".to_owned()),
         "{lines:?}"
     );
     assert!(
-        lines.contains(&"ember-plume-64: abc1234".to_owned()),
+        lines.contains(&"mantaflow-plume_collider-64: abc1234".to_owned()),
         "{lines:?}"
     );
+}
+
+/// The notes pool the smoke scenes' mass ratios into one range, so those
+/// scenes must share one commit even when each is internally consistent.
+#[test]
+fn the_smoke_scenes_must_share_one_commit() {
+    let mut s = all();
+    for r in s.iter_mut().filter(|r| r.scene == "plume_wind") {
+        r.commit = "def5678".into();
+    }
+    let lines = report::scene_commits(&s).unwrap_err();
+    assert!(
+        lines.contains(&"ember-plume_wind-64: def5678".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"mantaflow-plume-256: abc1234".to_owned()),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("fire")), "{lines:?}");
 }
 
 /// The drift-at-80 cell says when a run's outflow started, and how much of
@@ -684,6 +710,102 @@ fn the_notes_name_the_preview_presets_pressure_solve() {
     );
 }
 
+/// The fire scene's own table gives fuel mass and flame volume at frames
+/// 30, 60 and 90, each from its own field.
+#[test]
+fn the_fire_table_gives_fuel_mass_and_flame_volume() {
+    let md = report::results_markdown(&all(), &context()).unwrap();
+    assert!(
+        md.contains(
+            "| solver | cells | fuel mass (30 / 60 / 90) | flame volume m³ (30 / 60 / 90) |"
+        ),
+        "{md}"
+    );
+    // Fuel 0.1 n and flame 0.03 n.
+    assert!(
+        md.contains("| ember | 64³ | 3.00 / 6.00 / 9.00 | 0.900 / 1.80 / 2.70 |"),
+        "{md}"
+    );
+    assert!(
+        md.contains("| mantaflow | 256³ | 3.00 / 6.00 / 9.00 |"),
+        "{md}"
+    );
+}
+
+/// The notes say what `fire`'s smoke columns count and how the solvers'
+/// density differs there.
+#[test]
+fn the_notes_say_fire_smoke_comes_from_burning() {
+    let md = report::results_markdown(&all(), &context()).unwrap();
+    assert!(md.contains("describe the smoke made by burning"), "{md}");
+    assert!(md.contains("clamps density to [0, 1]"), "{md}");
+    assert!(md.contains("whose flame is above 0.01"), "{md}");
+}
+
+/// Result files written before fire have no fuel or flame keys; they still
+/// load, with both `None`.
+#[test]
+fn a_frame_from_before_fire_has_no_fuel_or_flame() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/bench/results/ember-plume-64.json"
+    );
+    let s: report::RunSummary =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(!s.frames.is_empty());
+    assert!(s.frames.iter().all(|f| f.fuel_mass.is_none()));
+    assert!(s.frames.iter().all(|f| f.flame_volume.is_none()));
+}
+
+/// The emitted-mass note compares emission, which `fire` does not have: its
+/// smoke comes from burning, so its runs stay out of the ratio.
+#[test]
+fn the_emitted_mass_ratio_leaves_out_fire() {
+    let mut s = all();
+    for r in s
+        .iter_mut()
+        .filter(|r| r.solver == "ember" && r.scene == "fire")
+    {
+        for f in &mut r.frames {
+            f.mass *= 3.0;
+        }
+    }
+    let md = report::results_markdown(&s, &context()).unwrap();
+    assert!(
+        md.contains("over frames 12–24, Ember's mass is 1.00–1.00× Mantaflow's"),
+        "{md}"
+    );
+}
+
+/// Every scene's runs must come from one commit, but scenes may differ: a
+/// scene added later is run at its own commit, and the header says which.
+#[test]
+fn each_scene_needs_one_commit_and_the_header_names_each() {
+    let mut s = all();
+    assert_eq!(report::scene_commits(&s), Ok("abc1234".to_owned()));
+    for r in s.iter_mut().filter(|r| r.scene == "fire") {
+        r.commit = "fff0000".into();
+    }
+    assert_eq!(
+        report::scene_commits(&s),
+        Ok("abc1234 (`plume`, `plume_collider`, `plume_wind`); fff0000 (`fire`)".to_owned())
+    );
+    s[0].commit = "def5678".into();
+    let lines = report::scene_commits(&s).unwrap_err();
+    assert!(
+        lines.contains(&"ember-plume-64: def5678".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"mantaflow-plume-64: abc1234".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("fire")),
+        "only the mixed scene is listed: {lines:?}"
+    );
+}
+
 /// Mantaflow's twin is built for a cube (one `dx` in `mapping.py`).
 #[test]
 #[should_panic(expected = "needs a cubic domain")]
@@ -754,7 +876,7 @@ fn latency(solver: &str, scene: &str, per_frame: f64) -> report::LatencySummary 
 }
 
 fn all_latency() -> Vec<report::LatencySummary> {
-    report::SCENES
+    report::LATENCY_SCENES
         .into_iter()
         .flat_map(|scene| {
             [
@@ -768,7 +890,7 @@ fn all_latency() -> Vec<report::LatencySummary> {
 #[test]
 fn the_latency_table_gives_mantaflow_over_ember_per_frame() {
     let md = report::latency_markdown(&all_latency(), &context(), None).unwrap();
-    for scene in report::SCENES {
+    for scene in report::LATENCY_SCENES {
         assert!(md.contains(&format!("## `{scene}` (128³)")), "{md}");
     }
     // Mantaflow 0.5 s a frame against Ember's 0.02: 25× at every N.

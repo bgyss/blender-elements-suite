@@ -23,6 +23,10 @@ pub const EMISSION_FRAMES: [u32; 2] = [1, 60];
 /// The solver's node id in every `Scene::document`.
 pub const SOLVER_NODE: NodeId = NodeId(1);
 
+/// The fire scene's fuel rate per second: Blender's default flow fuel
+/// amount, 1 per frame, at 24 fps (`mapping.fire`).
+pub const FIRE_FUEL_RATE: f32 = 24.0;
+
 /// A benchmark scene, defined once (spec §5.3). It generates the `.elements`
 /// document; the matching Mantaflow scene comes from the same values
 /// (`docs/superpowers/specs/2026-09-23-ember-mantaflow-benchmark-2b3-design.md`).
@@ -138,6 +142,17 @@ impl Scene {
             pos_x: Face::Open,
             ..Boundaries::default()
         };
+        scene
+    }
+
+    /// `plume`'s sphere emitting fuel instead of smoke, with Blender's
+    /// default fire settings mapped to Ember (2b-4 spec §6.2). Smoke comes
+    /// only from burning; the emitter's heat rises as `plume`'s does.
+    pub fn fire(resolution: u32) -> Self {
+        let mut scene = Self::plume(resolution);
+        scene.name = "fire";
+        scene.emitter.density_rate = 0.0;
+        scene.emitter.fuel_rate = FIRE_FUEL_RATE;
         scene
     }
 
@@ -259,8 +274,16 @@ impl Scene {
                 "radius": radius,
                 "density_rate": decimal(self.emitter.density_rate),
                 "temperature_rate": decimal(self.emitter.temperature_rate),
+                "fuel_rate": decimal(self.emitter.fuel_rate),
                 "active_frames": self.emitter.active_frames,
             },
+            "fire": (self.emitter.fuel_rate > 0.0).then(|| serde_json::json!({
+                "burning_rate": decimal(s.burning_rate),
+                "flame_smoke": decimal(s.flame_smoke),
+                "flame_vorticity": decimal(s.flame_vorticity),
+                "ignition_temperature": decimal(s.ignition_temperature),
+                "max_temperature": decimal(s.max_temperature),
+            })),
             "buoyancy_density": decimal(s.buoyancy_density),
             "buoyancy_temperature": decimal(s.buoyancy_temperature),
             "vorticity": decimal(s.vorticity),
@@ -281,8 +304,16 @@ impl Scene {
     }
 
     /// The scene as an `.elements` document: emitter → solver → output, plus
-    /// the collider when there is one.
+    /// the collider when there is one. Equivalent to
+    /// `document_with_output(0)`, the solver's density output.
     pub fn document(&self) -> Document {
+        self.document_with_output(0)
+    }
+
+    /// The scene as an `.elements` document with the solver's `socket` wired
+    /// to the output, plus the collider when there is one and the fuel edge
+    /// when the emitter has a fuel rate.
+    pub fn document_with_output(&self, socket: u32) -> Document {
         let to_value = |v: serde_json::Result<serde_json::Value>| {
             v.expect("scene parameters are plain numbers and always serialize")
         };
@@ -309,7 +340,10 @@ impl Scene {
                 params: serde_json::json!({}),
             },
         ];
-        let mut edges = vec![edge(0, 0, 1, 0), edge(0, 1, 1, 1), edge(1, 0, 2, 0)];
+        let mut edges = vec![edge(0, 0, 1, 0), edge(0, 1, 1, 1), edge(1, socket, 2, 0)];
+        if self.emitter.fuel_rate > 0.0 {
+            edges.push(edge(0, 4, 1, 6));
+        }
         // Colliders take ids 3, 4, …; each union after them merges the
         // running result with the next collider.
         let mut merged = None;

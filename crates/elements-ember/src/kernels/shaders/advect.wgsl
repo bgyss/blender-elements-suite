@@ -1,8 +1,9 @@
-// Stages 3 and 5: one RK2 semi-Lagrangian pass over one grid, either a
+// Stages 3 and 5: one semi-Lagrangian pass over one grid, either a
 // velocity face (params.axis 0–2) or a cell-centred scalar (params.axis =
-// CELL). MacCormack runs `forward`, then `backward`, then the correction in
-// `maccormack.wgsl`. Plain semi-Lagrangian runs `semi_lagrangian` alone,
-// which applies the scalar's dissipation too.
+// CELL), traced back by `backtrace` in velocity.wgsl (RK2, or Euler for
+// faces while fire burns). MacCormack runs `forward`, then `backward`,
+// then the correction in `maccormack.wgsl`. Plain semi-Lagrangian runs
+// `semi_lagrangian` alone, which applies the scalar's dissipation too.
 
 @group(0) @binding(0) var vel_x: texture_3d<f32>;
 @group(0) @binding(1) var vel_y: texture_3d<f32>;
@@ -32,7 +33,8 @@ fn pass_over(gid: vec3<u32>, direction: f32, decay: f32) {
             return;
         }
     }
-    // Scalars inside solids are zeroed every substep (spec §3.2), as Mantaflow's resetInObstacle does.
+    // Scalars inside solids are zeroed every substep (spec §3.2), as
+    // Mantaflow's resetInObstacle does.
     if (axis == CELL && cell_solid(p)) {
         textureStore(dst, p, vec4<f32>(0.0));
         return;

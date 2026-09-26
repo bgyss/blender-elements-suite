@@ -95,7 +95,9 @@ goes in 2b-3's mapping notes and is not copied.
 
 **RK2 midpoint backtrace**, for velocity faces and scalar cells alike:
 `x_mid = x − ½h·u(x)`, `x_back = x − h·u(x_mid)`. This replaces 2a's single
-Euler step and doubles the velocity sampling per backtrace.
+Euler step and doubles the velocity sampling per backtrace. Piece 2b-4 §3.2
+step 5 revisits this for velocity faces only: while fire burns, they are
+traced back with one Euler step instead.
 
 **MacCormack** (Selle et al. 2008) when `advection = "maccormack"`, as three
 dispatches per advected quantity (per face axis for velocity):

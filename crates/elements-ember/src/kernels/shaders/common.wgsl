@@ -17,6 +17,14 @@ struct Params {
     face_wind: f32,      // wind velocity along this uniform's axis, m/s; 0 for cell grids
     has_solids: u32,     // 1 when a collider's solid mask is bound (2b-2 spec §3.2)
     wind_blend: f32,     // 1 − exp(−wind_rate·h): how far one substep relaxes towards the wind
+    flame_confinement: f32,  // flame_vorticity·dx with fire on, else 0: confinement per unit fuel
+    burn: f32,               // burning_rate·h with fire on, else 0: fuel burnt this substep
+    flame_smoke: f32,        // smoke per unit fuel burnt
+    ignition_temperature: f32,
+    max_temperature: f32,
+    euler_faces: u32,        // 1 on face uniforms with fire on: backtrace with one Euler step
+    _pad1: u32,
+    _pad2: u32,
 };
 
 // `axis` for a cell-centred grid.

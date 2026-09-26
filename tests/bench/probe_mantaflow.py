@@ -25,6 +25,13 @@ Options, all optional, for the experiments in docs/bench/mantaflow-notes.md:
   open=S1,S2,...    then open these borders (left, right, front, back, bottom, top)
   heat_fill=T       add a second flow filling the domain: temperature T, no density
   script=0|1        also export Blender's generated Mantaflow script
+  fire=1            make the flow a FIRE flow (fuel, no smoke)
+  fuel=F            the flow's fuel_amount
+  burning=B         the domain's burning_rate
+  flame_smoke=S     the domain's flame_smoke
+  flame_vorticity=V the domain's flame_vorticity
+  ignition=T maxtemp=T  the domain's flame_ignition and flame_max_temp
+  resumable=1       make the cache resumable, which also saves fuel and react
 """
 
 import json
@@ -78,10 +85,21 @@ def main() -> None:
         for side in ("front", "back", "right", "left", "bottom"):
             setattr(s, f"use_collision_border_{side}", True)
         s.use_collision_border_top = False
+    for key, prop in (
+        ("burning", "burning_rate"),
+        ("flame_smoke", "flame_smoke"),
+        ("flame_vorticity", "flame_vorticity"),
+        ("ignition", "flame_ignition"),
+        ("maxtemp", "flame_max_temp"),
+    ):
+        if key in opts:
+            setattr(s, prop, float(opts[key]))
     for side in filter(None, opts.get("open", "").split(",")):
         setattr(s, f"use_collision_border_{side}", False)
     if opts.get("script") == "1":
         s.export_manta_script = True
+    if opts.get("resumable") == "1":
+        s.cache_resumable = True
 
     if opts.get("flow", "1") == "1":
         if opts.get("fill") == "1":
@@ -93,6 +111,10 @@ def main() -> None:
         flow.fluid_type = "FLOW"
         f = flow.flow_settings
         f.flow_type = "SMOKE"
+        if opts.get("fire") == "1":
+            f.flow_type = "FIRE"
+            if "fuel" in opts:
+                f.fuel_amount = float(opts["fuel"])
         f.flow_behavior = opts.get("behavior", "INFLOW")
         if "volume" in opts:
             f.volume_density = float(opts["volume"])
@@ -137,13 +159,26 @@ def main() -> None:
         wind.field.z_direction = "BOTH"
         wind.field.shape = "PLANE"
 
-    keys = ("alpha", "beta", "vorticity", "gravity", "time_scale", "cfl_condition")
+    keys = (
+        "alpha",
+        "beta",
+        "vorticity",
+        "gravity",
+        "time_scale",
+        "cfl_condition",
+        "burning_rate",
+        "flame_smoke",
+        "flame_vorticity",
+        "flame_ignition",
+        "flame_max_temp",
+    )
     settings = {k: getattr(s, k) for k in keys}
     settings["gravity"] = list(settings["gravity"])
     settings["scene_gravity"] = list(scene.gravity)
     settings["use_scene_gravity"] = scene.use_gravity
     if opts.get("flow", "1") == "1":
         settings["use_absolute"] = f.use_absolute
+        settings["fuel_amount"] = f.fuel_amount
     settings["borders"] = {
         side: getattr(s, f"use_collision_border_{side}")
         for side in ("front", "back", "right", "left", "top", "bottom")
