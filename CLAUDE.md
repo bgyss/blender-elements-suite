@@ -47,8 +47,9 @@ visibly less fine detail (`plume_wind` differs by construction).
 **2b-4**, fire, is complete
 (`docs/superpowers/specs/2026-09-25-ember-fire-2b4-design.md`): a fuel input
 that burns into heat and smoke, a `flame` output (√react), and a `fire`
-benchmark scene. While fire burns, velocity is traced with Euler rather than
-MacCormack, which blew up flame vorticity at one substep, and fuel is clamped
+benchmark scene. While fire burns, velocity faces are traced back with one
+Euler step instead of RK2's midpoint (MacCormack still applies); the RK2
+midpoint backtrace blew up flame vorticity at one substep. Fuel is clamped
 to [0, 10] at emission as in Mantaflow. In the fire benchmark
 (`docs/bench/results.md`, Fire) Ember is 4.9–6.0× faster, holds 0.88–1.42×
 Mantaflow's fuel at frame 60, and leaves 4–28× Mantaflow's divergence. A 128³

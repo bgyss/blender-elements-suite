@@ -3,10 +3,11 @@
 **Date:** 2026-09-25
 **Status:** Complete (2026-09-26). Plan: `docs/superpowers/plans/2026-09-25-ember-fire-2b4.md`.
 Results: the fire benchmark in `docs/bench/results.md` (Fire), the render in
-`docs/bench/render/` (`fire`, verdict pending the user), and the preview cost
-in `docs/bench/presets-fire.md` (103.5 ms under load, open risk (n) in piece
-2's spec §6). While fire burns, velocity is traced with Euler rather than
-MacCormack, and fuel is clamped to [0, 10] at emission.
+`docs/bench/render/` (`fire`, verdict recorded in `docs/bench/render/README.md`),
+and the preview cost in `docs/bench/presets-fire.md` (103.5 ms under load,
+open risk (n) in piece 2's spec §6). While fire burns, velocity faces are
+traced back with one Euler step instead of RK2's midpoint (MacCormack still
+applies), and fuel is clamped to [0, 10] at emission.
 **Parent:** `2026-09-21-ember-solver-design.md` (piece 2), whose list
 included flame. 2b-2 (`2026-09-23-ember-scene-content-2b2-design.md` §1)
 deferred it to this cycle, after the benchmark.
@@ -120,7 +121,10 @@ Recorded in `docs/bench/mantaflow-notes.md` and the results:
   cell. Ember keeps mass, as it already does for smoke.
 - **React blends towards 1**, not towards Mantaflow's
   `1 − (1 − occupancy)²` (§3.2 step 1): only cells on an emitter's surface
-  ramp differ.
+  ramp differ. The blend divides by fuel *after* the [0, 10] clamp
+  (`fuel'`), by `Δ / fuel'`, even on a step where the clamp absorbs part of
+  Δ — the fresh fraction the blend sees is smaller than `Δ` over the
+  cell's actual fuel gain in that case.
 - **Confinement reads fuel before advection.** Mantaflow burns before
   advection and confines on the advected fuel; Ember confines before
   advecting velocity, on the fuel after the burn.

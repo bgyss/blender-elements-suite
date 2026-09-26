@@ -83,9 +83,10 @@ Ember's smoke leaves through +x from frames 23–34, against Mantaflow's
 
 **Fire (2b-4).** `fire` was run at c372579, after the rest, so the header
 names two commits. Each scene's own runs share one commit. Ember traces
-velocity with Euler (first-order) backtracing while fire is burning, and
-clamps fuel to [0, 10] at emission as Mantaflow does. At one substep, the
-MacCormack velocity trace made flame vorticity blow up. The fire runs
+velocity faces back with one Euler (first-order) step instead of RK2's
+midpoint while fire is burning (MacCormack still applies), and clamps fuel
+to [0, 10] at emission as Mantaflow does. At one substep, the RK2 midpoint
+backtrace made flame vorticity blow up. The fire runs
 were under load too: 1-minute load 6.2–24.4 per run, and `vm.loadavg` was
 `{ 12.57 12.84 11.86 }` before `just bench fire` and `{ 16.36 18.46 16.15 }`
 after it.
