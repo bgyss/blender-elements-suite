@@ -1,5 +1,7 @@
 //! The preview preset's substep cap (2b-1 spec §6). Run with
 //! `just bench-presets`.
+//! Set `PRESET_SCENE=plume_collider` to measure the colliding plume, or
+//! `PRESET_SCENE=fire` for the fire cost run.
 //!
 //! Appends a section to `docs/bench/presets.md`, or to
 //! `presets-semi-lagrangian.md` when run with
@@ -68,6 +70,10 @@ fn main() -> Res<()> {
     let registry = elements_ember::registry();
     let scene_name = std::env::var("PRESET_SCENE").unwrap_or_else(|_| "plume".into());
     let fire = scene_name == "fire";
+    let collider = scene_name == "plume_collider";
+    if !(fire || collider || scene_name == "plume") {
+        return Err(format!("unknown preset scene {scene_name:?}").into());
+    }
     let (advection, file) = match std::env::var("PRESET_ADVECTION").as_deref() {
         Ok("semi_lagrangian") => (Advection::SemiLagrangian, "presets-semi-lagrangian.md"),
         _ if fire => (Advection::MacCormack, "presets-fire.md"),
@@ -90,6 +96,8 @@ fn main() -> Res<()> {
     for cap in CAPS {
         let base = if fire {
             Scene::fire(RESOLUTION)
+        } else if collider {
+            Scene::plume_collider(RESOLUTION)
         } else {
             Scene::plume(RESOLUTION)
         };

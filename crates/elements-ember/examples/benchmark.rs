@@ -2,6 +2,9 @@
 //!
 //! Modes:
 //!   benchmark ember SCENE RES      time and measure Ember
+//!   benchmark fire-probe RES PRESSURE_CYCLES
+//!                                  measure frame-60 fire and one timing run
+//!                                  without writing benchmark results
 //!   benchmark scene-json SCENE RES print the scene's Mantaflow twin as JSON,
 //!                                  for tests/bench/mantaflow_scene.py
 //!   benchmark document SCENE RES [OUTPUT]
@@ -763,6 +766,24 @@ fn run() -> Res<()> {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["fire-probe", res, cycles] => {
+            let res: u32 = res.parse()?;
+            let cycles: u32 = cycles.parse()?;
+            if !(1..=64).contains(&cycles) {
+                return Err("fire-probe pressure cycles must be 1..=64".into());
+            }
+            let gpu = GpuContext::new_headless()?;
+            let registry = elements_ember::registry();
+            let mut scene = Scene::fire(res);
+            scene.frames = 60;
+            scene.solver.pressure_cycles = cycles;
+            let metrics = metrics_run(&gpu, &registry, &scene)?;
+            let m = &metrics[59];
+            println!("fire {res}³ pressure ×{cycles} frame 60: rms={} max={} cells={} fuel={:?} flame={:?}", m.divergence_rms, m.divergence_max, m.measured_cells, m.fuel_mass, m.flame_volume);
+            let (times, _) = timed_run(&gpu, &registry, &scene)?;
+            println!("fire {res}³ pressure ×{cycles}: median_ms={}", median(&times));
+            Ok(())
+        }
         ["ember", name, res] => run_ember(name, res.parse()?),
         ["mantaflow", name, res] => run_mantaflow(name, res.parse()?),
         ["latency", name, res] => run_latency(name, res.parse()?),
@@ -789,7 +810,7 @@ fn run() -> Res<()> {
             println!("{}", serde_json::to_string_pretty(&json)?);
             Ok(())
         }
-        _ => Err("usage: benchmark ember SCENE RES | scene-json SCENE RES \
+        _ => Err("usage: benchmark ember SCENE RES | fire-probe RES PRESSURE_CYCLES | scene-json SCENE RES \
              | document SCENE RES [density|flame] \
              | mantaflow SCENE RES \
              | latency SCENE RES | mantaflow-latency SCENE RES | report | latency-report [LOADAVG]"

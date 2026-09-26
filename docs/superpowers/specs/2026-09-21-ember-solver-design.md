@@ -553,6 +553,16 @@ which 2b-3c added, and (n), which 2b-4 added. Future work that is not a risk is 
   69.6–116, `docs/bench/results.md`). That is within 3 ms of the budget
   under load, and some frames go over it. An idle rerun is still owed, and
   it should time `plume_collider` as well as `plume`.
+
+  **Follow-up 2026-09-26, run under load at the user's direction.** `plume`
+  cap 1 measured 92.57 ms (`docs/bench/presets.md`; 1-minute load 5.72 before,
+  4.42 after). The `PRESET_SCENE=plume_collider` path measured 112.30 ms at
+  cap 1, so no MacCormack cap met the 100 ms rule. The registered
+  semi-Lagrangian fallback then measured 67.75 ms at cap 1
+  (`docs/bench/presets-semi-lagrangian.md`). These runs recorded substantial
+  5- and 15-minute load and do not replace an idle run. They show the
+  MacCormack collider case remains over budget in the measured run; no preset
+  decision was made.
 - **(l) Resolved by 2b-3c (2026-09-25).** The evidence is after the
   history below.
 
@@ -623,6 +633,13 @@ which 2b-3c added, and (n), which 2b-4 added. Future work that is not a risk is 
   submit per frame. `plume` at the same settings took 71.5 ms in a
   separate run under similar load, so fire adds roughly 30 ms, but the two
   were not measured together. An idle rerun is owed, with (k)'s.
+
+  **Follow-up 2026-09-26, run under load at the user's direction.** The fire
+  preview cap-1 median was 103.58 ms (102.07–114.45 ms), against 100 ms;
+  cap 2–4 were 202.55, 300.74 and 418.62 ms
+  (`docs/bench/presets-fire.md`). Load average was 149.45 before and 36.43
+  after. The result remains an open risk and does not establish idle-machine
+  cost.
 
 **Future work.**
 
