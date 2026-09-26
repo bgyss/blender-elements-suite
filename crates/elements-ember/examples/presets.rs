@@ -3,7 +3,9 @@
 //!
 //! Appends a section to `docs/bench/presets.md`, or to
 //! `presets-semi-lagrangian.md` when run with
-//! `PRESET_ADVECTION=semi_lagrangian` (the rule's fallback), so the decisions
+//! `PRESET_ADVECTION=semi_lagrangian` (the rule's fallback), or to
+//! `presets-fire.md` when run with `PRESET_SCENE=fire` (2b-4 spec §6.4), so the
+//! decisions
 //! recorded there by hand are kept. The decision line at the section's end is
 //! filled in by hand after the user decides; this program only applies the
 //! rule.
@@ -65,15 +67,23 @@ fn run(gpu: &GpuContext, registry: &NodeRegistry, scene: &Scene) -> Res<(Vec<f64
 fn main() -> Res<()> {
     let gpu = GpuContext::new_headless()?;
     let registry = elements_ember::registry();
+    let scene_name = std::env::var("PRESET_SCENE").unwrap_or_else(|_| "plume".into());
+    let fire = scene_name == "fire";
     let (advection, file) = match std::env::var("PRESET_ADVECTION").as_deref() {
         Ok("semi_lagrangian") => (Advection::SemiLagrangian, "presets-semi-lagrangian.md"),
+        _ if fire => (Advection::MacCormack, "presets-fire.md"),
         _ => (Advection::MacCormack, "presets.md"),
     };
     let load_before = shell("sysctl", &["-n", "vm.loadavg"]);
     let mut table = String::new();
     let mut rows = Vec::new();
     for cap in CAPS {
-        let mut scene = Scene::plume(RESOLUTION).with_max_substeps(cap);
+        let base = if fire {
+            Scene::fire(RESOLUTION)
+        } else {
+            Scene::plume(RESOLUTION)
+        };
+        let mut scene = base.with_max_substeps(cap);
         let preview = Quality::Preview.params();
         scene.solver.pressure_solver = preview.pressure_solver;
         scene.solver.pressure_cycles = preview.pressure_cycles;
@@ -113,6 +123,28 @@ fn main() -> Res<()> {
             "**no cap fits**: rerun with `PRESET_ADVECTION=semi_lagrangian` (spec §6)".to_owned()
         }
     };
+    let rule = if fire {
+        // 2b-4 spec §6.4: fire's cost is recorded, not gated.
+        format!(
+            "Recorded, not gated (2b-4 spec §6.4): if cap 1's median is above \
+             {PRESET_FRAME_MS} ms, it becomes an open risk in piece 2's spec §6, alongside (k). \
+             The graph's output is the solver's density, so the flame output is not read; \
+             reading it adds one small submit per frame. The pass column applies \
+             2b-1's rule for comparison only.\n\n\
+             Load average (1, 5, 15 minutes): {load_before} before the run, {} after it.\n",
+            shell("sysctl", &["-n", "vm.loadavg"]),
+        )
+    } else {
+        format!(
+            "Pre-registered rule (2b-1 spec §6): preview's `max_substeps` is the largest cap whose \
+             median full frame is at most {PRESET_FRAME_MS} ms. If even 1 fails, preview falls back \
+             to semi-Lagrangian advection and the sweep runs again.\n\n\
+             Rule applied: {verdict}.\n\n\
+             Load average (1, 5, 15 minutes): {load_before} before the run, {} after it.\n\n\
+             Decision (recorded by the user): _pending_\n",
+            shell("sysctl", &["-n", "vm.loadavg"]),
+        )
+    };
     let preview = Quality::Preview.params();
     let pressure = match preview.pressure_solver {
         PressureSolver::GaussSeidel => format!("Gauss–Seidel ×{}", preview.pressure_iterations),
@@ -124,21 +156,15 @@ fn main() -> Res<()> {
          - OS: macOS {os}\n\
          - Ember commit: {commit}\n\
          - Date: {date}\n\
-         - Scene: `plume`, {RESOLUTION}³, preview's pressure solve ({pressure}), mass \
+         - Scene: `{scene_name}`, {RESOLUTION}³, preview's pressure solve ({pressure}), mass \
          correction {correction}, cfl 1.0, advection {advection:?}, vorticity 0. Frames {first}–{last} timed after {WARMUP} warm-up frames, each as \
          `eval_frame` (the CFL measurement and every substep) plus a blocking wait; median of \
          {RUNS} runs' medians. The min–max range is pooled over all timed frames of all runs.\n\n\
          | max_substeps | frame ms (median, min–max) | frames CFL-clamped | pass |\n\
          |---|---|---|---|\n\
          {table}\n\
-         Pre-registered rule (2b-1 spec §6): preview's `max_substeps` is the largest cap whose \
-         median full frame is at most {PRESET_FRAME_MS} ms. If even 1 fails, preview falls back \
-         to semi-Lagrangian advection and the sweep runs again.\n\n\
-         Rule applied: {verdict}.\n\n\
-         Load average (1, 5, 15 minutes): {load_before} before the run, {load_after} after it.\n\n\
-         Decision (recorded by the user): _pending_\n",
+         {rule}",
         correction = if preview.conserve_mass { "on" } else { "off" },
-        load_after = shell("sysctl", &["-n", "vm.loadavg"]),
         cpu = shell("sysctl", &["-n", "machdep.cpu.brand_string"]),
         adapter = gpu.adapter_name(),
         os = shell("sw_vers", &["-productVersion"]),
@@ -157,6 +183,7 @@ fn main() -> Res<()> {
             shell("date", &["-u", "+%Y-%m-%d"]),
             commit_label(),
         ),
+        Err(_) if fire => format!("# Ember fire preview frame (piece 2b-4)\n\n{body}"),
         Err(_) => format!("# Ember preview preset sweep (piece 2b-1)\n\n{body}"),
     };
     std::fs::write(&path, &report)?;
