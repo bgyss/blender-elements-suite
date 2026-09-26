@@ -11,7 +11,11 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 fn python() -> &'static str {
-    if cfg!(windows) { "python" } else { "python3" }
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3.11"
+    }
 }
 
 #[test]
@@ -64,7 +68,7 @@ fn the_python_client_speaks_the_real_protocol() {
         .arg(graph.to_str().unwrap())
         .arg(repo_root().join("tests/graphs/accumulate_4.elements"))
         .output()
-        .expect("python3 must be on PATH");
+        .expect("python3.11 must be on PATH");
 
     let _ = daemon.kill();
     let _ = daemon.wait();
