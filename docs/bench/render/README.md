@@ -2,8 +2,8 @@
 
 - Machine: Apple M1 Max
 - OS: macOS 27.2
-- Ember bakes' commit: eb6b1c1
-- Mantaflow bakes' commit: 2e1f9a9-dirty (the uncommitted change was the render scripts; `git diff 2e1f9a9..eb6b1c1` touches no scene or solver code)
+- Ember bakes' commit: eb6b1c1, fa59464-dirty (`fire`)
+- Mantaflow bakes' commit: 2e1f9a9-dirty (the uncommitted change was the render scripts; `git diff 2e1f9a9..eb6b1c1` touches no scene or solver code), fa59464-dirty (`fire`; the uncommitted changes were the render scripts, the `bench-render` recipe and `examples/presets.rs`, none of them scene or solver code)
 - Blender: 5.2.2 LTS
 - Date: 2026-09-25
 
@@ -112,3 +112,15 @@ Both panels show solver behaviour, not the render. Ember's smoke leaves through 
 ![plume 256³ frame 60](plume-256-f060.png)
 
 ![plume 256³ frame 90](plume-256-f090.png)
+
+## `fire` (128³)
+
+Each solver has a second Volume object at the same place for its flame. Ember's is baked from the solver's `flame` output into `flame.NNNN.vdb`; Mantaflow's is the `flame` grid of the same `fluid_data_NNNN.vdb`, which its resumable cache writes (`docs/bench/mantaflow-notes.md`, Grid inventory). Both solvers' flame is √react in [0, 1]. The two share one flame material: a Principled Volume of density 0 whose emission strength is `flame` × 8 and whose emission colour is a blackbody at a fixed 1500 K, not the temperature, so both get the same colour mapping. The smoke is drawn with the density material above. Fire emits fuel, not smoke, so its smoke is made by burning, and the matched emitted masses above do not apply to it. Mantaflow's burn clamps density to [0, 1] in every cell on every step; Ember does not clamp it (`docs/bench/results.md`, Fire).
+
+![fire 128³ frame 30](fire-128-f030.png)
+
+![fire 128³ frame 60](fire-128-f060.png)
+
+![fire 128³ frame 90](fire-128-f090.png)
+
+Fire verdict: _pending: recorded by the user_

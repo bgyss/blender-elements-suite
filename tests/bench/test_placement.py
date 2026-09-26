@@ -96,6 +96,28 @@ def test_a_recorded_verdict_survives_regeneration() -> None:
         ), placement.kept_verdict(path)
 
 
+def test_a_section_verdict_is_kept_apart_from_the_main_one() -> None:
+    import tempfile
+
+    label = "Fire verdict"
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "README.md")
+        with open(path, "w") as fh:
+            fh.write(
+                "# X\n\nVerdict (recorded by the user): main.\n\n## `plume`\n\n![p](p.png)\n\n"
+                "## `fire`\n\n![f](f.png)\n\n"
+            )
+        assert placement.kept_verdict(path, label, placement.pending(label)) == (
+            "Fire verdict: _pending: recorded by the user_"
+        )
+        with open(path, "a") as fh:
+            fh.write("Fire verdict (recorded by the user): flames.\n\n## `later`\n")
+        assert placement.kept_verdict(path, label, placement.pending(label)) == (
+            "Fire verdict (recorded by the user): flames."
+        ), placement.kept_verdict(path, label, placement.pending(label))
+        assert placement.kept_verdict(path) == "Verdict (recorded by the user): main."
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

@@ -131,7 +131,7 @@ bench-latency scenes="plume plume_collider plume_wind" res="128":
 # 15 minutes from nothing (6 of them plume's 256³ Mantaflow bake); not in
 # `check`.
 # Render Ember and Mantaflow side by side with one Cycles setup.
-bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256":
+bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256 fire:128":
     #!/usr/bin/env bash
     set -euo pipefail
     BLENDER_BIN="${BLENDER_BIN:-/Applications/Blender.app/Contents/MacOS/Blender}"
@@ -164,6 +164,15 @@ bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256":
           "$CLI" bake "$R/$scene-$res.elements" --out "$ember" --frames "$f" \
               --name density --voxel-size "$dx"
         done
+        # Fire also bakes the solver's flame output, for the render's emission.
+        if [ "$scene" = fire ]; then
+          "$B" document "$scene" "$res" flame > "$R/$scene-$res-flame.elements"
+          for f in 30 60 90; do
+            echo "ember $scene ${res}³: flame, frame $f; load $(sysctl -n vm.loadavg)"
+            "$CLI" bake "$R/$scene-$res-flame.elements" --out "$ember" --frames "$f" \
+                --name flame --voxel-size "$dx"
+          done
+        fi
         echo "$commit" > "$ember/commit"
       fi
       manta="$R/mantaflow/$scene-$res"
