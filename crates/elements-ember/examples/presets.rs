@@ -4,9 +4,8 @@
 //! Appends a section to `docs/bench/presets.md`, or to
 //! `presets-semi-lagrangian.md` when run with
 //! `PRESET_ADVECTION=semi_lagrangian` (the rule's fallback), or to
-//! `presets-fire.md` when run with `PRESET_SCENE=fire` (2b-4 spec §6.4), so the
-//! decisions
-//! recorded there by hand are kept. The decision line at the section's end is
+//! `presets-fire.md` when run with `PRESET_SCENE=fire` (2b-4 spec §6.4), so
+//! the decisions recorded there by hand are kept. The decision line at the section's end is
 //! filled in by hand after the user decides; this program only applies the
 //! rule.
 //!

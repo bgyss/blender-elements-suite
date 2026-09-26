@@ -54,7 +54,8 @@ to [0, 10] at emission as in Mantaflow. In the fire benchmark
 Mantaflow's fuel at frame 60, and leaves 4–28× Mantaflow's divergence. A 128³
 fire preview frame takes 103.5 ms under load, over budget: risk (n)
 (`docs/bench/presets-fire.md`). The side-by-side render is in
-`docs/bench/render/`, its fire verdict pending. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
+`docs/bench/render/`: the fires share a base and height, but Ember's is a
+narrower column and still burns at frame 90 after Mantaflow's has gone out. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
 branch `ember-node-editor`) is designed and planned but paused.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
