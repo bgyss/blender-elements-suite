@@ -121,10 +121,10 @@ Recorded in `docs/bench/mantaflow-notes.md` and the results:
   cell. Ember keeps mass, as it already does for smoke.
 - **React blends towards 1**, not towards Mantaflow's
   `1 − (1 − occupancy)²` (§3.2 step 1): only cells on an emitter's surface
-  ramp differ. The blend divides by fuel *after* the [0, 10] clamp
-  (`fuel'`), by `Δ / fuel'`, even on a step where the clamp absorbs part of
-  Δ — the fresh fraction the blend sees is smaller than `Δ` over the
-  cell's actual fuel gain in that case.
+  ramp differ. The blend uses `Δ / fuel'` with the clamped `fuel'`, so
+  where the clamp absorbs part of Δ it overstates fresh fuel's share (the
+  actual gain over `fuel'` is smaller): a cell already at 10 still moves
+  react by `Δ / 10`.
 - **Confinement reads fuel before advection.** Mantaflow burns before
   advection and confines on the advected fuel; Ember confines before
   advecting velocity, on the fuel after the burn.
