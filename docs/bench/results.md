@@ -106,6 +106,14 @@ after it.
   none. The emission and the burn law match (`.superpowers/sdd/fire-diagnosis.md`).
   This run has no budget at 128³ or 256³, so it does not explain why
   Mantaflow holds less fuel than Ember there.
+
+  Follow-up (2026-09-26): the [high-resolution fuel investigation](fire-fuel-budget-2026-09-26.md)
+  found a source difference already on frame 1. Mantaflow's cached inflow
+  volume falls from 0.03284 m³ at 64³ to 0.02510 and 0.01639 m³ at 128³ and
+  256³; unclipped bakes reproduce the latter two figures. Its intermediate
+  `fuel_inflow` grid is affected by VDB clipping, so the saved 60-frame grids
+  cannot uniquely apportion the remaining difference among advection and
+  outflow. The per-cell rate mapping has not been shown wrong.
 - **Burn-out.** Ember burns out more slowly after emission stops. At frame 90,
   Ember still has 0.005, 0.072 and 0.098 fuel, against Mantaflow's 4e-5,
   2e-8 and 0.001.
