@@ -29,3 +29,22 @@ runs). Cap 1's median, 103.5 ms, is above preview's 100 ms, under load, and
 is recorded as risk (n) in
 `docs/superpowers/specs/2026-09-21-ember-solver-design.md` §6. It agrees
 with the benchmark's 104 ms fire frame at 128³ (`docs/bench/results.md`).
+
+## Run of 2026-09-26 at 1f6f0bd-dirty
+
+- Machine: Apple M1 Max (Apple M1 Max)
+- OS: macOS 27.2
+- Ember commit: 1f6f0bd-dirty
+- Date: 2026-09-26
+- Scene: `fire`, 128³, preview's pressure solve (MGPCG ×4), mass correction on, cfl 1.0, advection MacCormack, flame vorticity 12/s (base vorticity 0). Frames 25–48 timed after 24 warm-up frames, each as `eval_frame` (the CFL measurement and every substep) plus a blocking wait; median of 3 runs' medians. The min–max range is pooled over all timed frames of all runs.
+
+| max_substeps | frame ms (median, min–max) | frames CFL-clamped | pass |
+|---|---|---|---|
+| 1 | 103.58 (102.07–114.45) | 72 of 72 | no |
+| 2 | 202.55 (199.93–221.86) | 72 of 72 | no |
+| 3 | 300.74 (278.46–361.21) | 72 of 72 | no |
+| 4 | 418.62 (378.45–442.13) | 72 of 72 | no |
+
+Recorded, not gated (2b-4 spec §6.4): if cap 1's median is above 100 ms, it becomes an open risk in piece 2's spec §6, alongside (k). The graph's output is the solver's density, so the flame output is not read; reading it adds one small submit per frame. The pass column applies 2b-1's rule for comparison only.
+
+Load average (1, 5, 15 minutes): { 149.45 152.47 74.16 } before the run, { 36.43 105.63 67.14 } after it.
