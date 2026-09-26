@@ -115,13 +115,14 @@ fn block_source(cells: FieldDims, rate: f32) -> Vec<f32> {
 }
 
 /// Fuel tracks density bit-for-bit through advection and the mass
-/// correction, and react to within 1e-6 (see the last assertion): they start identical to density (one substep at rate 1/h,
-/// still air, puts density = fuel = react = 1.0 in the block and 0
-/// elsewhere exactly, spec §3.2 step 1), then all three see the same
-/// velocity, the same zero sources, and the same `conserve_mass` for three
-/// more substeps. Nothing but their own field distinguishes them from
-/// density in this setup but react's 1e-6 fuel cut-off, so any other
-/// divergence is a bug in how fuel or react is carried.
+/// correction, and react to within 1e-6 (see the last assertion): they
+/// start identical to density (one substep at rate 1/h, still air, puts
+/// density = fuel = react = 1.0 in the block and 0 elsewhere exactly, spec
+/// §3.2 step 1), then all three see the same velocity, the same zero
+/// sources, and the same `conserve_mass` for three more substeps. Nothing
+/// but their own field distinguishes them from density in this setup but
+/// react's 1e-6 fuel cut-off, so any other divergence is a bug in how fuel
+/// or react is carried.
 #[test]
 fn fuel_and_react_are_advected_and_mass_corrected_as_density_is() {
     let gpu = gpu();
@@ -724,15 +725,20 @@ fn emitted_fuel_is_clamped_at_ten() {
     let mut pool = FieldPool::new();
     let mut cache = PipelineCache::new();
     let n = CELLS.voxel_count();
-    // Cell 0 would reach 11.5 and is clamped; cell 1 reaches 3 and is not.
+    // Cell 0 would reach 11.5 and is clamped high; cell 1 reaches 3 and is
+    // not; cell 2 would reach -1.5 (a negative fuel_rate) and is clamped low.
     let mut f0 = vec![0.0; n];
     f0[0] = 9.5;
     f0[1] = 1.0;
+    f0[2] = 0.5;
+    let mut react0 = vec![0.0; n];
+    react0[2] = 0.7;
     let mut rate = vec![0.0; n];
     rate[0] = 8.0; // Δ = 8 · 0.25 = 2
     rate[1] = 8.0;
+    rate[2] = -8.0; // Δ = -8 · 0.25 = -2
     let fuel = upload(&gpu, &mut pool, CELLS, &f0);
-    let react = upload(&gpu, &mut pool, CELLS, &vec![0.0; n]);
+    let react = upload(&gpu, &mut pool, CELLS, &react0);
     let src = upload(&gpu, &mut pool, CELLS, &rate);
     let u = Uniforms::new(&gpu, &transport_only()).unwrap();
     let mut batch = ComputeBatch::new();
@@ -742,10 +748,14 @@ fn emitted_fuel_is_clamped_at_ten() {
     let react = react.read_back(&gpu).unwrap();
     assert_eq!(fuel[0], 10.0, "fuel is clamped at 10");
     assert_eq!(fuel[1], 3.0, "fuel below the clamp is untouched");
-    assert!(fuel[2..].iter().all(|&f| f == 0.0));
+    assert_eq!(fuel[2], 0.0, "fuel is clamped at 0, not driven negative");
+    assert!(fuel[3..].iter().all(|&f| f == 0.0));
     // React blends by Δ over the clamped fuel: 2 / 10, and 2 / 3 below it.
     assert_close(&react[..2], &[0.2, 2.0 / 3.0], 1e-6, "react");
-    assert!(react[2..].iter().all(|&r| r == 0.0));
+    // At the low clamp f1 == 0, so the blend guard (f1 > 1e-6) leaves react
+    // exactly as it was rather than dividing by zero.
+    assert_eq!(react[2], 0.7, "react is unchanged when fuel clamps to zero");
+    assert!(react[3..].iter().all(|&r| r == 0.0));
 }
 
 /// One advection of the velocity pattern's faces through themselves, and of

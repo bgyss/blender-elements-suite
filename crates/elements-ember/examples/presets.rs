@@ -22,7 +22,7 @@ use elements_core::gpu::{FieldPool, GpuContext, PipelineCache};
 use elements_core::graph::{NodeRegistry, StateStore, Time};
 use elements_ember::bench::{PRESET_FRAME_MS, PresetRow, Scene, preview_substeps_verdict};
 use elements_ember::kernels::Advection;
-use elements_ember::solver::{PressureSolver, Quality};
+use elements_ember::solver::{DEFAULT_FLAME_VORTICITY, PressureSolver, Quality};
 
 use common::{commit_label, median, shell};
 
@@ -74,6 +74,17 @@ fn main() -> Res<()> {
         _ => (Advection::MacCormack, "presets.md"),
     };
     let load_before = shell("sysctl", &["-n", "vm.loadavg"]);
+    // Base vorticity confinement is 0 in every scene here; fire also carries
+    // the preset's flame vorticity, which scales with fuel and is not
+    // zeroed above.
+    let vorticity_note = if fire {
+        format!(
+            "flame vorticity {}/s (base vorticity 0)",
+            DEFAULT_FLAME_VORTICITY
+        )
+    } else {
+        "vorticity 0".to_owned()
+    };
     let mut table = String::new();
     let mut rows = Vec::new();
     for cap in CAPS {
@@ -135,9 +146,9 @@ fn main() -> Res<()> {
         )
     } else {
         format!(
-            "Pre-registered rule (2b-1 spec §6): preview's `max_substeps` is the largest cap whose \
-             median full frame is at most {PRESET_FRAME_MS} ms. If even 1 fails, preview falls back \
-             to semi-Lagrangian advection and the sweep runs again.\n\n\
+            "Pre-registered rule (2b-1 spec §6): preview's `max_substeps` is the largest cap \
+             whose median full frame is at most {PRESET_FRAME_MS} ms. If even 1 fails, preview \
+             falls back to semi-Lagrangian advection and the sweep runs again.\n\n\
              Rule applied: {verdict}.\n\n\
              Load average (1, 5, 15 minutes): {load_before} before the run, {} after it.\n\n\
              Decision (recorded by the user): _pending_\n",
@@ -156,9 +167,10 @@ fn main() -> Res<()> {
          - Ember commit: {commit}\n\
          - Date: {date}\n\
          - Scene: `{scene_name}`, {RESOLUTION}³, preview's pressure solve ({pressure}), mass \
-         correction {correction}, cfl 1.0, advection {advection:?}, vorticity 0. Frames {first}–{last} timed after {WARMUP} warm-up frames, each as \
-         `eval_frame` (the CFL measurement and every substep) plus a blocking wait; median of \
-         {RUNS} runs' medians. The min–max range is pooled over all timed frames of all runs.\n\n\
+         correction {correction}, cfl 1.0, advection {advection:?}, {vorticity_note}. Frames \
+         {first}–{last} timed after {WARMUP} warm-up frames, each as `eval_frame` (the CFL \
+         measurement and every substep) plus a blocking wait; median of {RUNS} runs' medians. \
+         The min–max range is pooled over all timed frames of all runs.\n\n\
          | max_substeps | frame ms (median, min–max) | frames CFL-clamped | pass |\n\
          |---|---|---|---|\n\
          {table}\n\
