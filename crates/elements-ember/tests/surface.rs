@@ -811,3 +811,89 @@ fn a_mesh_collider_outputs_its_load_and_rejects_a_moving_or_negative_one() {
     let negative = cube_mesh_collider("").replace("\"load\": 2.5", "\"load\": -1.0");
     assert!(build(&negative).is_err(), "a negative load is rejected");
 }
+
+// ---- The front spreads (FT4 spec §4 test 5) ----
+
+/// A 16×16×32 domain (dx = 0.125 m, 2 × 2 × 4 m) with a vertical wooden wall
+/// one cell thick (i = 8, j 5..=10, k 2..=13: `half_extents [0.0625, 0.4,
+/// 0.8]` at [1.0625, 1.0, 1.0], load 4.0) and a temperature emitter at its
+/// foot on the −x side ([0.9, 1.0, 0.3], r 0.15, rate `heat`). The solver
+/// runs the preview preset with `temperature_dissipation` 8 and
+/// `surface_burn_rate` 8 (attempt 2 in `docs/bench/surface-ignition.md`).
+/// Fuel input 6 is connected at rate 0; `char` (solver output 4) is the output.
+fn wall_doc(heat: f32) -> String {
+    format!(
+        r#"{{ "version": 3, "dims": [16, 16, 32], "fps": 24.0, "domain_size": 4.0,
+      "nodes": [
+        {{ "id": 0, "kind": "ember.sphere_emitter", "params": {{ "center": [0.9, 1.0, 0.3],
+           "radius": 0.15, "density_rate": 0.0, "temperature_rate": {heat:?} }} }},
+        {{ "id": 1, "kind": "ember.smoke_solver", "params": {{ "buoyancy_temperature": 1.0,
+           "temperature_dissipation": 8.0, "surface_burn_rate": 8.0 }} }},
+        {{ "id": 2, "kind": "core.output", "params": {{}} }},
+        {{ "id": 3, "kind": "ember.sphere_emitter", "params": {{ "center": [0.5, 0.5, 3.5],
+           "radius": 0.1, "density_rate": 0.0, "temperature_rate": 0.0 }} }},
+        {{ "id": 4, "kind": "ember.collider", "params": {{
+           "shape": {{ "box": {{ "half_extents": [0.0625, 0.4, 0.8] }} }},
+           "transform": {{ "keys": [{{ "frame": 0, "translate": [1.0625, 1.0, 1.0] }}] }},
+           "surface_fuel": {{ "load": 4.0 }} }} }} ],
+      "edges": [
+        {{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }},
+        {{ "from_node": 0, "from_index": 1, "to_node": 1, "to_index": 1 }},
+        {{ "from_node": 4, "from_index": 0, "to_node": 1, "to_index": 4 }},
+        {{ "from_node": 4, "from_index": 1, "to_node": 1, "to_index": 5 }},
+        {{ "from_node": 1, "from_index": 4, "to_node": 2, "to_index": 0 }},
+        {{ "from_node": 3, "from_index": 0, "to_node": 1, "to_index": 6 }},
+        {{ "from_node": 4, "from_index": 2, "to_node": 1, "to_index": 7 }} ],
+      "output": 2 }}"#
+    )
+}
+
+/// FT4 spec §4 test 5, emergent: heat at the foot of a vertical wall lights
+/// the bottom rows, their fuel burns in the gas, and the flame rising along
+/// the wall lights the rows above. Scene: `wall_doc(30.0)` (constants in its
+/// doc comment): preview preset (one substep, MGPCG ×4), buoyancy 1,
+/// temperature dissipation 8/s, surface burn rate 8/s, gas burning rate
+/// 1.875, ignition 1.5, max temperature 3, frames 1..=60, 16×16×32, no seed
+/// (nothing stochastic), recorded on Apple M1 Max. The dissipation is what
+/// makes the test fail without the surface's fuel: the heat source's own
+/// plume cools below ignition within two rows, while flame is reset above it
+/// wherever fuel burns. Every scene attempt is in
+/// `docs/bench/surface-ignition.md`.
+#[test]
+fn the_front_spreads_up_a_wall() {
+    const FRAMES: u32 = 60;
+    const NZ: usize = 32;
+    let mut s = Session::new(&wall_doc(30.0));
+    let mut t = timeline(0);
+    let mut first: [Option<u32>; NZ] = [None; NZ];
+    for frame in 1..=FRAMES {
+        let char: Vec<f32> = s
+            .density_bits(&mut t, frame)
+            .iter()
+            .map(|b| f32::from_bits(*b))
+            .collect();
+        for (k, row) in char.chunks(16 * 16).enumerate() {
+            if first[k].is_none() && row.iter().any(|&c| c > 0.0) {
+                first[k] = Some(frame);
+            }
+        }
+    }
+    let rows: Vec<(usize, u32)> = first
+        .iter()
+        .enumerate()
+        .filter_map(|(k, f)| f.map(|f| (k, f)))
+        .collect();
+    eprintln!("ignition frames by row: {rows:?}");
+    assert!(
+        rows.len() >= 3,
+        "the front must reach at least 3 wall rows, got {rows:?}"
+    );
+    assert!(
+        rows.windows(2).all(|w| w[1].1 >= w[0].1),
+        "ignition frames must not decrease with height: {rows:?}"
+    );
+    assert!(
+        rows[0].0 < rows.last().unwrap().0,
+        "the front must have moved"
+    );
+}

@@ -60,7 +60,7 @@ fire preview frame takes 103.5 ms under load, over budget: risk (n)
 narrower column and still burns at frame 90 after Mantaflow's has gone out. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
 branch `ember-node-editor`) is designed and planned but paused.
 
-Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a nozzle cone, mesh colliders and a procedural shack. FT3 measured which fire variant closes the divergence gap; its recommendation is provisional (`docs/bench/fire-divergence.md`).
+Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a nozzle cone, mesh colliders and a procedural shack. FT3 measured which fire variant closes the divergence gap; its recommendation is provisional (`docs/bench/fire-divergence.md`). FT4, surface ignition, is complete (`docs/superpowers/specs/2026-09-30-flamethrower-ft4-surface-ignition-design.md`, `docs/superpowers/plans/2026-09-30-flamethrower-ft4-surface-ignition.md`): a static `ember.collider` or `ember.mesh_collider` with `surface_fuel` outputs a load (output 2) that the smoke solver takes on input 7 with fuel connected; wood beside gas above ignition burns into gas fuel, and solver output 4 is `char`. A front climbs a heated wall only with temperature dissipation and a surface burn rate above the gas's (`docs/bench/surface-ignition.md`).
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -85,6 +85,8 @@ Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a 
 - Flamethrower FT0 shot spec: `docs/superpowers/specs/2026-09-30-flamethrower-shot-ft0.md`
 - Flamethrower FT0–FT3 plan: `docs/superpowers/plans/2026-09-30-flamethrower-ft0-ft3.md`
 - Mesh collider fill cost: `docs/bench/mesh-collider.md`
+- Flamethrower FT4 spec and plan: `docs/superpowers/specs/2026-09-30-flamethrower-ft4-surface-ignition-design.md`, `docs/superpowers/plans/2026-09-30-flamethrower-ft4-surface-ignition.md`
+- Surface ignition front: `docs/bench/surface-ignition.md`
 - Mantaflow benchmark results and cache notes: `docs/bench/results.md` (2b-3c's rerun; 2b-3's run is in `docs/bench/results-2b3/`), `docs/bench/mantaflow-notes.md`
 - Solver gate (Gauss–Seidel, multigrid and MGPCG): `docs/bench/solver-gate.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
