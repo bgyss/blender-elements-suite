@@ -59,7 +59,8 @@ fire preview frame takes 103.5 ms under load, over budget: risk (n)
 `docs/bench/render/`: the fires share a base and height, but Ember's is a
 narrower column and still burns at frame 90 after Mantaflow's has gone out. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
 branch `ember-node-editor`) is designed and planned but paused.
-Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a nozzle cone, mesh colliders and a procedural shack.
+
+Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a nozzle cone, mesh colliders and a procedural shack. FT3 measured which fire variant closes the divergence gap; its recommendation is provisional (`docs/bench/fire-divergence.md`).
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`

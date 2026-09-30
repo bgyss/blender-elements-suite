@@ -1,7 +1,15 @@
 # Flamethrower-vs-shack and napalm: roadmap and design
 
 **Date:** 2026-09-30
-**Status:** design, approved in conversation; written spec awaiting review.
+**Status:** reviewed and approved by the user (2026-09-30). FT0-FT3 were implemented on
+branch `worktree-flamethrower-ft0-ft3` (plan: `docs/superpowers/plans/2026-09-30-flamethrower-ft0-ft3.md`).
+
+**Plan FT0-FT3 outcome.** FT0-FT2 are done. FT3's results are recorded in
+`docs/bench/fire-divergence.md` with a PROVISIONAL recommendation. Two findings change the
+next plan: flame does not reach the shack at preview's one substep (the shot needs more
+substeps and/or a bigger flame), and filling the mesh SDF every frame has a real cost
+(risk (o) in the piece 2 spec), which needs a static-pose cache. `shack()` also needs input
+validation before it becomes a node parameter.
 **Builds on:** Ember fire (2b-4), the research brief
 (`docs/research/2026-09-26-particles-fluids-terrain-brief.md`), the core design's Tide row.
 

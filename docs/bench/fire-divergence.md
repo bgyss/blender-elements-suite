@@ -19,6 +19,10 @@ fix anything. The `final` preset goes well below Mantaflow and changes the fire'
 size. It runs eight substeps, and in loaded timings its frames took about 10×
 as long as preview's.
 
+This is the fire-scene result only. FT3b found that six cycles do not carry over to
+the shack scene (509× its control; see "More cycles help, but not in proportion"
+and the provisional recommendation below).
+
 ## Method
 
 - **Machine:** Apple M1 Max (MacBookPro18,2), macOS 27.2, Metal.
@@ -413,14 +417,16 @@ that risk (m) left out of scope.
   - The shot needs about 8 substeps or more to get flame there. At 8
     substeps, even ×10 leaves 12× its control (2.1e-5).
   - The "×10 cuts divergence 32×" support therefore comes from the
-    one-substep regime, which the shot cannot use.
+    one-substep regime, which the shot cannot use. Both figures are single
+    runs and provisional (see the caveats in the recommendation below).
 - **Before choosing a cycle count,** the scoped solver task should
   re-measure with flame reaching the shack, at 8 substeps or the `final`
   preset. It should also run the cavity and mesh-path controls above.
 
 - ×6, Task 9's fire-scene variant, does not carry over. It closes the
   fire-scene gap, but with the shack it leaves 5.0e-3, 509× its control.
-- ×10 cuts the shack's frame-60 divergence 32× under preview, to 1.8× the
+- Provisionally (single run, smoke only; see the caveats below), ×10 cuts the
+  shack's frame-60 divergence 32× under preview, to 1.8× the
   no-shack preview level. It does not close the gap to its own control.
   With 8 substeps it reaches 2.1e-5, still 12× its control.
 - Its cost is unmeasured on an idle machine, as for ×6.
@@ -432,5 +438,7 @@ that risk (m) left out of scope.
 
 The alternatives: (a) is not supported, since divergence is 58× the
 no-shack level and flame does not reach the shack. (c), accepting the gap,
-is reasonable if FT6 bakes the shot in `final` anyway, since `final`'s
-settings already land at 2.1e-5 here. No solver change was made.
+is reasonable only provisionally, and only if FT6 bakes the shot in `final`
+anyway: `final`'s settings land at 2.1e-5 here, which is still 12× the
+control's divergence, from a single run with smoke only and no flame at the
+shack. No solver change was made.

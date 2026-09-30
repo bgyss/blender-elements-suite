@@ -36,7 +36,8 @@ about 38 ms).
 step; at 256×128×128 a step is larger, but the fill is still well over 10%
 (77 ms against a step that would have to exceed 770 ms). Even with a
 generous allowance for the load, an idle machine would not bring it near
-10%.
+10%. (The loads differ: the fill was timed at load 21-35, the step at about
+9.6, so the ratio overstates the fill's share by an unmeasured amount.)
 
 Nothing was optimised here. Recorded as risk (o) in
 `docs/superpowers/specs/2026-09-21-ember-solver-design.md` §6. Options for the

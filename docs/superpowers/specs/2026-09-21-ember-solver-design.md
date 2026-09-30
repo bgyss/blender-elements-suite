@@ -6,8 +6,8 @@
 whose Mantaflow half is built in 2b. §6 lists the risks 2b inherits.
 Piece 2b-1 (solver correctness) is complete; see `2026-09-22-ember-solver-2b1-design.md`.
 2b-2 (scene content) is complete; see `2026-09-23-ember-scene-content-2b2-design.md`.
-Of §6's risks, (b), (c), (d), (f) and (h) are resolved; (e), the open part of (g), (j) and (k) remain.
-2b-4 (fire) added (n). The flamethrower plan's FT2 added (o).
+Of §6's risks, (a), (b), (c), (d), (e), (f), (h), (i) and (l) are resolved; the open part of (g),
+(j), (k), (m), (n) and (o) remain. 2b-4 (fire) added (n). The flamethrower plan's FT2 added (o).
 **Parent:** `2026-09-21-ember-design.md` (piece 2 of 4)
 
 ## 1. Goal and split
@@ -363,7 +363,8 @@ This is the umbrella's highest risk ("wgpu compute on Metal is too slow"), check
 Found by piece 2a's whole-branch review. (a) and (i) were resolved in 2a, and
 (g) mostly. 2b-1 resolved (b), (c), (d), (f) and (h). 2b-3c resolved (e) and
 (l). Still open: the open part of (g), (j), (k), which 2b-2 added, (m),
-which 2b-3c added, (n), which 2b-4 added, and (o), which the flamethrower plan's FT2 added. Future work that is not a risk is listed after them.
+which 2b-3c added, (n), which 2b-4 added, and (o), which the flamethrower plan's FT2 added
+(so the open list is (g)'s open part, (j), (k), (m), (n) and (o)). Future work that is not a risk is listed after them.
 
 - **(a) Resolved (eac0cc3).** `GpuContext` now also requests the adapter's
   `max_buffer_size`, so 512³ domains are no longer capped by the downlevel
@@ -649,7 +650,10 @@ which 2b-3c added, (n), which 2b-4 added, and (o), which the flamethrower plan's
   under the 10% the plan asks for. The fill is pure cost when the pose has
   not changed. No optimisation was made; the options are to cache the SDF in
   node state while the pose is unchanged (the shack is static in the shot),
-  or a coarse AABB early-out. The user decides.
+  or a coarse AABB early-out. **Ruling (2026-09-30, final review):** the
+  controller ruled the per-frame cost acceptable for the flamethrower plan's
+  240-frame bake, where preview is out of scope, and carried a static-pose SDF
+  cache task into the FT4-FT6 plan. The risk stays open until that cache lands.
 
 **Future work.**
 
