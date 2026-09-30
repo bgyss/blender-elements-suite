@@ -80,6 +80,7 @@
         "pressure_cycles": 4,
         "pressure_iterations": 160,
         "pressure_solver": "mgpcg",
+        "surface_burn_rate": 2.0,
         "temperature_dissipation": 0.0,
         "vorticity": 0.0,
         "wind_rate": 0.0,

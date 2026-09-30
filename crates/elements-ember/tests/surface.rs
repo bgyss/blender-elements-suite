@@ -145,3 +145,73 @@ fn a_union_with_one_unconnected_load_outputs_the_other() {
     assert!(loads.contains(&4.0), "the first collider's load survives");
     assert!(loads.iter().all(|&l| l == 0.0 || l == 4.0), "{loads:?}");
 }
+
+/// FT4 spec §3.5: with the surface unconnected, a fire document is bit-identical
+/// to the one before FT4. Recorded on the commit before any FT4 solver change,
+/// on this adapter; other adapters print and skip.
+#[test]
+fn without_a_surface_a_fire_document_matches_the_solver_before_ft4() {
+    const RECORDED_ON: &str = "Apple M1 Max";
+    const WANT: u64 = 0xfbcd_e02f_2e02_d31f;
+    let ctx = gpu();
+    if ctx.adapter_name() != RECORDED_ON {
+        eprintln!(
+            "skipped: recorded on {RECORDED_ON}, this is {}",
+            ctx.adapter_name()
+        );
+        return;
+    }
+    let mut s = Session::new(&fire_doc());
+    let mut t = timeline(0);
+    let mut bits = Vec::new();
+    for frame in 1..=40 {
+        bits = s.density_bits(&mut t, frame);
+    }
+    assert_eq!(fnv1a(&bits), WANT, "frame 40 density changed");
+}
+
+fn fnv1a(bits: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bits {
+        for byte in b.to_le_bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// A 16³ plume fed fuel by a second emitter, density (socket 0) as the output.
+fn fire_doc() -> String {
+    r#"{ "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+      "nodes": [
+        { "id": 0, "kind": "ember.sphere_emitter", "params": { "center": [1.0, 1.0, 0.4],
+          "radius": 0.3, "density_rate": 1.0, "temperature_rate": 2.0 } },
+        { "id": 1, "kind": "ember.smoke_solver", "params": { "buoyancy_temperature": 1.0 } },
+        { "id": 2, "kind": "core.output", "params": {} },
+        { "id": 3, "kind": "ember.sphere_emitter", "params": { "center": [1.0, 1.0, 0.4],
+          "radius": 0.3, "density_rate": 1.0, "temperature_rate": 0.0 } } ],
+      "edges": [
+        { "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 },
+        { "from_node": 0, "from_index": 1, "to_node": 1, "to_index": 1 },
+        { "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 0 },
+        { "from_node": 3, "from_index": 0, "to_node": 1, "to_index": 6 } ],
+      "output": 2 }"#
+        .to_owned()
+}
+
+#[test]
+fn surface_burn_rate_must_be_finite_and_non_negative() {
+    use elements_ember::solver::resolve_params;
+    assert_eq!(
+        resolve_params(&serde_json::json!({}))
+            .unwrap()
+            .surface_burn_rate,
+        2.0
+    );
+    assert!(resolve_params(&serde_json::json!({ "surface_burn_rate": 0.5 })).is_ok());
+    assert!(resolve_params(&serde_json::json!({ "surface_burn_rate": -1.0 })).is_err());
+    // JSON cannot carry NaN (`json!` turns it into null, which means "default"),
+    // so a non-finite rate arrives as a number that overflows f32 to infinity.
+    assert!(resolve_params(&serde_json::json!({ "surface_burn_rate": 1e39 })).is_err());
+}

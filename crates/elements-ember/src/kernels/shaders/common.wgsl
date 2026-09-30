@@ -23,7 +23,7 @@ struct Params {
     ignition_temperature: f32,
     max_temperature: f32,
     euler_faces: u32,        // 1 on face uniforms with fire on: backtrace with one Euler step
-    _pad1: u32,
+    surface_burn: f32,       // surface_burn_rate·h: wood burnt per substep (FT4)
     _pad2: u32,
 };
 

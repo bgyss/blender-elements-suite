@@ -59,6 +59,7 @@ const FUEL_INPUT: u32 = 6;
 /// Blender's fire defaults in Ember's units at 24 fps
 /// (`tests/bench/mapping.py` `EMBER_FIRE_DEFAULTS`, 2b-4 spec §4.3).
 pub const DEFAULT_BURNING_RATE: f32 = 1.875;
+pub const DEFAULT_SURFACE_BURN_RATE: f32 = 2.0;
 pub const DEFAULT_FLAME_SMOKE: f32 = 1.0;
 pub const DEFAULT_FLAME_VORTICITY: f32 = 12.0;
 pub const DEFAULT_IGNITION_TEMPERATURE: f32 = 1.5;
@@ -117,6 +118,7 @@ impl Quality {
             pressure_cycles,
             conserve_mass: true,
             burning_rate: DEFAULT_BURNING_RATE,
+            surface_burn_rate: DEFAULT_SURFACE_BURN_RATE,
             flame_smoke: DEFAULT_FLAME_SMOKE,
             flame_vorticity: DEFAULT_FLAME_VORTICITY,
             ignition_temperature: DEFAULT_IGNITION_TEMPERATURE,
@@ -202,6 +204,9 @@ pub struct SolverParams {
     /// Fuel burnt per second where there is fuel (2b-4 spec §3.2). Fire
     /// parameters act only while the fuel input is connected.
     pub burning_rate: f32,
+    /// Wood burnt per second per surface cell while it burns (FT4 spec §3.2);
+    /// acts only while the surface input is connected.
+    pub surface_burn_rate: f32,
     /// Smoke made per unit of fuel burnt, Mantaflow's `flame_smoke` factor.
     pub flame_smoke: f32,
     /// Extra vorticity confinement per unit fuel, 1/s: the per-cell
@@ -247,6 +252,7 @@ struct DocParams {
     pressure_cycles: Option<u32>,
     conserve_mass: Option<bool>,
     burning_rate: Option<f32>,
+    surface_burn_rate: Option<f32>,
     flame_smoke: Option<f32>,
     flame_vorticity: Option<f32>,
     ignition_temperature: Option<f32>,
@@ -303,6 +309,7 @@ pub fn resolve_params(params: &serde_json::Value) -> Result<SolverParams, DocErr
         pressure_cycles: doc.pressure_cycles.unwrap_or(preset.pressure_cycles),
         conserve_mass: doc.conserve_mass.unwrap_or(preset.conserve_mass),
         burning_rate: doc.burning_rate.unwrap_or(preset.burning_rate),
+        surface_burn_rate: doc.surface_burn_rate.unwrap_or(preset.surface_burn_rate),
         flame_smoke: doc.flame_smoke.unwrap_or(preset.flame_smoke),
         flame_vorticity: doc.flame_vorticity.unwrap_or(preset.flame_vorticity),
         ignition_temperature: doc
@@ -374,6 +381,10 @@ fn validate(p: &SolverParams) -> Result<(), DocError> {
             "vorticity and dissipation rates must be at least 0",
         ));
     }
+    params::finite(KIND, "surface_burn_rate", &[p.surface_burn_rate])?;
+    if p.surface_burn_rate < 0.0 {
+        return Err(params::bad(KIND, "surface_burn_rate must be at least 0"));
+    }
     let fire = [p.burning_rate, p.flame_smoke, p.flame_vorticity];
     params::finite(KIND, "fire rates", &fire)?;
     if fire.iter().any(|&r| r < 0.0) {
@@ -424,6 +435,7 @@ impl SolverParams {
             wind_rate: self.wind_rate,
             conserve_mass: self.conserve_mass,
             burning_rate: self.burning_rate,
+            surface_burn_rate: self.surface_burn_rate,
             flame_smoke: self.flame_smoke,
             flame_vorticity: self.flame_vorticity,
             ignition_temperature: self.ignition_temperature,

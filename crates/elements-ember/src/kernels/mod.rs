@@ -72,6 +72,8 @@ pub struct StepConstants {
     pub fire: bool,
     /// Fuel burnt per second.
     pub burning_rate: f32,
+    /// Wood burnt per second per cell where a surface burns (FT4 spec §3.2); 0 otherwise.
+    pub surface_burn_rate: f32,
     /// Smoke per unit fuel burnt.
     pub flame_smoke: f32,
     /// Confinement per unit fuel, 1/s.
@@ -104,6 +106,7 @@ impl StepConstants {
             conserve_mass: false,
             fire: false,
             burning_rate: 0.0,
+            surface_burn_rate: 0.0,
             flame_smoke: 0.0,
             flame_vorticity: 0.0,
             ignition_temperature: 0.0,
@@ -136,7 +139,8 @@ struct KernelParams {
     ignition_temperature: f32,
     max_temperature: f32,
     euler_faces: u32,
-    _pad: [u32; 2],
+    surface_burn: f32,
+    _pad: u32,
 }
 
 // `Params` in `shaders/common.wgsl` is 96 bytes; a field added here without
@@ -215,7 +219,8 @@ impl Uniforms {
                 // burns; scalars keep RK2, and so does everything with fire
                 // off (2b-4 spec §3.2 step 5).
                 euler_faces: u32::from(c.fire && axis != CELL),
-                _pad: [0; 2],
+                surface_burn: c.surface_burn_rate * c.h,
+                _pad: 0,
             };
             gpu.device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
