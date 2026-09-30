@@ -203,13 +203,15 @@ is an upper bound.
 The fire-scene result above does not carry over to the shot. With the shack
 in the jet's path, divergence is 58× the same jet without the shack under
 preview, and 509× with 6 cycles. Six cycles lower it only 1.75× at frame 60.
-The cause is the shack's thin walls, not having a collider at all. A solid box
-of the same outer size leaves divergence at the no-shack level. The excess
-is not local to the shack: cells more than 4 cells from it have the same
-RMS. That points to the pressure solve converging slowly around one-cell
-walls, which is known risk (m) (piece 2 spec §6). Nothing blew up. Smoke
-reaches the shack. The flame does not reach it under preview, and barely does
-with 8 substeps.
+These are smoke-only numbers: no flame reaches the shack at one substep.
+Merely having a collider does not explain the excess: a solid box of the same
+outer size leaves divergence at the no-shack level. The excess is not local
+to the shack either, because cells more than 4 cells from it have the same
+RMS. That is consistent with the pressure solve converging slowly around
+one-cell walls, which is known risk (m) (piece 2 spec §6). Two other causes
+are untested (see "What the gap tracks here"). No residual or convergence
+quantity was measured. Nothing blew up. Smoke reaches the shack. The flame
+does not reach it under preview, and barely does with 8 substeps.
 
 ## Method
 
@@ -256,6 +258,11 @@ with 8 substeps.
   same faces in the controls. The solver therefore holds the shack solid.
 - **CLI check:** `elements bake examples/jet_shack.elements --frames 1-12`
   loads and bakes the committed document.
+- **The harness asserts nothing, by design.** It is an experiment, not a
+  check. On a non-finite value it prints an `ERROR at frame N` line and
+  stops that variant, but the test still passes. Read its output. Its
+  `f30`, `f40` and `f60` lines print divergence, fuel, flame, smoke and
+  reach for each variant.
 
 ## Results
 
@@ -280,15 +287,37 @@ so it divides by the ×6 control.
 For comparison, the `fire` scene at 128³, frame 60 (the table above): Ember
 preview 1.19e-3, ×6 4.18e-5, and Mantaflow 4.60e-5.
 
+The fire while the pulse runs, from the harness's `f30` and `f40` lines.
+Fuel is Σ fuel · dx³, and flame is the volume with flame above 0.01. Both
+are 0 at frame 60 in every run.
+
+| variant | fuel f30 | flame f30 m³ | fuel f40 | flame f40 m³ |
+|---|---|---|---|---|
+| shack, preview ×4 | 0.00154 | 0.00639 | 0.00140 | 0.00459 |
+| shack, ×6 | 0.00139 | 0.00404 | 0.00140 | 0.00466 |
+| control, ×4 | 0.00144 | 0.00539 | 0.00127 | 0.00467 |
+| control, ×6 | 0.00139 | 0.00547 | 0.00146 | 0.00400 |
+| diag.: shack, ×10 | 0.00132 | 0.00412 | 0.00135 | 0.00484 |
+| diag.: solid box, ×4 | 0.00127 | 0.00476 | 0.00129 | 0.00409 |
+| diag.: solid box, ×6 | 0.00127 | 0.00468 | 0.00140 | 0.00483 |
+| diag.: shack, 8 substeps ×4 | 0.00032 | 0.00315 | 0.00032 | 0.00330 |
+| diag.: control, 8 substeps ×4 | 0.00031 | 0.00322 | 0.00032 | 0.00317 |
+| diag.: shack, 8 substeps ×10 | 0.00032 | 0.00324 | 0.00030 | 0.00304 |
+| diag.: control, 8 substeps ×10 | 0.00031 | 0.00318 | 0.00033 | 0.00324 |
+
 - **No blow-up.** No run had a non-finite value. Peak |u| stayed at or
   below 12.1 m/s, which is the nozzle's 14 m/s target blended in, far under
   30 m/s.
 - **The fire has burnt out by frame 60.** The pulse ends at frame 40, and
   fuel and flame are 0 at frame 60 in every run. Frame 60 therefore
   measures the flow the fire left behind. Frame 40, the last pulse frame, is
-  the burning comparison: there, flame volume is about 0.004–0.005 m³ at
-  one substep and 0.003 m³ at 8 substeps.
-- **The thin walls cause the excess, not the collider.** The solid box
+  the burning comparison: there, flame volume is 0.0040–0.0048 m³ at one
+  substep and 0.0030–0.0033 m³ at 8 substeps (the fire table).
+  - The shack's ×6 divergence **rises** after the pulse ends, from 4.18e-3
+    at frame 40 to 5.04e-3 at frame 60. Every other run falls over the same
+    frames. This is not explained. So frame 60 is not simply the burning
+    flow's error decaying.
+- **Consistent with thin walls (risk (m)); not simply having a collider.** The solid box
   stays within 0.6–1.2× the control at frame 60. The shack is 58× (×4) and
   509× (×6). Far-field RMS matches measured-cell RMS in every shack run
   (8.72e-3 against 8.84e-3 under preview), so the error is spread across
@@ -298,6 +327,24 @@ preview 1.19e-3, ×6 4.18e-5, and Mantaflow 4.60e-5.
   that has not converged around one-cell walls fits that pattern. Risk (m)
   records the same for `plume_plate`: preview's ×4 misses the thin plate's
   target, and `final`'s ×10 passes.
+  - The box differs from the shack in more than wall thickness, so the
+    evidence does not isolate the walls.
+  - No residual or convergence quantity was measured.
+- **What the gap tracks here: two causes are untested.** Neither was run for
+  this record.
+  1. **The enclosed cavity.** The shack is hollow and nearly sealed: a
+     pocket of fluid cells sits behind planks with gaps of about 5 mm,
+     under one voxel. A pressure solve with a poorly connected fluid region
+     is another plausible cause. The solid box has no cavity.
+  2. **The mesh-collider SDF path.** The shack goes through
+     `ember.mesh_collider`, and the box through the analytic
+     `ember.collider`.
+  - **Controls that would separate them:**
+    - A hollow analytic box with the shack's wall thickness, which would
+      have thin walls and a cavity but no mesh path.
+    - The same shape built as a mesh.
+    - The shack with one wall opened, which would keep the thin walls but
+      remove the enclosure.
 - **More cycles help, but not in proportion.** ×6 gives 1.75× at frame 60
   (16× at frame 40), and ×10 gives 32× at frame 60. With the shack, ×10
   lands at 1.8× the no-shack preview. With 8 substeps and ×10 (`final`'s
@@ -331,16 +378,22 @@ preview 1.19e-3, ×6 4.18e-5, and Mantaflow 4.60e-5.
 - **Nothing was rendered.** Reach is measured by mass and cell counts, not
   looked at.
 - **No Mantaflow twin** exists for this scene.
-- **Every timing is a loaded upper bound.** The 1-minute load was 4.3–7.7.
+- **Every timing is a loaded upper bound.** The 1-minute load was 4.3–7.7
+  for the runs in the table. Two earlier runs of the first four and five
+  variants, at load 14.8 → 15.2 and 15.1 → 13.3, gave the same metrics.
+  They are not in the table.
   Frame ms includes a blocking wait but not the read-backs. No conclusion
   about cost follows from them.
 - **The noise scale was halved** with the other lengths, to 0.04 m. The
   spec gives 0.08 m for the full-size shot.
-- **Not a bug in Tasks 4–8.** The cone emits at the nozzle, and
-  `velocity_local` gives the +x jet. The mesh collider gives a solid
-  (6,755 cells, zero face velocity inside). The excess divergence comes
-  with thin walls in general: the analytic solid box does not show it, and
-  the analytic `plume_plate` does (risk (m)).
+- **No bug found in Tasks 4–8, but one is not ruled out.**
+  - The cone emits at the nozzle, and `velocity_local` gives the +x jet.
+  - The mesh collider gives a solid (6,755 cells, zero face velocity inside).
+  - The excess divergence is consistent with thin walls (risk (m)). The
+    analytic solid box does not show it, and the analytic `plume_plate`,
+    another thin wall, has the same known weakness.
+  - The mesh-collider SDF path and the enclosed cavity remain untested as
+    causes (see above).
 
 ## Recommendation for FT3 (the user decides)
 
@@ -349,6 +402,21 @@ The variant to scope is `pressure_cycles` 10 when a thin collider is
 present.** This is `final`'s cycle count, as a preset rule or a document
 default for the shot. The task should also weigh the adaptive residual stop
 that risk (m) left out of scope.
+
+**This recommendation is provisional.**
+- **One run per variant, frame 60 only, after the pulse ended.** Frame 40 is
+  also recorded.
+- **The flow is smoke only.**
+  - The 58× and 509× figures are smoke-only flow. At one substep no flame
+    ever crosses the shack's front plane, so no run measures flame meeting
+    the shack.
+  - The shot needs about 8 substeps or more to get flame there. At 8
+    substeps, even ×10 leaves 12× its control (2.1e-5).
+  - The "×10 cuts divergence 32×" support therefore comes from the
+    one-substep regime, which the shot cannot use.
+- **Before choosing a cycle count,** the scoped solver task should
+  re-measure with flame reaching the shack, at 8 substeps or the `final`
+  preset. It should also run the cavity and mesh-path controls above.
 
 - ×6, Task 9's fire-scene variant, does not carry over. It closes the
   fire-scene gap, but with the shack it leaves 5.0e-3, 509× its control.
