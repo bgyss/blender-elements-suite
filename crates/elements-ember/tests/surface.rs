@@ -854,10 +854,11 @@ fn wall_doc(heat: f32) -> String {
 /// doc comment): preview preset (one substep, MGPCG ×4), buoyancy 1,
 /// temperature dissipation 8/s, surface burn rate 8/s, gas burning rate
 /// 1.875, ignition 1.5, max temperature 3, frames 1..=60, 16×16×32, no seed
-/// (nothing stochastic), recorded on Apple M1 Max. The dissipation is what
-/// makes the test fail without the surface's fuel: the heat source's own
-/// plume cools below ignition within two rows (the zeroed-gather mutant lit
-/// only rows 2 and 3), while flame is reset above it wherever fuel burns.
+/// (nothing stochastic), recorded on Apple M1 Max. The zeroed-gather
+/// mutant fails this test with `temperature_dissipation` 8 and
+/// `surface_burn_rate` 8 changed together (not isolated from each other): the
+/// heat source's own plume cools below ignition within two rows (the mutant
+/// lit only rows 2 and 3), while flame is reset above it wherever fuel burns.
 /// Every scene attempt is in
 /// `docs/bench/surface-ignition.md`.
 #[test]
