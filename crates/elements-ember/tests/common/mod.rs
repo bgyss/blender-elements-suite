@@ -632,3 +632,22 @@ pub fn block_mask(cells: FieldDims) -> Vec<f32> {
     }
     mask
 }
+
+/// Threshold `sdf` (< 0 is solid) into a 0/1 mask field, as the solver does.
+pub fn solid_mask(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    pool: &mut FieldPool,
+    cells: FieldDims,
+    dx: f32,
+    sdf: &Field,
+) -> Field {
+    use elements_core::gpu::ComputeBatch;
+    use elements_ember::kernels::{StepConstants, Uniforms, solidify};
+    let mask = pool.acquire(gpu, cells, FieldFormat::R32Float).unwrap();
+    let u = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).unwrap();
+    let mut batch = ComputeBatch::new();
+    solidify(gpu, cache, &mut batch, &u, sdf, &mask).unwrap();
+    batch.submit(gpu).unwrap();
+    mask
+}
