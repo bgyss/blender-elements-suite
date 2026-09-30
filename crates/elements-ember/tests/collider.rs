@@ -53,6 +53,7 @@ fn the_sdf_is_the_signed_distance_to_the_shape() {
     let sphere = ColliderParams {
         shape: Shape::Sphere { radius: 0.3 },
         transform: Transform::at([1.0, 0.9, 0.7]),
+        surface_fuel: None,
     };
     let (s, _, _) = run(&gpu, &sphere, 0.0);
     let half = [0.3, 0.2, 0.25];
@@ -70,6 +71,7 @@ fn the_sdf_is_the_signed_distance_to_the_shape() {
                 }),
             }],
         },
+        surface_fuel: None,
     };
     let (b, _, pose) = run(&gpu, &boxed, 0.0);
     let mut inside = 0;
@@ -123,6 +125,7 @@ fn the_velocity_is_the_colliders_material_velocity_at_each_face() {
                 },
             ],
         },
+        surface_fuel: None,
     };
     let (_, faces, pose) = run(&gpu, &spinning, 6.0);
     for (a, face) in faces.iter().enumerate() {
@@ -182,12 +185,14 @@ fn a_collider_union_takes_the_nearer_colliders_distance_and_velocity() {
     let a = ColliderParams {
         shape: Shape::Sphere { radius: 0.3 },
         transform: moving([0.6, 0.8, 0.6], [0.6, 0.8, 1.0]),
+        surface_fuel: None,
     };
     let b = ColliderParams {
         shape: Shape::Box {
             half_extents: [0.25; 3],
         },
         transform: moving([1.4, 0.8, 0.6], [1.0, 0.8, 0.6]),
+        surface_fuel: None,
     };
     let make = |pool: &mut FieldPool| {
         (

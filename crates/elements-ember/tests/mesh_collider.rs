@@ -64,6 +64,7 @@ fn a_box_mesh_matches_the_analytic_box_distance() {
         mesh: Mesh::box_mesh([-0.3, -0.2, -0.25], [0.3, 0.2, 0.25]),
         transform: at([1.0, 1.0, 1.0], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let (lo, hi) = ([0.7, 0.8, 0.75], [1.3, 1.2, 1.25]);
@@ -179,6 +180,7 @@ fn a_sphere_mesh_matches_the_analytic_sphere_distance() {
         mesh,
         transform: at([1.0, 1.0, 1.0], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let cells = FieldDims::new(N, N, N);
@@ -229,6 +231,7 @@ fn a_rotated_mesh_is_the_rotated_shape() {
             }),
         ),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let cells = FieldDims::new(N, N, N);
@@ -243,6 +246,7 @@ fn offset_shrinks_the_distance() {
         mesh: Mesh::box_mesh([-0.3; 3], [0.3; 3]),
         transform: at([1.0; 3], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let inflated = MeshColliderParams {
         offset: 0.05,
@@ -266,6 +270,7 @@ fn a_zero_area_triangle_is_ignored() {
         mesh,
         transform: at([1.0; 3], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     assert!(sdf.iter().all(|d| d.is_finite()));
@@ -291,6 +296,7 @@ fn a_moving_mesh_has_its_linear_velocity_on_the_faces() {
         mesh: Mesh::box_mesh([-0.3; 3], [0.3; 3]),
         transform: t,
         offset: 0.0,
+        surface_fuel: None,
     };
     let (_, [u, v, _]) = fill(&params, 12.0);
     assert!(
@@ -340,6 +346,7 @@ fn touching_boxes_have_the_union_sign_everywhere() {
         mesh,
         transform: at([0.0; 3], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let cells = FieldDims::new(N, N, N);
@@ -465,6 +472,7 @@ fn a_sharp_wedge_matches_the_reference_at_every_cell() {
         mesh: mesh.clone(),
         transform: at([0.0; 3], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let cells = FieldDims::new(N, N, N);
@@ -499,6 +507,7 @@ fn a_sliver_beside_a_box_is_not_a_surface() {
         mesh,
         transform: at([1.0; 3], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let cells = FieldDims::new(N, N, N);
@@ -536,6 +545,7 @@ fn a_dispatch_over_the_triangle_test_budget_is_refused() {
         mesh,
         transform: at([1.0; 3], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let gpu = gpu();
     let mut pool = FieldPool::new();
@@ -596,6 +606,7 @@ fn a_concave_shack_keeps_its_interior_outside_the_solid() {
         mesh: shack(&p),
         transform: at([1.0, 1.0, 0.0], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let (sdf, _) = fill(&params, 0.0);
     let cells = FieldDims::new(N, N, N);
@@ -638,6 +649,7 @@ fn shack_fill_cost() {
         mesh,
         transform: at([1.0, 1.0, 0.0], None),
         offset: 0.0,
+        surface_fuel: None,
     };
     let gpu = gpu();
     println!("adapter: {}", gpu.adapter_name());

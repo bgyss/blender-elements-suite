@@ -96,7 +96,9 @@ simpler baseline.
 
 ## 6. Open items for later cycles
 
-- Whether the `char` mask and surface reservoir belong in `ember.collider` or a new node kind.
+- Decided (user decision 2026-09-30): the `char` mask and surface reservoir extend `ember.collider`
+  (and `ember.mesh_collider`) with `surface_fuel`, not a new node kind; built in FT4
+  (`2026-09-30-flamethrower-ft4-surface-ignition-design.md`).
 - Fire divergence: whether FT3 leads to a solver change (user decision).
 - Tide licensing and any paper source: review before incorporating source or weights; no GPL code in
   `elements-*` crates.
