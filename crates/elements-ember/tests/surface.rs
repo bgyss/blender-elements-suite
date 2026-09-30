@@ -856,8 +856,9 @@ fn wall_doc(heat: f32) -> String {
 /// 1.875, ignition 1.5, max temperature 3, frames 1..=60, 16×16×32, no seed
 /// (nothing stochastic), recorded on Apple M1 Max. The dissipation is what
 /// makes the test fail without the surface's fuel: the heat source's own
-/// plume cools below ignition within two rows, while flame is reset above it
-/// wherever fuel burns. Every scene attempt is in
+/// plume cools below ignition within two rows (the zeroed-gather mutant lit
+/// only rows 2 and 3), while flame is reset above it wherever fuel burns.
+/// Every scene attempt is in
 /// `docs/bench/surface-ignition.md`.
 #[test]
 fn the_front_spreads_up_a_wall() {

@@ -53,14 +53,15 @@ surface's fuel. The same mutation did fail the other tests that use it
 did take effect.
 
 Why the surface's fuel added nothing is inferred from the arithmetic and was
-not measured: a wall cell one cell thick has two fluid neighbours, so each
+not measured: an interior cell of a wall one cell thick has two fluid neighbours
+(edge cells have three or more, so each of theirs receives less), so each
 receives `2 · h / 2` ≈ 0.042 fuel per substep, while the gas burns
 `1.875 · h` ≈ 0.078 per substep. The fuel is consumed in the substep it
 arrives, react drops to 0, and no flame temperature is set.
 
 ### Attempt 2: temperature dissipation 8/s, surface burn rate 8/s (kept)
 
-One adjustment, two solver constants changed together:
+One adjustment, two solver constants changed together. Intended effect (reasoned, not measured separately):
 
 - `temperature_dissipation` 8.0: the heat source's plume cools below
   ignition within a short rise. Burning gas is not affected the same way,
@@ -81,7 +82,8 @@ All 12 wall rows ignite in order from the foot; the front climbs about one row
 Rows 2 and 3 light from the heat source directly.
 
 Mutation (surface_gather.wgsl: `textureStore(rate, p, vec4<f32>(0.0, 0.0, 0.0, 0.0))`),
-the same as the spec's test 5 mutation:
+the same as the spec's test 5 mutation (run at commit 1052529; the fix round's
+doc-comment line moves the assertion down one line):
 
 ```
 ignition frames by row: [(2, 2), (3, 4)]
@@ -93,6 +95,12 @@ test the_front_spreads_up_a_wall ... FAILED
 Without the gathered fuel only the two rows the heat source reaches ignite.
 The shader was restored and `git diff` checked clean.
 
+Margin: the zeroed-gather mutant falls one row short of the 3-row threshold;
+the non-decreasing check alone does not discriminate (attempt 1's heater-only
+run passed it), so the proof rests on `rows.len() >= 3`, and on another
+backend the heater might reach one more row and lose the mutation proof
+(llvmpipe has not run).
+
 Attempt 3 and 4 were not needed.
 
 ## What this does not measure
@@ -100,6 +108,11 @@ Attempt 3 and 4 were not needed.
 - No flame-meets-shack case: FT3b found preview's single substep never brings
   the flamethrower's flame to the shack, so the shot's real behaviour is FT6's.
 - No timing.
+- Whether both settings are needed: dissipation and surface burn rate were
+  changed in one attempt and not tested apart. The zeroed-gather mutant's
+  result (rows 2–3 only) shows dissipation alone stops the heater's plume
+  above row 3; whether the default surface burn rate of 2 would still spread
+  the front with dissipation 8 is unknown.
 - One scene, one resolution (16×16×32), one adapter; nothing stochastic, so
   no seed variation. The Linux software-Vulkan CI run has not happened for
   this commit.
