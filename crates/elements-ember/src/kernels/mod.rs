@@ -13,6 +13,7 @@ pub mod mgpcg;
 pub mod multigrid;
 mod project;
 mod solid;
+mod surface;
 mod vorticity;
 
 pub use advect::{Advection, Carried, Pass, advect, maccormack};
@@ -25,6 +26,7 @@ pub use project::{
     solve_pressure, subtract_gradient,
 };
 pub use solid::solidify;
+pub use surface::{surface_burn, surface_char, surface_gather};
 pub use vorticity::{confine, curl};
 
 use elements_core::gpu::{Axis, Field, FieldDims, GpuContext, GpuError, StaggeredField};

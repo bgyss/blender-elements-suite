@@ -215,3 +215,305 @@ fn surface_burn_rate_must_be_finite_and_non_negative() {
     // so a non-finite rate arrives as a number that overflows f32 to infinity.
     assert!(resolve_params(&serde_json::json!({ "surface_burn_rate": 1e39 })).is_err());
 }
+
+// ---- Surface kernels (FT4 spec §3.3) ----
+
+use elements_core::gpu::{ComputeBatch, Field, FieldFormat, GpuContext};
+use elements_ember::kernels::{
+    Solids, StepConstants, Uniforms, surface_burn, surface_char, surface_gather,
+};
+
+const K: FieldDims = FieldDims { x: 8, y: 8, z: 8 };
+const H: f32 = 1.0 / 48.0;
+const IGN: f32 = 1.5;
+const BURN_RATE: f32 = 2.0;
+
+/// A vertical plank: solid cells i = 4, j in 2..6, k in 1..7, each with `load`.
+fn plank(load: f32) -> (Vec<f32>, Vec<f32>) {
+    let mut mask = vec![0.0; K.voxel_count()];
+    let mut loads = vec![0.0; K.voxel_count()];
+    for k in 1..7 {
+        for j in 2..6 {
+            mask[index(K, 4, j, k)] = 1.0;
+            loads[index(K, 4, j, k)] = load;
+        }
+    }
+    (mask, loads)
+}
+
+fn constants() -> StepConstants {
+    StepConstants {
+        has_solids: true,
+        surface_burn_rate: BURN_RATE,
+        ignition_temperature: IGN,
+        ..StepConstants::new(K, H, 0.125)
+    }
+}
+
+fn in_domain(c: [i32; 3]) -> bool {
+    c.iter().all(|&v| (0..8).contains(&v))
+}
+
+fn neighbours(c: [i32; 3]) -> [[i32; 3]; 6] {
+    let mut out = [c; 6];
+    for n in 0..6 {
+        out[n][n / 2] += if n % 2 == 1 { 1 } else { -1 };
+    }
+    out
+}
+
+fn fluid(mask: &[f32], c: [i32; 3]) -> bool {
+    in_domain(c) && mask[index(K, c[0] as u32, c[1] as u32, c[2] as u32)] <= 0.5
+}
+
+fn at(c: [i32; 3]) -> usize {
+    index(K, c[0] as u32, c[1] as u32, c[2] as u32)
+}
+
+/// FT4 spec §3.3, directly: returns (burned', emitted, rate).
+fn cpu_surface(
+    mask: &[f32],
+    load: &[f32],
+    burned: &[f32],
+    temperature: &[f32],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let n = K.voxel_count();
+    let (mut b2, mut emitted, mut rate) = (burned.to_vec(), vec![0.0; n], vec![0.0; n]);
+    let burn = BURN_RATE * H;
+    for k in 0..8 {
+        for j in 0..8 {
+            for i in 0..8 {
+                let c = [i, j, k];
+                let fluid_n: Vec<[i32; 3]> = neighbours(c)
+                    .into_iter()
+                    .filter(|&q| fluid(mask, q))
+                    .collect();
+                if mask[at(c)] > 0.5 && load[at(c)] > 0.0 && !fluid_n.is_empty() {
+                    let hottest = fluid_n
+                        .iter()
+                        .map(|&q| temperature[at(q)])
+                        .fold(f32::MIN, f32::max);
+                    let b = burned[at(c)];
+                    if (b > 0.0 || hottest > IGN) && b < load[at(c)] {
+                        let e = burn.min(load[at(c)] - b);
+                        b2[at(c)] = b + e;
+                        emitted[at(c)] = e;
+                    }
+                }
+            }
+        }
+    }
+    for k in 0..8 {
+        for j in 0..8 {
+            for i in 0..8 {
+                let c = [i, j, k];
+                if fluid(mask, c) {
+                    let mut sum = 0.0;
+                    for q in neighbours(c) {
+                        if in_domain(q) && mask[at(q)] > 0.5 && emitted[at(q)] > 0.0 {
+                            let nf = neighbours(q)
+                                .into_iter()
+                                .filter(|&r| fluid(mask, r))
+                                .count();
+                            sum += emitted[at(q)] / nf as f32;
+                        }
+                    }
+                    rate[at(c)] = sum / H;
+                }
+            }
+        }
+    }
+    (b2, emitted, rate)
+}
+
+struct Kernels {
+    gpu: GpuContext,
+    pool: FieldPool,
+    cache: PipelineCache,
+    mask: Field,
+    velocity: elements_core::gpu::StaggeredField,
+    load: Field,
+    burned: Field,
+    emitted: Field,
+    rate: Field,
+}
+
+impl Kernels {
+    fn new(mask: &[f32], load: &[f32], burned: &[f32]) -> Self {
+        let gpu = gpu();
+        let mut pool = FieldPool::new();
+        let mut cache = PipelineCache::new();
+        let velocity = pool.acquire_staggered_zeroed(&gpu, &mut cache, K).unwrap();
+        let mask = upload(&gpu, &mut pool, K, mask);
+        let load = upload(&gpu, &mut pool, K, load);
+        let burned = upload(&gpu, &mut pool, K, burned);
+        let emitted = upload(&gpu, &mut pool, K, &vec![9.0; K.voxel_count()]);
+        let rate = upload(&gpu, &mut pool, K, &vec![9.0; K.voxel_count()]);
+        Self {
+            gpu,
+            pool,
+            cache,
+            mask,
+            velocity,
+            load,
+            burned,
+            emitted,
+            rate,
+        }
+    }
+
+    /// One substep of the two kernels; returns (burned', emitted, rate).
+    fn run(&mut self, temperature: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let temp = upload(&self.gpu, &mut self.pool, K, temperature);
+        let u = Uniforms::new(&self.gpu, &constants()).unwrap();
+        let solids = Solids {
+            mask: &self.mask,
+            velocity: &self.velocity,
+        };
+        let mut batch = ComputeBatch::new();
+        surface_burn(
+            &self.gpu,
+            &mut self.cache,
+            &mut batch,
+            &u,
+            &self.load,
+            &temp,
+            solids,
+            &self.burned,
+            &self.emitted,
+        )
+        .unwrap();
+        surface_gather(
+            &self.gpu,
+            &mut self.cache,
+            &mut batch,
+            &u,
+            solids,
+            &self.emitted,
+            &self.rate,
+        )
+        .unwrap();
+        batch.submit(&self.gpu).unwrap();
+        (
+            self.burned.read_back(&self.gpu).unwrap(),
+            self.emitted.read_back(&self.gpu).unwrap(),
+            self.rate.read_back(&self.gpu).unwrap(),
+        )
+    }
+}
+
+fn gas(temperature_at: &[([i32; 3], f32)]) -> Vec<f32> {
+    let mut t = vec![0.0; K.voxel_count()];
+    for (c, v) in temperature_at {
+        t[at(*c)] = *v;
+    }
+    t
+}
+
+#[test]
+fn cold_gas_ignites_nothing() {
+    let (mask, load) = plank(5.0);
+    let mut k = Kernels::new(&mask, &load, &vec![0.0; K.voxel_count()]);
+    // Even gas exactly at the threshold does not ignite: strictly above.
+    let t = vec![IGN; K.voxel_count()];
+    for _ in 0..10 {
+        let (burned, emitted, rate) = k.run(&t);
+        assert!(burned.iter().all(|&b| b == 0.0));
+        assert!(emitted.iter().all(|&e| e == 0.0));
+        assert!(rate.iter().all(|&r| r == 0.0));
+    }
+}
+
+#[test]
+fn gas_above_the_threshold_ignites_only_its_neighbour() {
+    let (mask, load) = plank(5.0);
+    let mut k = Kernels::new(&mask, &load, &vec![0.0; K.voxel_count()]);
+    // One hot fluid cell beside plank cell (4, 3, 3).
+    let t = gas(&[([3, 3, 3], IGN + 0.01)]);
+    let (burned, emitted, rate) = k.run(&t);
+    let burn = BURN_RATE * H;
+    assert_eq!(burned[at([4, 3, 3])], burn);
+    assert_eq!(burned.iter().filter(|&&b| b > 0.0).count(), 1);
+    assert_eq!(emitted[at([4, 3, 3])], burn);
+    // Its fluid neighbours: (3,3,3), (5,3,3), (4,2,3)? no: j = 2 is plank.
+    // The kernel and the CPU reference must agree on the split.
+    let (cb, ce, cr) = cpu_surface(&mask, &load, &vec![0.0; K.voxel_count()], &t);
+    assert_close(&burned, &cb, 1e-7, "burned");
+    assert_close(&emitted, &ce, 1e-7, "emitted");
+    assert_close(&rate, &cr, 1e-4, "rate");
+}
+
+#[test]
+fn the_kernels_match_the_cpu_reference_over_many_substeps() {
+    let (mask, load) = plank(0.3); // 7.2 substeps of burning: spent late in the cooling phase
+    let mut k = Kernels::new(&mask, &load, &vec![0.0; K.voxel_count()]);
+    let mut burned = vec![0.0; K.voxel_count()];
+    let hot = gas(&[([3, 3, 3], 2.0), ([5, 4, 5], 2.0), ([3, 5, 1], 1.6)]);
+    let cold = vec![0.0; K.voxel_count()];
+    // 6 substeps of hot gas, then 10 of cold: lit cells keep burning to depletion.
+    for step in 0..16 {
+        let gas = if step < 6 { &hot } else { &cold };
+        let (want_b, want_e, want_r) = cpu_surface(&mask, &load, &burned, gas);
+        let (got_b, got_e, got_r) = k.run(gas);
+        assert_close(&got_b, &want_b, 1e-7, &format!("burned step {step}"));
+        assert_close(&got_e, &want_e, 1e-7, &format!("emitted step {step}"));
+        assert_close(&got_r, &want_r, 1e-4, &format!("rate step {step}"));
+        burned = want_b;
+    }
+}
+
+#[test]
+fn the_reservoir_depletes_and_emission_stops() {
+    let (mask, load) = plank(0.1);
+    let mut k = Kernels::new(&mask, &load, &vec![0.0; K.voxel_count()]);
+    let hot = gas(&[([3, 3, 3], 2.0)]);
+    let mut last = 0.0f32;
+    for _ in 0..30 {
+        let (burned, emitted, _) = k.run(&hot);
+        assert!(burned[at([4, 3, 3])] <= 0.1 + 1e-7, "never past the load");
+        last = emitted[at([4, 3, 3])];
+    }
+    let (burned, _, _) = k.run(&hot);
+    assert_eq!(burned[at([4, 3, 3])], 0.1, "fully burned");
+    assert_eq!(last, 0.0, "a spent cell emits nothing");
+}
+
+#[test]
+fn what_the_wood_loses_the_gas_gains() {
+    let (mask, load) = plank(3.0);
+    let mut k = Kernels::new(&mask, &load, &vec![0.0; K.voxel_count()]);
+    let hot = gas(&[([3, 3, 3], 2.0), ([5, 4, 5], 2.0)]);
+    let (burned, _, rate) = k.run(&hot);
+    let lost: f64 = burned.iter().map(|&b| f64::from(b)).sum();
+    let gained: f64 = rate.iter().map(|&r| f64::from(r) * f64::from(H)).sum();
+    assert!(lost > 0.0);
+    assert!(
+        (lost - gained).abs() <= 1e-6 * lost,
+        "lost {lost}, gained {gained}"
+    );
+}
+
+#[test]
+fn char_is_the_burned_fraction_and_zero_without_a_load() {
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let n = K.voxel_count();
+    let mut burned = vec![0.0; n];
+    let mut load = vec![0.0; n];
+    burned[0] = 1.0;
+    load[0] = 4.0; // quarter burned
+    burned[1] = 4.0;
+    load[1] = 4.0; // spent
+    burned[2] = 0.5; // burned but no load: must be 0, not NaN or inf
+    let b = upload(&gpu, &mut pool, K, &burned);
+    let l = upload(&gpu, &mut pool, K, &load);
+    let dst = pool.acquire(&gpu, K, FieldFormat::R32Float).unwrap();
+    let u = Uniforms::new(&gpu, &constants()).unwrap();
+    let mut batch = ComputeBatch::new();
+    surface_char(&gpu, &mut cache, &mut batch, &u, &b, &l, &dst).unwrap();
+    batch.submit(&gpu).unwrap();
+    let out = dst.read_back(&gpu).unwrap();
+    assert_eq!(&out[..3], &[0.25, 1.0, 0.0]);
+    assert!(out.iter().all(|v| v.is_finite()));
+}
