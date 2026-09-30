@@ -4,7 +4,7 @@
 struct Emitter {
     dims: vec3<u32>,
     dx: f32,
-    velocity: vec3<f32>,   // target velocity, m/s, world space
+    velocity: vec3<f32>,   // target velocity, m/s, world space unless velocity_local
     axis: u32,             // the face pass's axis (0, 1, 2)
     density_rate: f32,
     temperature_rate: f32,
@@ -16,6 +16,6 @@ struct Emitter {
     seed_lo: u32,
     seed_hi: u32,
     fuel_rate: f32,
-    _pad1: u32,
+    velocity_local: u32,   // 1: `velocity` is in the emitter's local frame
     _pad2: u32,
 };

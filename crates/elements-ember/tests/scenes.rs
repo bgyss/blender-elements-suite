@@ -2,14 +2,13 @@ mod common;
 
 use common::*;
 use elements_core::gpu::{
-    ComputeBatch, Field, FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache,
-    StaggeredField,
+    Field, FieldDims, FieldFormat, FieldPool, GpuContext, PipelineCache, StaggeredField,
 };
 use elements_ember::bench::GATE_RATIO;
 use elements_ember::boundaries::DEFAULT_OPEN_MASK;
 use elements_ember::collider::{ColliderFields, ColliderParams, fill_collider};
 use elements_ember::emitter::{Sphere, fill_sphere};
-use elements_ember::kernels::{Solids, StepConstants, Uniforms, solidify};
+use elements_ember::kernels::{Solids, StepConstants};
 use elements_ember::metrics::{centroid_z, divergence};
 use elements_ember::solver::{Emission, PressureSolve, SolverState, Sources, Substep, substep};
 use elements_ember::transform::{Key, Shape, Transform};
@@ -390,11 +389,7 @@ fn collider_at(
         },
     )
     .unwrap();
-    let mask = pool.acquire(gpu, cells, FieldFormat::R32Float).unwrap();
-    let u = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).unwrap();
-    let mut batch = ComputeBatch::new();
-    solidify(gpu, cache, &mut batch, &u, &sdf, &mask).unwrap();
-    batch.submit(gpu).unwrap();
+    let mask = solid_mask(gpu, cache, pool, cells, dx, &sdf);
     let values = sdf.read_back(gpu).unwrap();
     pool.release(sdf);
     (values, mask, velocity)

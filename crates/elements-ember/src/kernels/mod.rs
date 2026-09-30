@@ -413,3 +413,19 @@ pub(crate) fn uniform_buffer(
             })
     })
 }
+
+/// A read-only storage buffer holding `bytes`, created inside an error scope.
+pub(crate) fn storage_buffer(
+    gpu: &GpuContext,
+    label: &str,
+    bytes: &[u8],
+) -> Result<wgpu::Buffer, GpuError> {
+    gpu.scoped(|| {
+        gpu.device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+    })
+}

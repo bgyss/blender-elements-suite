@@ -220,6 +220,7 @@ impl Scene {
                             .iter()
                             .zip(half_extents)
                             .all(|(v, h)| v.abs() <= f64::from(h)),
+                        Shape::Cone { .. } => panic!("bench colliders are spheres or boxes"),
                     });
                 }
             }
