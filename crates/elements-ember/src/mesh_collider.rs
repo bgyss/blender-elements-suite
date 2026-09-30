@@ -15,6 +15,13 @@ use crate::transform::{Pose, Shape, ShapeGpu, Transform};
 
 pub const KIND: &str = "ember.mesh_collider";
 
+/// The most cell-triangle tests (cells x triangles) one dispatch may run, so a
+/// legal mesh cannot hold the GPU long enough for the OS watchdog to kill it.
+/// Measured on an M1 Max with the winding-number kernel: the procedural shack
+/// (576 triangles) at 256x128x128 ran at about 1.4e10 tests/s including
+/// read-back, so this budget is roughly 0.7 s a dispatch.
+pub const MAX_TRIANGLE_TESTS: u64 = 10_000_000_000;
+
 const CELLS_WGSL: &str = concat!(
     include_str!("kernels/shaders/shape.wgsl"),
     include_str!("kernels/shaders/mesh_sdf.wgsl"),
@@ -74,6 +81,17 @@ pub fn fill_mesh_collider(
     out.check("fill_mesh_collider")?;
     let cells = out.sdf.dims();
     let dims = [cells.x, cells.y, cells.z];
+    let tests = u64::from(cells.x)
+        * u64::from(cells.y)
+        * u64::from(cells.z)
+        * params.mesh.triangle_count() as u64;
+    if tests > MAX_TRIANGLE_TESTS {
+        return Err(GpuError::Validation(format!(
+            "fill_mesh_collider: {} cells x {} triangles = {tests} tests, over the budget of {MAX_TRIANGLE_TESTS}",
+            u64::from(cells.x) * u64::from(cells.y) * u64::from(cells.z),
+            params.mesh.triangle_count()
+        )));
+    }
     let cell_pipe = cache.get_or_create(gpu, "ember.mesh_collider.cells", CELLS_WGSL, "main")?;
     let face_pipe = cache.get_or_create(gpu, "ember.mesh_collider.faces", FACES_WGSL, "main")?;
     // `Shape` supplies the pose; the kind and extents are unused.

@@ -56,29 +56,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = shape.world_to_local * (world - shape.origin);
 
     var best = 1.0e30;
-    var best_abs_dot = 0.0;
-    var sign = 1.0;
+    var winding = 0.0;
     for (var t = 0u; t < mesh.tri_count; t = t + 1u) {
         let a = vertices[tris[3u * t]].xyz;
         let b = vertices[tris[3u * t + 1u]].xyz;
         let c = vertices[tris[3u * t + 2u]].xyz;
-        let n = cross(b - a, c - a);
-        let nl = length(n);
-        if (nl <= 0.0) {
-            continue;   // a zero-area triangle has no normal and no surface
+        let ab = b - a;
+        let ac = c - a;
+        let n = cross(ab, ac);
+        // A zero-area or sliver triangle has no surface; its normal is rounding
+        // noise, so the threshold is relative to the edge lengths.
+        if (dot(n, n) <= 1.0e-12 * dot(ab, ab) * dot(ac, ac)) {
+            continue;
         }
-        let d = p - closest_on_triangle(p, a, b, c);
-        let dist = length(d);
-        let ndot = dot(d, n / nl);
-        // The nearest triangle's normal gives the side. Where two triangles
-        // tie (an edge or vertex), the one more aligned with the offset wins.
-        let better = dist < best - 1.0e-6;
-        let tie = !better && dist <= best + 1.0e-6 && abs(ndot) > best_abs_dot;
-        if (better || tie) {
-            best = min(best, dist);
-            best_abs_dot = abs(ndot);
-            sign = select(1.0, -1.0, ndot < 0.0);
+        best = min(best, length(p - closest_on_triangle(p, a, b, c)));
+        // Van Oosterom-Strakhov solid angle of the triangle seen from p. The
+        // sum over a closed surface is 4 pi inside and 0 outside, however
+        // the parts of the mesh touch or overlap.
+        let ra = a - p;
+        let rb = b - p;
+        let rc = c - p;
+        let la = length(ra);
+        let lb = length(rb);
+        let lc = length(rc);
+        let den = la * lb * lc + dot(ra, rb) * lc + dot(rb, rc) * la + dot(rc, ra) * lb;
+        // p on a vertex gives a zero length: the distance is 0 there, so the
+        // sign is immaterial, but the angle must not be NaN.
+        if (la > 0.0 && lb > 0.0 && lc > 0.0) {
+            winding = winding + 2.0 * atan2(dot(ra, cross(rb, rc)), den);
         }
     }
+    let sign = select(1.0, -1.0, winding / (4.0 * 3.14159265358979) > 0.5);
     textureStore(sdf, vec3<i32>(gid), vec4<f32>(sign * best - mesh.offset, 0.0, 0.0, 0.0));
 }

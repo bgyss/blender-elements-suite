@@ -123,7 +123,7 @@ fn offset_shrinks_the_distance() {
 
 /// A zero-area triangle inside a closed mesh is skipped, not turned into NaN.
 #[test]
-fn a_degenerate_triangle_does_not_poison_the_field() {
+fn a_zero_area_triangle_is_ignored() {
     let mut mesh = Mesh::box_mesh([-0.3; 3], [0.3; 3]);
     mesh.positions.push([0.1, 0.1, 0.1]);
     let v = (mesh.positions.len() - 1) as u32;
@@ -136,7 +136,11 @@ fn a_degenerate_triangle_does_not_poison_the_field() {
     let (sdf, _) = fill(&params, 0.0);
     assert!(sdf.iter().all(|d| d.is_finite()));
     let cells = FieldDims::new(N, N, N);
-    assert!(sdf[index(cells, 16, 16, 16)] < 0.0);
+    let d = sdf[index(cells, 16, 16, 16)];
+    assert!(d < 0.0);
+    // The stray point is not a surface: the distance is to the box's wall
+    // (0.3 - 0.03125 away), not the 0.119 m to the stray vertex.
+    assert!((d + 0.26875).abs() < 1e-4, "{d}");
 }
 
 /// A moving mesh carries its material velocity to the faces, as
@@ -184,4 +188,243 @@ fn the_node_is_registered_and_validates_its_mesh() {
         err.is_err(),
         "an out-of-range index must be rejected at build"
     );
+}
+
+fn cell_centres() -> impl Iterator<Item = (u32, u32, u32)> {
+    (0..N).flat_map(|k| (0..N).flat_map(move |j| (0..N).map(move |i| (i, j, k))))
+}
+
+/// Two closed boxes sharing a coincident face, as the shack merges its planks:
+/// the sign must come from the whole surface, not the nearest triangle's side.
+#[test]
+fn touching_boxes_have_the_union_sign_everywhere() {
+    let (alo, ahi) = ([0.4, 0.4, 0.4], [1.6, 0.8, 1.6]);
+    let (blo, bhi) = ([0.4, 0.8, 0.4], [0.8, 1.6, 1.6]);
+    let mut mesh = Mesh::box_mesh([0.4f32, 0.4, 0.4], [1.6, 0.8, 1.6]);
+    mesh.merge(&Mesh::box_mesh([0.4, 0.8, 0.4], [0.8, 1.6, 1.6]));
+    let params = MeshColliderParams {
+        mesh,
+        transform: at([0.0; 3], None),
+        offset: 0.0,
+    };
+    let (sdf, _) = fill(&params, 0.0);
+    let cells = FieldDims::new(N, N, N);
+    let (mut wrong_sign, mut inside, mut worst_out) = (0, 0, 0.0f64);
+    for (i, j, k) in cell_centres() {
+        let p = [cell(i), cell(j), cell(k)];
+        let (da, db) = (box_sdf(alo, ahi, p), box_sdf(blo, bhi, p));
+        let want = da.min(db);
+        let got = f64::from(sdf[index(cells, i, j, k)]);
+        if want.abs() > 1e-3 {
+            inside += usize::from(want < 0.0);
+            wrong_sign += usize::from((got < 0.0) != (want < 0.0));
+        }
+        // Outside, the distance is exact.
+        if want > 0.0 {
+            worst_out = worst_out.max((got - want).abs());
+        }
+    }
+    assert!(inside > 1000, "{inside} inside cells");
+    assert_eq!(wrong_sign, 0, "wrong-sign cells");
+    assert!(worst_out < 1e-4, "worst outside error {worst_out}");
+}
+
+/// Ericson's closest point, f64, for the CPU reference.
+fn closest(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+    let sub = |x: [f64; 3], y: [f64; 3]| [x[0] - y[0], x[1] - y[1], x[2] - y[2]];
+    let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let at = |o: [f64; 3], d: [f64; 3], s: f64| [o[0] + d[0] * s, o[1] + d[1] * s, o[2] + d[2] * s];
+    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = sub(p, b);
+    let (d3, d4) = (dot(ab, bp), dot(ac, bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return at(a, ab, d1 / (d1 - d3));
+    }
+    let cp = sub(p, c);
+    let (d5, d6) = (dot(ab, cp), dot(ac, cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return at(a, ac, d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return at(b, sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let q = at(a, ab, vb * denom);
+    at(q, ac, vc * denom)
+}
+
+/// Signed distance by min distance and the generalized winding number, f64.
+fn reference_sdf(mesh: &Mesh, p: [f64; 3]) -> f64 {
+    let v = |i: u32| mesh.positions[i as usize].map(f64::from);
+    let (mut best, mut winding) = (f64::MAX, 0.0);
+    for t in mesh.indices.chunks(3) {
+        let (a, b, c) = (v(t[0]), v(t[1]), v(t[2]));
+        let q = closest(p, a, b, c);
+        best = best
+            .min(((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt());
+        let r = |x: [f64; 3]| [x[0] - p[0], x[1] - p[1], x[2] - p[2]];
+        let (ra, rb, rc) = (r(a), r(b), r(c));
+        let len = |x: [f64; 3]| (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+        let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+        let cross = |x: [f64; 3], y: [f64; 3]| {
+            [
+                x[1] * y[2] - x[2] * y[1],
+                x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0],
+            ]
+        };
+        let (la, lb, lc) = (len(ra), len(rb), len(rc));
+        if la == 0.0 || lb == 0.0 || lc == 0.0 {
+            continue;
+        }
+        let den = la * lb * lc + dot(ra, rb) * lc + dot(rb, rc) * la + dot(rc, ra) * lb;
+        winding += 2.0 * dot(ra, cross(rb, rc)).atan2(den);
+    }
+    if winding / (4.0 * std::f64::consts::PI) > 0.5 {
+        -best
+    } else {
+        best
+    }
+}
+
+/// A sharp, thin tetrahedron (acute dihedral angles) against a brute-force
+/// f64 reference at every cell, including outside near the acute vertex.
+#[test]
+fn a_sharp_wedge_matches_the_reference_at_every_cell() {
+    let positions = vec![
+        [0.5f32, 0.6, 0.6],
+        [1.6, 0.6, 0.6],
+        [0.7, 0.75, 0.6],
+        [0.8, 0.65, 1.4],
+    ];
+    let mut indices = vec![0u32, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2];
+    // Orient outward: a negative signed volume means the winding is inverted.
+    let vol: f64 = indices
+        .chunks(3)
+        .map(|t| {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| positions[i as usize].map(f64::from));
+            a[0] * (b[1] * c[2] - b[2] * c[1])
+                + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0])
+        })
+        .sum();
+    if vol < 0.0 {
+        for t in indices.chunks_mut(3) {
+            t.swap(1, 2);
+        }
+    }
+    let mesh = Mesh { positions, indices };
+    let params = MeshColliderParams {
+        mesh: mesh.clone(),
+        transform: at([0.0; 3], None),
+        offset: 0.0,
+    };
+    let (sdf, _) = fill(&params, 0.0);
+    let cells = FieldDims::new(N, N, N);
+    let (mut inside, mut worst) = (0, 0.0f64);
+    for (i, j, k) in cell_centres() {
+        let want = reference_sdf(&mesh, [cell(i), cell(j), cell(k)]);
+        let got = f64::from(sdf[index(cells, i, j, k)]);
+        inside += usize::from(want < 0.0);
+        worst = worst.max((got - want).abs());
+    }
+    assert!(inside > 10, "{inside} inside cells");
+    assert!(worst < 1e-4, "worst error {worst} m");
+}
+
+/// A sliver lying on the +x face of a closed box (three nearly collinear
+/// points) changes no cell's sign.
+#[test]
+fn a_sliver_on_the_surface_changes_no_sign() {
+    let plain = Mesh::box_mesh([-0.3; 3], [0.3; 3]);
+    let mut mesh = plain.clone();
+    let n = mesh.positions.len() as u32;
+    mesh.positions
+        .extend_from_slice(&[[0.3, -0.2, 0.0], [0.3, 0.0, 1e-6], [0.3, 0.2, 0.0]]);
+    mesh.indices.extend_from_slice(&[n, n + 1, n + 2]);
+    let with = MeshColliderParams {
+        mesh,
+        transform: at([1.0; 3], None),
+        offset: 0.0,
+    };
+    let without = MeshColliderParams {
+        mesh: plain,
+        transform: at([1.0; 3], None),
+        offset: 0.0,
+    };
+    let (a, _) = fill(&with, 0.0);
+    let (b, _) = fill(&without, 0.0);
+    assert!(a.iter().all(|d| d.is_finite()));
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(*x < 0.0, *y < 0.0, "{x} {y}");
+    }
+}
+
+/// A valid mesh over the dispatch budget is refused up front, quickly.
+#[test]
+fn a_dispatch_over_the_triangle_test_budget_is_refused() {
+    use elements_ember::mesh_collider::MAX_TRIANGLE_TESTS;
+    let tris = (MAX_TRIANGLE_TESTS / u64::from(N * N * N)) as usize + 1000;
+    let mesh = Mesh {
+        positions: vec![[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+        indices: (0..tris).flat_map(|_| [0, 1, 2]).collect(),
+    };
+    mesh.validate("test").unwrap();
+    let params = MeshColliderParams {
+        mesh,
+        transform: at([1.0; 3], None),
+        offset: 0.0,
+    };
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let cells = FieldDims::new(N, N, N);
+    let sdf = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
+    let v = pool.acquire_staggered_uninit(&gpu, cells).unwrap();
+    let pose = params.transform.pose(0.0, SPF);
+    let start = std::time::Instant::now();
+    let err = fill_mesh_collider(
+        &gpu,
+        &mut cache,
+        &params,
+        &pose,
+        DX,
+        ColliderFields {
+            sdf: &sdf,
+            velocity: &v,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(start.elapsed().as_secs_f64() < 1.0);
+    assert!(err.contains("budget"), "{err}");
+    // The same mesh on a tiny domain is under budget and runs.
+    let tiny = FieldDims::new(2, 2, 2);
+    let sdf = pool.acquire(&gpu, tiny, FieldFormat::R32Float).unwrap();
+    let v = pool.acquire_staggered_uninit(&gpu, tiny).unwrap();
+    fill_mesh_collider(
+        &gpu,
+        &mut cache,
+        &params,
+        &pose,
+        DX,
+        ColliderFields {
+            sdf: &sdf,
+            velocity: &v,
+        },
+    )
+    .unwrap();
 }

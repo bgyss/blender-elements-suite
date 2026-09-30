@@ -1,4 +1,4 @@
-use elements_ember::mesh::{MAX_TRIANGLES, Mesh};
+use elements_ember::mesh::{MAX_TRIANGLES, MAX_VERTICES, Mesh};
 
 fn outward_volume(m: &Mesh) -> f64 {
     // Signed volume by the divergence theorem: positive for outward winding.
@@ -77,6 +77,13 @@ fn bad_meshes_are_rejected_with_a_reason() {
             Mesh {
                 positions: ok.positions.clone(),
                 indices: vec![0; (MAX_TRIANGLES + 1) * 3],
+            },
+        ),
+        (
+            "positions, at most",
+            Mesh {
+                positions: vec![[0.0; 3]; MAX_VERTICES + 1],
+                indices: vec![0, 1, 2],
             },
         ),
     ];

@@ -7,9 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::params;
 
-/// The most triangles a mesh may hold. The SDF kernel tests every triangle at
-/// every cell, so this bounds a frame's cost and the buffer size.
+/// The most triangles a mesh may hold. This bounds memory and buffer size, not
+/// frame cost; `mesh_collider::MAX_TRIANGLE_TESTS` bounds that.
 pub const MAX_TRIANGLES: usize = 1_000_000;
+
+/// The most positions a mesh may hold: at 16 bytes each (padded to a vec4 on
+/// the GPU) this stays under the 128 MiB downlevel storage-binding limit.
+pub const MAX_VERTICES: usize = 8_388_608;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +47,15 @@ impl Mesh {
                 format!(
                     "mesh has {} triangles, at most {MAX_TRIANGLES}",
                     self.triangle_count()
+                ),
+            ));
+        }
+        if self.positions.len() > MAX_VERTICES {
+            return Err(params::bad(
+                kind,
+                format!(
+                    "mesh has {} positions, at most {MAX_VERTICES}",
+                    self.positions.len()
                 ),
             ));
         }
