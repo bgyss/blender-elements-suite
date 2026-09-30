@@ -38,6 +38,8 @@ const FACES_WGSL: &str = concat!(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshColliderParams {
+    /// Should be a closed surface: an open mesh has no inside (its winding
+    /// number stays at or below one half everywhere), so it is all outside.
     pub mesh: Mesh,
     pub transform: Transform,
     /// Metres subtracted from the signed distance: inflates the solid so

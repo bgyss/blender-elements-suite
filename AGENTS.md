@@ -59,6 +59,7 @@ fire preview frame takes 103.5 ms under load, over budget: risk (n)
 `docs/bench/render/`: the fires share a base and height, but Ember's is a
 narrower column and still burns at frame 90 after Mantaflow's has gone out. The node editor (`docs/superpowers/specs/2026-09-25-ember-node-editor-design.md`,
 branch `ember-node-editor`) is designed and planned but paused.
+Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a nozzle cone, mesh colliders and a procedural shack.
 
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
@@ -79,6 +80,10 @@ branch `ember-node-editor`) is designed and planned but paused.
 - Ember piece 2b-3c plan: `docs/superpowers/plans/2026-09-24-ember-solver-quality-2b3c.md`
 - Ember piece 2b-4 spec and plan: `docs/superpowers/specs/2026-09-25-ember-fire-2b4-design.md`, `docs/superpowers/plans/2026-09-25-ember-fire-2b4.md`
 - Fire preview cost: `docs/bench/presets-fire.md`
+- Flamethrower roadmap spec: `docs/superpowers/specs/2026-09-30-flamethrower-napalm-roadmap-design.md`
+- Flamethrower FT0 shot spec: `docs/superpowers/specs/2026-09-30-flamethrower-shot-ft0.md`
+- Flamethrower FT0–FT3 plan: `docs/superpowers/plans/2026-09-30-flamethrower-ft0-ft3.md`
+- Mesh collider fill cost: `docs/bench/mesh-collider.md`
 - Mantaflow benchmark results and cache notes: `docs/bench/results.md` (2b-3c's rerun; 2b-3's run is in `docs/bench/results-2b3/`), `docs/bench/mantaflow-notes.md`
 - Solver gate (Gauss–Seidel, multigrid and MGPCG): `docs/bench/solver-gate.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`

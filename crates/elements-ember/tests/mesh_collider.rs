@@ -345,32 +345,47 @@ fn a_sharp_wedge_matches_the_reference_at_every_cell() {
     assert!(worst < 1e-4, "worst error {worst} m");
 }
 
-/// A sliver lying on the +x face of a closed box (three nearly collinear
-/// points) changes no cell's sign.
+/// A sliver (three points collinear to 1e-8 m) floating outside a closed box,
+/// exactly through a row of cell centres, is no surface: every cell keeps the
+/// analytic box distance and sign. Without the sliver skip it would be the
+/// strict nearest triangle (distance 0) to that row.
 #[test]
-fn a_sliver_on_the_surface_changes_no_sign() {
-    let plain = Mesh::box_mesh([-0.3; 3], [0.3; 3]);
-    let mut mesh = plain.clone();
+fn a_sliver_beside_a_box_is_not_a_surface() {
+    let mut mesh = Mesh::box_mesh([-0.3; 3], [0.3; 3]);
     let n = mesh.positions.len() as u32;
-    mesh.positions
-        .extend_from_slice(&[[0.3, -0.2, 0.0], [0.3, 0.0, 1e-6], [0.3, 0.2, 0.0]]);
+    // Local x = 0.40625 and z = 0.03125 are world 1.40625 and 1.03125: the
+    // centres of cells i = 22 and k = 16, so cells (22, 13..=18, 16) lie on it.
+    mesh.positions.extend_from_slice(&[
+        [0.40625, -0.1875, 0.03125],
+        [0.40625, 0.0, 0.03125 + 1e-8],
+        [0.40625, 0.1875, 0.03125],
+    ]);
     mesh.indices.extend_from_slice(&[n, n + 1, n + 2]);
-    let with = MeshColliderParams {
+    let params = MeshColliderParams {
         mesh,
         transform: at([1.0; 3], None),
         offset: 0.0,
     };
-    let without = MeshColliderParams {
-        mesh: plain,
-        transform: at([1.0; 3], None),
-        offset: 0.0,
-    };
-    let (a, _) = fill(&with, 0.0);
-    let (b, _) = fill(&without, 0.0);
-    assert!(a.iter().all(|d| d.is_finite()));
-    for (x, y) in a.iter().zip(&b) {
-        assert_eq!(*x < 0.0, *y < 0.0, "{x} {y}");
+    let (sdf, _) = fill(&params, 0.0);
+    let cells = FieldDims::new(N, N, N);
+    let (lo, hi) = ([0.7; 3], [1.3; 3]);
+    let want_on_sliver = box_sdf(lo, hi, [cell(22), cell(16), cell(16)]);
+    assert!(want_on_sliver > 0.1, "the row is outside the box");
+    let mut worst = 0.0f64;
+    for (i, j, k) in cell_centres() {
+        let want = box_sdf(lo, hi, [cell(i), cell(j), cell(k)]);
+        let got = f64::from(sdf[index(cells, i, j, k)]);
+        assert!(got.is_finite());
+        if want.abs() > 1e-3 {
+            assert_eq!(
+                got < 0.0,
+                want < 0.0,
+                "sign at ({i},{j},{k}): {got} vs {want}"
+            );
+        }
+        worst = worst.max((got - want).abs());
     }
+    assert!(worst < 1e-4, "worst error {worst} m");
 }
 
 /// A valid mesh over the dispatch budget is refused up front, quickly.
@@ -427,4 +442,101 @@ fn a_dispatch_over_the_triangle_test_budget_is_refused() {
         },
     )
     .unwrap();
+}
+
+/// The shack is concave and open: a cell in the middle of the room is outside
+/// (positive), a cell inside a wall plank is inside (negative), and a cell
+/// above the roof is outside again.
+#[test]
+fn a_concave_shack_keeps_its_interior_outside_the_solid() {
+    use elements_ember::shack::{ShackParams, shack};
+    let p = ShackParams {
+        size: [1.2, 1.0, 1.0],
+        plank_height: 0.1,
+        thickness: 0.05,
+        gap: 0.0,
+        broken_fraction: 0.0,
+        seed: 1,
+    };
+    let params = MeshColliderParams {
+        mesh: shack(&p),
+        transform: at([1.0, 1.0, 0.0], None),
+        offset: 0.0,
+    };
+    let (sdf, _) = fill(&params, 0.0);
+    let cells = FieldDims::new(N, N, N);
+    // Cell (16, 16, 8) is at (1.03, 1.03, 0.53): the room's middle, well clear
+    // of every wall (nearest is the south wall's inner face, y = 0.55).
+    let inside_room = sdf[index(cells, 16, 16, 8)];
+    assert!(inside_room > 0.2, "the room is open air, sdf {inside_room}");
+    // The south wall spans y in [0.5, 0.55]; cell row 8 is y = 0.53125, inside
+    // it (x = 1.03 is within the wall's 0.4..1.6 span, z = 0.53 is mid-plank).
+    let in_wall = sdf[index(cells, 16, 8, 8)];
+    assert!(in_wall < 0.0, "the wall plank is solid, sdf {in_wall}");
+    // The roof's top is z = 1.05; cell layer 20 is z = 1.28.
+    let above = sdf[index(cells, 16, 16, 20)];
+    assert!(above > 0.0, "above the roof, sdf {above}");
+    // Under the roof, inside the room near its ceiling (z = 0.97, layer 15)
+    // is still outside the solid: the winding number sees the room as empty.
+    let under_roof = sdf[index(cells, 16, 16, 15)];
+    assert!(
+        under_roof > 0.0,
+        "under the roof is open air, sdf {under_roof}"
+    );
+}
+
+/// Cost of one SDF fill of the shot's shack. Run by hand:
+/// `cargo nextest run -p elements-ember --run-ignored ignored-only -E 'test(shack_fill_cost)'`
+/// (see docs/bench/mesh-collider.md).
+#[test]
+#[ignore = "timing measurement; prints, asserts nothing about speed"]
+fn shack_fill_cost() {
+    use elements_ember::shack::{ShackParams, shack};
+    let mesh = shack(&ShackParams {
+        size: [1.2, 1.0, 1.0],
+        plank_height: 0.1,
+        thickness: 0.02,
+        gap: 0.01,
+        broken_fraction: 0.2,
+        seed: 7,
+    });
+    let params = MeshColliderParams {
+        mesh,
+        transform: at([1.0, 1.0, 0.0], None),
+        offset: 0.0,
+    };
+    let gpu = gpu();
+    println!("adapter: {}", gpu.adapter_name());
+    println!("triangles: {}", params.mesh.triangle_count());
+    let pose = params.transform.pose(0.0, SPF);
+    for dims in [FieldDims::new(128, 128, 128), FieldDims::new(256, 128, 128)] {
+        let mut pool = FieldPool::new();
+        let mut cache = PipelineCache::new();
+        let sdf = pool.acquire(&gpu, dims, FieldFormat::R32Float).unwrap();
+        let v = pool.acquire_staggered_uninit(&gpu, dims).unwrap();
+        let mut run = || {
+            let start = std::time::Instant::now();
+            fill_mesh_collider(
+                &gpu,
+                &mut cache,
+                &params,
+                &pose,
+                DX,
+                ColliderFields {
+                    sdf: &sdf,
+                    velocity: &v,
+                },
+            )
+            .unwrap();
+            gpu.wait().unwrap();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        run(); // warm-up: pipeline compile
+        let mut ms: Vec<f64> = (0..5).map(|_| run()).collect();
+        ms.sort_by(f64::total_cmp);
+        println!(
+            "{}x{}x{}: median {:.1} ms, range {:.1}..{:.1} ms",
+            dims.x, dims.y, dims.z, ms[2], ms[0], ms[4]
+        );
+    }
 }

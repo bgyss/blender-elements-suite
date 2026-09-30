@@ -13,7 +13,7 @@ use elements_ember::transform::Transform;
 const DX: f32 = 2.0 / 32.0;
 const FRAMES: usize = 80;
 
-/// Mean density above a horizontal 0.03 m wall (cells with z > 1.2) after 40
+/// Mean density above a horizontal 0.03 m wall (cells with z > 1.2) after 80
 /// frames of a plume rising into it from z = 0.3, at 32³ in a 2 m domain.
 /// (40 frames is too few: the plume front has not reached z = 1.2.)
 /// The wall is thinner than a voxel, so `offset` decides whether it seals.
