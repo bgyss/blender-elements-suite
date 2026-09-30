@@ -419,6 +419,7 @@ fn collider_scene(with_collider: bool) -> (f64, Option<(f32, f32)>) {
     let collider = ColliderParams {
         shape: Shape::Sphere { radius: 0.25 },
         transform: Transform::at([1.0, 1.0, 0.8]),
+        surface_fuel: None,
     };
     let solid =
         with_collider.then(|| collider_at(&gpu, &mut cache, &mut pool, cells, dx, &collider, 0.0));
@@ -523,6 +524,7 @@ fn a_moving_collider_pushes_the_fluid() {
                 },
             ],
         },
+        surface_fuel: None,
     };
     let constants = StepConstants {
         has_solids: true,

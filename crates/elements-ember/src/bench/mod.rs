@@ -82,6 +82,7 @@ impl Scene {
             colliders: vec![ColliderParams {
                 shape: Shape::Sphere { radius: 0.25 },
                 transform: Transform::at([1.0, 1.0, 0.8]),
+                surface_fuel: None,
             }],
             ..Self::plume(resolution)
         }
@@ -120,6 +121,7 @@ impl Scene {
                 half_extents: [half_x as f32, half_y as f32, (0.5 * dx) as f32],
             },
             transform: Transform::at([x as f32, half_y as f32, z as f32]),
+            surface_fuel: None,
         };
         Self {
             name: "plume_plate",

@@ -241,6 +241,7 @@ fn no_fuel_or_flame_enters_a_collider() {
     scene.colliders = vec![ColliderParams {
         shape: Shape::Sphere { radius: 0.25 },
         transform: Transform::at([1.0, 1.0, 0.8]),
+        surface_fuel: None,
     }];
     let solid = scene.solid_mask();
     let mut r = scene_run(&scene, 3);

@@ -62,6 +62,7 @@ fn shack_collider() -> MeshColliderParams {
         // Planks are thinner than a voxel (10 mm against 15.6 mm), so the
         // spec inflates them by half a voxel.
         offset: (0.5 * DX) as f32,
+        surface_fuel: None,
     }
 }
 
@@ -166,6 +167,7 @@ fn document(v: Variant) -> Document {
                     half_extents: BOX_HALF,
                 },
                 transform: Transform::at(BOX_AT),
+                surface_fuel: None,
             })
             .expect("collider params serialize"),
         }),

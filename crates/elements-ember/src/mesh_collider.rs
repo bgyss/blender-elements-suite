@@ -6,7 +6,7 @@ use elements_core::gpu::{Axis, ComputeBatch, GpuContext, GpuError, PipelineCache
 use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
 use serde::{Deserialize, Serialize};
 
-use crate::collider::ColliderFields;
+use crate::collider::{ColliderFields, SurfaceFuel, fill_surface_load};
 use crate::kernels::{Bind, axis_index, bind_group, storage_buffer, uniform_buffer};
 use crate::mesh::Mesh;
 use crate::node_util::produce;
@@ -51,6 +51,8 @@ pub struct MeshColliderParams {
     /// planks thinner than a voxel still block flow. Zero or more.
     #[serde(default)]
     pub offset: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_fuel: Option<SurfaceFuel>,
 }
 
 /// Matches `MeshParams` in mesh_sdf.wgsl, 32 bytes.
@@ -178,7 +180,11 @@ impl Node for MeshCollider {
     fn sockets(&self) -> SocketSpec {
         SocketSpec {
             inputs: vec![],
-            outputs: vec![SocketType::Field, SocketType::VectorField],
+            outputs: vec![
+                SocketType::Field,
+                SocketType::VectorField,
+                SocketType::Field,
+            ],
         }
     }
 
@@ -187,7 +193,8 @@ impl Node for MeshCollider {
         let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
         let dx = ctx.voxel_size();
         let params = &self.params;
-        produce(ctx, 1, |gpu, cache, cells, velocity| {
+        let load = params.surface_fuel.map_or(0.0, |s| s.load);
+        let mut values = produce(ctx, 2, |gpu, cache, cells, velocity| {
             fill_mesh_collider(
                 gpu,
                 cache,
@@ -198,8 +205,12 @@ impl Node for MeshCollider {
                     sdf: &cells[0],
                     velocity,
                 },
-            )
-        })
+            )?;
+            fill_surface_load(gpu, cache, &cells[0], load, &cells[1])
+        })?;
+        // `produce` returns the cell fields then the vector: [sdf, load, velocity].
+        values.swap(1, 2);
+        Ok(values)
     }
 }
 
@@ -213,6 +224,9 @@ pub(crate) fn build(value: &serde_json::Value) -> Result<Box<dyn Node>, DocError
             KIND,
             format!("offset must not be negative, got {}", p.offset),
         ));
+    }
+    if let Some(s) = &p.surface_fuel {
+        s.validate(KIND, &p.transform)?;
     }
     Ok(Box::new(MeshCollider { params: p }))
 }

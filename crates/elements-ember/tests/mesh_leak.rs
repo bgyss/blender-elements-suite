@@ -37,6 +37,7 @@ fn above_wall(offset: f32, with_wall: bool) -> f64 {
             mesh: Mesh::box_mesh([-1.0, -1.0, -0.015], [1.0, 1.0, 0.015]),
             transform: Transform::at([1.0, 1.0, 1.0]),
             offset,
+            surface_fuel: None,
         };
         let sdf = pool.acquire(&gpu, cells, FieldFormat::R32Float).unwrap();
         // Static wall: the face velocity stays zero.

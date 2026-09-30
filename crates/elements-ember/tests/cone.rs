@@ -24,6 +24,7 @@ fn sdf(shape: Shape, rotate: Option<Rotate>, at: [f32; 3]) -> Vec<f32> {
                 rotate,
             }],
         },
+        surface_fuel: None,
     };
     let pose = params.transform.pose(0.0, SPF);
     fill_collider(

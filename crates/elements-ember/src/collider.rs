@@ -32,6 +32,8 @@ const FACES_WGSL: &str = concat!(
 pub struct ColliderParams {
     pub shape: Shape,
     pub transform: Transform,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_fuel: Option<SurfaceFuel>,
 }
 
 /// A collider's two outputs.
@@ -67,6 +69,79 @@ struct ColliderGpu {
 }
 
 const _: () = assert!(std::mem::size_of::<ColliderGpu>() == 32);
+
+const LOAD_WGSL: &str = include_str!("kernels/shaders/surface_load.wgsl");
+
+/// A collider's wood budget (FT4 spec §3.1): fuel-grid units per solid cell.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceFuel {
+    pub load: f32,
+}
+
+impl SurfaceFuel {
+    pub(crate) fn validate(&self, kind: &str, transform: &Transform) -> Result<(), DocError> {
+        params::finite(kind, "surface_fuel.load", &[self.load])?;
+        if self.load < 0.0 {
+            return Err(params::bad(
+                kind,
+                format!("surface_fuel.load must not be negative, got {}", self.load),
+            ));
+        }
+        if transform.keys.len() > 1 {
+            return Err(params::bad(
+                kind,
+                "surface_fuel needs a static collider: its reservoir is tied to grid cells, \
+                 so the transform may have at most one key",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Matches `Load` in surface_load.wgsl, 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LoadGpu {
+    dims: [u32; 3],
+    load: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<LoadGpu>() == 16);
+
+/// `out` = `load` where `sdf` < 0, else 0. Submits its own batch.
+pub fn fill_surface_load(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    sdf: &Field,
+    load: f32,
+    out: &Field,
+) -> Result<(), GpuError> {
+    let cells = sdf.dims();
+    if out.dims() != cells {
+        return Err(GpuError::Validation(format!(
+            "fill_surface_load: out {:?}, sdf {cells:?}",
+            out.dims()
+        )));
+    }
+    let pipe = cache.get_or_create(gpu, "ember.collider.load", LOAD_WGSL, "main")?;
+    let params = uniform_buffer(
+        gpu,
+        "ember-load",
+        bytemuck::bytes_of(&LoadGpu {
+            dims: [cells.x, cells.y, cells.z],
+            load,
+        }),
+    )?;
+    let group = bind_group(
+        gpu,
+        &pipe,
+        &[Bind::Tex(sdf), Bind::Tex(out), Bind::Buf(&params)],
+    )?;
+    let mut batch = ComputeBatch::new();
+    batch.dispatch(&pipe, &group, cells);
+    batch.submit(gpu)
+}
 
 /// Write `params`' SDF and velocity at `pose` into `out`. Submits its own batch.
 pub fn fill_collider(
@@ -135,7 +210,11 @@ impl Node for Collider {
     fn sockets(&self) -> SocketSpec {
         SocketSpec {
             inputs: vec![],
-            outputs: vec![SocketType::Field, SocketType::VectorField],
+            outputs: vec![
+                SocketType::Field,
+                SocketType::VectorField,
+                SocketType::Field,
+            ],
         }
     }
 
@@ -144,7 +223,8 @@ impl Node for Collider {
         let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
         let dx = ctx.voxel_size();
         let params = &self.params;
-        produce(ctx, 1, |gpu, cache, cells, velocity| {
+        let load = params.surface_fuel.map_or(0.0, |s| s.load);
+        let mut values = produce(ctx, 2, |gpu, cache, cells, velocity| {
             fill_collider(
                 gpu,
                 cache,
@@ -155,8 +235,12 @@ impl Node for Collider {
                     sdf: &cells[0],
                     velocity,
                 },
-            )
-        })
+            )?;
+            fill_surface_load(gpu, cache, &cells[0], load, &cells[1])
+        })?;
+        // `produce` returns the cell fields then the vector: [sdf, load, velocity].
+        values.swap(1, 2);
+        Ok(values)
     }
 }
 
@@ -164,5 +248,8 @@ pub(crate) fn build(params: &serde_json::Value) -> Result<Box<dyn Node>, DocErro
     let p: ColliderParams = params::parse(KIND, params)?;
     p.shape.validate(KIND)?;
     p.transform.validate(KIND)?;
+    if let Some(s) = &p.surface_fuel {
+        s.validate(KIND, &p.transform)?;
+    }
     Ok(Box::new(Collider { params: p }))
 }
