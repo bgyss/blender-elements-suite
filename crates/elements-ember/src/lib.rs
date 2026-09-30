@@ -12,6 +12,7 @@ pub mod collider;
 pub mod emitter;
 pub mod kernels;
 pub mod mesh;
+pub mod mesh_collider;
 pub mod metrics;
 mod node_util;
 mod params;
@@ -30,6 +31,7 @@ pub fn register(registry: &mut NodeRegistry) {
     registry.register(shape_emitter::KIND, shape_emitter::build);
     registry.register(unions::EMITTER_UNION_KIND, unions::build_emitter_union);
     registry.register(collider::KIND, collider::build);
+    registry.register(mesh_collider::KIND, mesh_collider::build);
     registry.register(unions::COLLIDER_UNION_KIND, unions::build_collider_union);
 }
 

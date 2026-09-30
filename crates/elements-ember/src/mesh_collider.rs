@@ -1,0 +1,193 @@
+//! `ember.mesh_collider`: a triangle mesh the fluid cannot enter, outputting
+//! the same signed-distance and face-velocity pair as `ember.collider`
+//! (flamethrower roadmap spec §4, FT2).
+
+use elements_core::gpu::{Axis, ComputeBatch, GpuContext, GpuError, PipelineCache};
+use elements_core::graph::{DocError, EvalCtx, Node, NodeError, SocketSpec, SocketType, Value};
+use serde::{Deserialize, Serialize};
+
+use crate::collider::ColliderFields;
+use crate::kernels::{Bind, axis_index, bind_group, storage_buffer, uniform_buffer};
+use crate::mesh::Mesh;
+use crate::node_util::produce;
+use crate::params;
+use crate::transform::{Pose, Shape, ShapeGpu, Transform};
+
+pub const KIND: &str = "ember.mesh_collider";
+
+const CELLS_WGSL: &str = concat!(
+    include_str!("kernels/shaders/shape.wgsl"),
+    include_str!("kernels/shaders/mesh_sdf.wgsl"),
+);
+
+// The face pass is the collider's: only the pose velocity is read from
+// `shape`, so the shape kind is irrelevant.
+const FACES_WGSL: &str = concat!(
+    include_str!("kernels/shaders/collider_common.wgsl"),
+    include_str!("kernels/shaders/shape.wgsl"),
+    include_str!("kernels/shaders/collider_faces.wgsl"),
+);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshColliderParams {
+    pub mesh: Mesh,
+    pub transform: Transform,
+    /// Metres subtracted from the signed distance: inflates the solid so
+    /// planks thinner than a voxel still block flow. Zero or more.
+    #[serde(default)]
+    pub offset: f32,
+}
+
+/// Matches `MeshParams` in mesh_sdf.wgsl, 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshGpu {
+    dims: [u32; 3],
+    dx: f32,
+    tri_count: u32,
+    offset: f32,
+    _pad: [u32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<MeshGpu>() == 32);
+
+/// Matches `ColliderGpu` in collider.rs (the shared face pass), 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FaceGpu {
+    dims: [u32; 3],
+    dx: f32,
+    axis: u32,
+    _pad: [u32; 3],
+}
+
+/// Write `params`' SDF and velocity at `pose` into `out`. Submits its own batch.
+pub fn fill_mesh_collider(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    params: &MeshColliderParams,
+    pose: &Pose,
+    dx: f32,
+    out: ColliderFields<'_>,
+) -> Result<(), GpuError> {
+    out.check("fill_mesh_collider")?;
+    let cells = out.sdf.dims();
+    let dims = [cells.x, cells.y, cells.z];
+    let cell_pipe = cache.get_or_create(gpu, "ember.mesh_collider.cells", CELLS_WGSL, "main")?;
+    let face_pipe = cache.get_or_create(gpu, "ember.mesh_collider.faces", FACES_WGSL, "main")?;
+    // `Shape` supplies the pose; the kind and extents are unused.
+    let shape = uniform_buffer(
+        gpu,
+        "ember-shape",
+        bytemuck::bytes_of(&ShapeGpu::new(&Shape::Sphere { radius: 1.0 }, pose)),
+    )?;
+    let vertices: Vec<[f32; 4]> = params
+        .mesh
+        .positions
+        .iter()
+        .map(|p| [p[0], p[1], p[2], 0.0])
+        .collect();
+    let vertex_buf = storage_buffer(gpu, "ember-mesh-vertices", bytemuck::cast_slice(&vertices))?;
+    let index_buf = storage_buffer(
+        gpu,
+        "ember-mesh-indices",
+        bytemuck::cast_slice(&params.mesh.indices),
+    )?;
+    let mesh_params = uniform_buffer(
+        gpu,
+        "ember-mesh",
+        bytemuck::bytes_of(&MeshGpu {
+            dims,
+            dx,
+            tri_count: params.mesh.triangle_count() as u32,
+            offset: params.offset,
+            _pad: [0; 2],
+        }),
+    )?;
+    let mut batch = ComputeBatch::new();
+    let group = bind_group(
+        gpu,
+        &cell_pipe,
+        &[
+            Bind::Tex(out.sdf),
+            Bind::Buf(&mesh_params),
+            Bind::Buf(&shape),
+            Bind::Buf(&vertex_buf),
+            Bind::Buf(&index_buf),
+        ],
+    )?;
+    batch.dispatch(&cell_pipe, &group, cells);
+    for axis in Axis::ALL {
+        let face_params = uniform_buffer(
+            gpu,
+            "ember-mesh-faces",
+            bytemuck::bytes_of(&FaceGpu {
+                dims,
+                dx,
+                axis: axis_index(axis),
+                _pad: [0; 3],
+            }),
+        )?;
+        let face = out.velocity.face(axis);
+        let group = bind_group(
+            gpu,
+            &face_pipe,
+            &[Bind::Tex(face), Bind::Buf(&face_params), Bind::Buf(&shape)],
+        )?;
+        batch.dispatch(&face_pipe, &group, face.dims());
+    }
+    batch.submit(gpu)
+}
+
+#[derive(Debug, Clone)]
+pub struct MeshCollider {
+    params: MeshColliderParams,
+}
+
+impl Node for MeshCollider {
+    fn kind(&self) -> &'static str {
+        KIND
+    }
+
+    fn sockets(&self) -> SocketSpec {
+        SocketSpec {
+            inputs: vec![],
+            outputs: vec![SocketType::Field, SocketType::VectorField],
+        }
+    }
+
+    fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
+        let time = ctx.time();
+        let pose = self.params.transform.pose(f64::from(time.frame), time.dt);
+        let dx = ctx.voxel_size();
+        let params = &self.params;
+        produce(ctx, 1, |gpu, cache, cells, velocity| {
+            fill_mesh_collider(
+                gpu,
+                cache,
+                params,
+                &pose,
+                dx,
+                ColliderFields {
+                    sdf: &cells[0],
+                    velocity,
+                },
+            )
+        })
+    }
+}
+
+pub(crate) fn build(value: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
+    let p: MeshColliderParams = params::parse(KIND, value)?;
+    p.mesh.validate(KIND)?;
+    p.transform.validate(KIND)?;
+    params::finite(KIND, "offset", &[p.offset])?;
+    if p.offset < 0.0 {
+        return Err(params::bad(
+            KIND,
+            format!("offset must not be negative, got {}", p.offset),
+        ));
+    }
+    Ok(Box::new(MeshCollider { params: p }))
+}
