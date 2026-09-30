@@ -143,5 +143,6 @@ fn shapes_parse_from_documents() {
     }))
     .unwrap();
     assert_eq!(t.keys.len(), 1);
+    assert!(serde_json::from_value::<Shape>(serde_json::json!({ "torus": {} })).is_err());
     assert!(serde_json::from_value::<Shape>(serde_json::json!({ "cone": {} })).is_err());
 }

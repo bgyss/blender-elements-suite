@@ -70,7 +70,7 @@ pub struct EmitterParams {
     /// Fuel added per second where fully occupied (2b-4 spec §4.1).
     #[serde(default)]
     pub fuel_rate: f32,
-    /// Target velocity, m/s, world space. The emitter's own motion is added.
+    /// Target velocity, m/s, world space unless `velocity_local`. The emitter's own motion is added.
     #[serde(default)]
     pub velocity: [f32; 3],
     /// How fast the fluid is pulled to the target velocity, 1/s; 0 turns

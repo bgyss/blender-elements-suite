@@ -81,6 +81,140 @@ fn a_box_mesh_matches_the_analytic_box_distance() {
     assert!(worst < 1e-4, "worst error {worst} m");
 }
 
+/// An outward-wound icosphere of `radius` about the origin: an icosahedron
+/// with each triangle split four ways `subdivisions` times, vertices pushed
+/// onto the sphere. Also returns the largest angle (radians) any edge spans
+/// at the centre, which bounds the chord's sagitta.
+fn icosphere(radius: f32, subdivisions: u32) -> (Mesh, f32) {
+    let t = (1.0 + 5.0f32.sqrt()) / 2.0;
+    let raw = [
+        [-1.0, t, 0.0],
+        [1.0, t, 0.0],
+        [-1.0, -t, 0.0],
+        [1.0, -t, 0.0],
+        [0.0, -1.0, t],
+        [0.0, 1.0, t],
+        [0.0, -1.0, -t],
+        [0.0, 1.0, -t],
+        [t, 0.0, -1.0],
+        [t, 0.0, 1.0],
+        [-t, 0.0, -1.0],
+        [-t, 0.0, 1.0],
+    ];
+    let unit = |p: [f32; 3]| {
+        let l = p.iter().map(|v| v * v).sum::<f32>().sqrt();
+        p.map(|v| v / l)
+    };
+    let mut pos: Vec<[f32; 3]> = raw.iter().map(|&p| unit(p)).collect();
+    let mut tris: Vec<[u32; 3]> = vec![
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
+    ];
+    for _ in 0..subdivisions {
+        let mut mid = std::collections::HashMap::new();
+        let mut split = |a: u32, b: u32, pos: &mut Vec<[f32; 3]>| -> u32 {
+            *mid.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                let (pa, pb) = (pos[a as usize], pos[b as usize]);
+                pos.push(unit(std::array::from_fn(|i| pa[i] + pb[i])));
+                (pos.len() - 1) as u32
+            })
+        };
+        let mut next = Vec::new();
+        for [a, b, c] in tris {
+            let (ab, bc, ca) = (
+                split(a, b, &mut pos),
+                split(b, c, &mut pos),
+                split(c, a, &mut pos),
+            );
+            next.extend([[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]);
+        }
+        tris = next;
+    }
+    let mut widest = 0.0f32;
+    for t in &tris {
+        for e in 0..3 {
+            let (p, q) = (pos[t[e] as usize], pos[t[(e + 1) % 3] as usize]);
+            let dot: f32 = (0..3).map(|i| p[i] * q[i]).sum();
+            widest = widest.max(dot.clamp(-1.0, 1.0).acos());
+        }
+    }
+    let mesh = Mesh {
+        positions: pos.iter().map(|p| p.map(|v| v * radius)).collect(),
+        indices: tris.iter().flatten().copied().collect(),
+    };
+    (mesh, widest)
+}
+
+/// A tessellated sphere matches the analytic sphere distance to within the
+/// chord's sagitta, at every cell: same sign outside a thin band around the
+/// surface, and the distance itself everywhere.
+#[test]
+fn a_sphere_mesh_matches_the_analytic_sphere_distance() {
+    let radius = 0.3f64;
+    let (mesh, widest) = icosphere(radius as f32, 3);
+    // The surface sits inside the sphere by at most the sagitta at a face
+    // centre, about the widest edge over sqrt(3) from its vertices (the
+    // triangles are near equilateral); the extra 2e-4 is float slack.
+    let tol = radius * (1.0 - (f64::from(widest) / 3.0f64.sqrt()).cos()) + 2e-4;
+    assert!(tol < 0.004, "tolerance {tol} m is not tight");
+    let params = MeshColliderParams {
+        mesh,
+        transform: at([1.0, 1.0, 1.0], None),
+        offset: 0.0,
+    };
+    let (sdf, _) = fill(&params, 0.0);
+    let cells = FieldDims::new(N, N, N);
+    let (mut worst, mut inside, mut outside) = (0.0f64, 0, 0);
+    for k in 0..N {
+        for j in 0..N {
+            for i in 0..N {
+                let d = [cell(i) - 1.0, cell(j) - 1.0, cell(k) - 1.0];
+                let want = d.iter().map(|v| v * v).sum::<f64>().sqrt() - radius;
+                let got = f64::from(sdf[index(cells, i, j, k)]);
+                worst = worst.max((got - want).abs());
+                if want.abs() > tol {
+                    assert_eq!(
+                        got < 0.0,
+                        want < 0.0,
+                        "sign at ({i},{j},{k}): {got} vs {want}"
+                    );
+                    if want < 0.0 {
+                        inside += 1;
+                    } else {
+                        outside += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        worst <= tol,
+        "worst error {worst} m against tolerance {tol} m"
+    );
+    assert!(
+        inside > 50 && outside > 1000,
+        "{inside} inside, {outside} outside"
+    );
+}
+
 /// A rotated mesh is the box turned: the axis-aligned check on a box turned
 /// 90° about z swaps its x and y half-extents.
 #[test]

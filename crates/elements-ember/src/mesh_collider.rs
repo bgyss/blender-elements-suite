@@ -17,9 +17,11 @@ pub const KIND: &str = "ember.mesh_collider";
 
 /// The most cell-triangle tests (cells x triangles) one dispatch may run, so a
 /// legal mesh cannot hold the GPU long enough for the OS watchdog to kill it.
-/// Measured on an M1 Max with the winding-number kernel: the procedural shack
-/// (576 triangles) at 256x128x128 ran at about 1.4e10 tests/s including
-/// read-back, so this budget is roughly 0.7 s a dispatch.
+/// Measured on an M1 Max under load with the winding-number kernel, including
+/// read-back: about 2e10 tests/s on the shot's 372-triangle procedural shack
+/// (`docs/bench/mesh-collider.md`: 372 triangles, gap 0.01, broken_fraction
+/// 0.2, seed 7, at 128³ and 256x128x128), so this budget is roughly 0.5 s a
+/// dispatch.
 pub const MAX_TRIANGLE_TESTS: u64 = 10_000_000_000;
 
 const CELLS_WGSL: &str = concat!(
@@ -40,6 +42,9 @@ const FACES_WGSL: &str = concat!(
 pub struct MeshColliderParams {
     /// Should be a closed surface: an open mesh has no inside (its winding
     /// number stays at or below one half everywhere), so it is all outside.
+    /// It must also be wound outward: a mesh wound inward (negative signed
+    /// volume, winding number -1) has no inside either, so the collider
+    /// silently vanishes.
     pub mesh: Mesh,
     pub transform: Transform,
     /// Metres subtracted from the signed distance: inflates the solid so
