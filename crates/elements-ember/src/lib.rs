@@ -15,6 +15,7 @@ pub mod mesh;
 pub mod metrics;
 mod node_util;
 mod params;
+pub mod shack;
 pub mod shape_emitter;
 pub mod solver;
 pub mod transform;
