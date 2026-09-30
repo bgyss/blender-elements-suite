@@ -10,8 +10,19 @@ use crate::params;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Shape {
-    Sphere { radius: f32 },
-    Box { half_extents: [f32; 3] },
+    Sphere {
+        radius: f32,
+    },
+    Box {
+        half_extents: [f32; 3],
+    },
+    /// A truncated cone along the local +x axis, centred on the origin:
+    /// `radius_start` at the −x end, `radius_end` at the +x end.
+    Cone {
+        length: f32,
+        radius_start: f32,
+        radius_end: f32,
+    },
 }
 
 impl Shape {
@@ -32,6 +43,33 @@ impl Shape {
                     return Err(params::bad(
                         kind,
                         format!("half_extents must be positive, got {half_extents:?}"),
+                    ));
+                }
+            }
+            Self::Cone {
+                length,
+                radius_start,
+                radius_end,
+            } => {
+                params::finite(kind, "cone", &[*length, *radius_start, *radius_end])?;
+                if *length <= 0.0 {
+                    return Err(params::bad(
+                        kind,
+                        format!("cone length must be positive, got {length}"),
+                    ));
+                }
+                if *radius_start < 0.0 || *radius_end < 0.0 {
+                    return Err(params::bad(
+                        kind,
+                        format!(
+                            "cone radii must not be negative, got {radius_start} and {radius_end}"
+                        ),
+                    ));
+                }
+                if *radius_start == 0.0 && *radius_end == 0.0 {
+                    return Err(params::bad(
+                        kind,
+                        "a cone needs at least one nonzero radius",
                     ));
                 }
             }
@@ -277,7 +315,7 @@ impl Pose {
 }
 
 /// Matches `Shape` in `shape.wgsl`: a `mat3x3<f32>` (three 16-byte columns),
-/// then four vec3 + scalar rows. 112 bytes.
+/// then four vec3 + scalar rows. 112 bytes. Kind 0 sphere, 1 box, 2 cone.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct ShapeGpu {
@@ -300,6 +338,11 @@ impl ShapeGpu {
         let (kind, extents) = match *shape {
             Shape::Sphere { radius } => (0, [radius, 0.0, 0.0]),
             Shape::Box { half_extents } => (1, half_extents),
+            Shape::Cone {
+                length,
+                radius_start,
+                radius_end,
+            } => (2, [length / 2.0, radius_start, radius_end]),
         };
         Self {
             // WGSL matrices are column-major: column c holds row r's entry c.
