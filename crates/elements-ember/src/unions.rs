@@ -267,6 +267,40 @@ const COLLIDER_FACES_WGSL: &str = concat!(
     include_str!("kernels/shaders/weights.wgsl"),
     include_str!("kernels/shaders/collider_union_faces.wgsl"),
 );
+const UNION_LOAD_WGSL: &str = include_str!("kernels/shaders/collider_union_load.wgsl");
+
+/// `out` = the per-cell max of the wood loads `a` and `b`. Submits its own batch.
+pub fn union_surface_load(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    a: &Field,
+    b: &Field,
+    out: &Field,
+) -> Result<(), GpuError> {
+    let cells = out.dims();
+    if a.dims() != cells || b.dims() != cells {
+        return Err(GpuError::Validation(
+            "union_surface_load: inputs differ in size".to_owned(),
+        ));
+    }
+    let pipe = cache.get_or_create(gpu, "ember.collider_union.load", UNION_LOAD_WGSL, "main")?;
+    let grid = uniform_buffer(
+        gpu,
+        "ember-union",
+        bytemuck::bytes_of(&GridGpu {
+            dims: [cells.x, cells.y, cells.z],
+            axis: 0,
+        }),
+    )?;
+    let group = bind_group(
+        gpu,
+        &pipe,
+        &[Bind::Tex(a), Bind::Tex(b), Bind::Tex(out), Bind::Buf(&grid)],
+    )?;
+    let mut batch = ComputeBatch::new();
+    batch.dispatch(&pipe, &group, cells);
+    batch.submit(gpu)
+}
 
 /// `out` = the union of colliders `a` and `b`. Submits its own batch.
 pub fn union_colliders(
@@ -353,31 +387,45 @@ impl Node for ColliderUnion {
     fn sockets(&self) -> SocketSpec {
         let group = [SocketType::Field, SocketType::VectorField];
         SocketSpec {
-            inputs: [group, group].concat(),
-            outputs: group.to_vec(),
+            inputs: [group, group, [SocketType::Field, SocketType::Field]].concat(),
+            outputs: [group.to_vec(), vec![SocketType::Field]].concat(),
         }
     }
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
-        let inputs = take_inputs(ctx, 4)?;
+        let mut wanted = vec![0, 1, 2, 3];
+        wanted.extend([4u32, 5].into_iter().filter(|i| ctx.input_connected(*i)));
+        let inputs = take_listed(ctx, &wanted)?;
         let result = collider_union_node(ctx, &inputs);
-        for value in inputs {
+        for (_, value) in inputs {
             ctx.release(value);
         }
         result
     }
 }
 
-fn collider_union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Value>, NodeError> {
+fn collider_union_node(
+    ctx: &mut EvalCtx<'_>,
+    inputs: &[(u32, Value)],
+) -> Result<Vec<Value>, NodeError> {
+    let at = |i: u32| inputs.iter().find(|(n, _)| *n == i).map(|(_, v)| v);
     let a = ColliderFields {
-        sdf: inputs[0].as_field()?,
-        velocity: inputs[1].as_vector_field()?,
+        sdf: at(0).expect("taken").as_field()?,
+        velocity: at(1).expect("taken").as_vector_field()?,
     };
     let b = ColliderFields {
-        sdf: inputs[2].as_field()?,
-        velocity: inputs[3].as_vector_field()?,
+        sdf: at(2).expect("taken").as_field()?,
+        velocity: at(3).expect("taken").as_vector_field()?,
     };
-    produce(ctx, 1, |gpu, cache, cells, velocity| {
+    let load_a = at(4).map(Value::as_field).transpose()?;
+    let load_b = at(5).map(Value::as_field).transpose()?;
+    // A missing side is all zero: max(x, 0) for a non-negative load is x.
+    let zero = if load_a.is_some() != load_b.is_some() {
+        Some(ctx.acquire_zeroed()?)
+    } else {
+        None
+    };
+    let produced = produce(ctx, 2, |gpu, cache, cells, velocity| {
         union_colliders(
             gpu,
             cache,
@@ -387,8 +435,21 @@ fn collider_union_node(ctx: &mut EvalCtx<'_>, inputs: &[Value]) -> Result<Vec<Va
                 sdf: &cells[0],
                 velocity,
             },
-        )
-    })
+        )?;
+        match (load_a, load_b, zero.as_ref()) {
+            (Some(la), Some(lb), _) => union_surface_load(gpu, cache, la, lb, &cells[1]),
+            (Some(l), None, Some(z)) | (None, Some(l), Some(z)) => {
+                union_surface_load(gpu, cache, l, z, &cells[1])
+            }
+            _ => cells[1].write(gpu, &vec![0.0; cells[1].dims().voxel_count()]),
+        }
+    });
+    if let Some(z) = zero {
+        ctx.release(Value::Field(z));
+    }
+    let mut values = produced?;
+    values.swap(1, 2);
+    Ok(values)
 }
 
 pub(crate) fn build_collider_union(params: &serde_json::Value) -> Result<Box<dyn Node>, DocError> {
