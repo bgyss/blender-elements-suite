@@ -1258,7 +1258,7 @@ fn slab_doc(socket: u32, heat: f32, connect_fuel: bool, connect_load: bool) -> S
         {{ "id": 4, "kind": "ember.sphere_emitter", "params": {{ "center": [1.0, 1.0, 1.4],
            "radius": 0.1, "density_rate": 0.0, "temperature_rate": 0.0 }} }},
         {{ "id": 5, "kind": "ember.collider", "params": {{
-           "shape": {{ "box": {{ "half_extents": [0.0625, 0.4, 0.4] }} }},
+           "shape": {{ "box": {{ "half_extents": [0.07, 0.4, 0.4] }} }},
            "transform": {{ "keys": [{{ "frame": 0, "translate": [1.0, 1.0, 0.6] }}] }},
            "surface_fuel": {{ "load": 4.0 }} }} }} ],
       "edges": [
