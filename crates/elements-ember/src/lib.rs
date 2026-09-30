@@ -11,6 +11,7 @@ pub mod cfl;
 pub mod collider;
 pub mod emitter;
 pub mod kernels;
+pub mod mesh;
 pub mod metrics;
 mod node_util;
 mod params;
