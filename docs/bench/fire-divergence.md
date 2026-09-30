@@ -10,11 +10,14 @@ adding 128³ and 256³, peak |u| and fuel.
 
 **Result.** The gap tracks the pressure solve's convergence. The Euler backtrace
 has little effect on it. Six MGPCG cycles instead of preview's four close the
-gap at 64³ and 128³, and leave 1.6× at 256³. Fuel and flame volume stay within
-2% of the baseline. Euler for every grid leaves divergence where it was.
+gap at 64³ (0.08× Mantaflow) and reach about parity at 128³ (0.91×). They do
+not close it at 256³, where 1.58× remains. Fuel and flame volume stay within
+2% of the baseline; measured cells fall about 10% at 64³. Flame shape was
+not inspected. Euler for every grid leaves divergence where it was.
 `flame_vorticity = 0` lowers divergence by weakening the flame, which does not
-fix anything. The `final` preset goes well below Mantaflow at a cost of about
-10× preview's frame time, and changes the fire's size.
+fix anything. The `final` preset goes well below Mantaflow and changes the fire's
+size. It runs eight substeps, and in loaded timings its frames took about 10×
+as long as preview's.
 
 ## Method
 
@@ -30,7 +33,11 @@ fix anything. The `final` preset goes well below Mantaflow at a cost of about
   the benchmark's own `metrics_run`, so divergence, measured cells, fuel mass
   and flame volume are computed exactly as in `results.md`.
 - **Peak |u|:** the largest max |u| over all velocity faces in frames 1–60,
-  as `.superpowers/sdd/fire-diagnosis.md` measured it.
+  as the 2026-09-25 fire diagnosis measured it. That diagnosis is
+  `.superpowers/sdd/fire-diagnosis.md`, a git-ignored local file in the main
+  checkout, not in the repository, so its numbers cannot be checked from this
+  branch. The two numbers used here are copied from it: Mantaflow's fire peaks
+  at 15.3 m/s at 32³ and 11.7 m/s at 64³.
 - **Frame ms:** the median of frames 2–60 from one timed run of `eval_frame`
   plus a blocking wait. `results.md` uses 120 frames and three runs.
 - **Scratch branch:** `scratch/fire-divergence-experiments`, left in place.
@@ -61,7 +68,7 @@ run checks whether the fix changes the fire itself.
 
 Mantaflow's RMS divergence at frame 60 comes from [results.md](results.md):
 1.25e-4 at 64³, 4.60e-5 at 128³ and 9.00e-5 at 256³. Mantaflow's peak |u| is
-11.7 m/s at 64³ (fire-diagnosis.md). Mantaflow's fuel at frame 60 is 0.696,
+11.7 m/s at 64³ (the local fire diagnosis, see Method). Mantaflow's fuel at frame 60 is 0.696,
 0.517 and 0.443, and its flame volume 0.695, 0.327 and 0.205 m³.
 
 | variant | res | div. RMS f60 (1/s) | × Mantaflow | measured cells | fuel f60 (× baseline) | flame m³ f60 | peak \|u\| m/s (frame) | frame ms | 1-min load before → after |
@@ -100,13 +107,14 @@ depend on load.
 - **Pressure convergence.** This is the main cause. Changing only the cycle
   count from 4 to 6 lowers divergence 50× at 64³, 28× at 128³ and 18× at
   256³. The fire is unchanged: fuel is 0.98–1.02× the baseline, flame volume
-  is within 1.2%, and measured cells are within 10%.
+  is within 1.2%, and measured cells are within 10% (−10.1% at 64³).
   - At 256³ it still leaves 1.58× Mantaflow's divergence. The 2026-09-26
     probe found 1.50e-4 there with ×10, so extra cycles at one substep stop
     helping at that point. The rest of the 256³ gap is something else.
   - Peak |u| at 256³ rises from 14.2 to 17.5 m/s, at frame 14. That is the
     early core spike, not a runaway, but it is higher than Mantaflow's
-    11.7–15.3 m/s at lower resolutions (no 256³ Mantaflow peak is recorded).
+    15.3 m/s at 32³ and 11.7 m/s at 64³ (the local fire diagnosis; no 256³
+    Mantaflow peak is recorded).
 - **Not the Euler backtrace.** Tracing every grid with Euler changes
   divergence by −6% to +4%, which is noise-sized next to a 26× gap.
   - It lowers peak |u| (9.6 / 12.0 / 12.1 m/s, matching the diagnosis).
@@ -123,8 +131,9 @@ depend on load.
   Flame vorticity drives the fast, rotational core that 4 cycles cannot
   project, but turning it off is not a match for Mantaflow.
 - **`final` goes well below Mantaflow**: 0.02× at 64³ and 0.18× at 128³.
-  - It costs about 10× preview's frame time: 1,127 ms against 106 ms at 128³,
-    under load.
+  - It runs eight substeps. In loaded timings, which are upper bounds taken
+    at different loads, it took 1,127 ms a frame at 128³ against the
+    baseline's 106 ms.
   - It changes the fire: 2.2× the measured cells at 128³, fuel 1.28×, and
     flame 1.3×.
   - It is an offline bake setting, not the fix for preview.
@@ -133,38 +142,58 @@ depend on load.
 
 Euler for every grid ran faster than the baseline in this harness.
 
-- I ran it paired at 128³, alternating the two binaries twice at load
-  8–10. Euler for every grid took 74.0 and 73.7 ms a frame, and the baseline
-  106.4 and 106.6 ms.
-- The unpaired 64³ and 256³ runs agree: 16.3 against 20.9 ms, and 548
-  against 868 ms.
-- Euler for every grid drops the RK2 midpoint sample in each scalar pass, but
-  a 30% cut is larger than that alone would explain.
-- These runs were under load, so this is not a timing result. It should be
-  checked on an idle machine before anyone relies on it.
-- If it holds, it matters: it would bring fire preview at 128³ under the
-  100 ms budget (risk (n)). It could also pay for the extra pressure cycles:
-  ×6 cost about 11 ms at 128³ here (117.0 against 106.4 ms, unpaired and at
-  different loads).
+This is data from a loaded machine, not a timing result. Every figure here
+is an upper bound.
+
+- **Paired run at 128³.** I alternated the two binaries twice at a 1-minute
+  load of 8–10. Euler for every grid took 74.0 and 73.7 ms a frame, and the
+  baseline took 106.4 and 106.6 ms.
+- **Unpaired runs.** The 64³ and 256³ rows in the table ran at very different
+  loads, so they do not corroborate the paired run.
+- **Preview cost.** The cost of Euler for every grid, and of ×6 cycles, has
+  not been measured on an idle machine. Any claim about either's preview cost
+  needs an idle-machine paired run first.
 
 ## Recommendation (the user decides)
 
 1. **Scope a follow-up task: raise fire's pressure solve to 6 MGPCG cycles.**
-   This could be a fire-only preview setting or a new preview default. It is
-   the one variant that closes the gap at 64³ and 128³ without changing fuel,
-   flame or measured cells, and it needs no solver code, only a preset value.
-   - Before deciding, idle-machine timing must show its preview cost at 128³:
-     roughly +10% here, while fire preview is already over 100 ms under load.
+   This could be a fire-only preview setting or a new preview default.
+   - **Why this variant.** It is the one variant that closes the gap at 64³
+     and reaches about parity at 128³ while keeping fuel and flame volume
+     within 2%. It leaves 1.58× at 256³.
+   - **Flame shape was not inspected.** Nothing was rendered, and only flame
+     volume and measured-cell counts were compared.
+   - **It needs no solver code**, only a preset value.
+   - **Before deciding,** measure its preview cost at 128³ with an
+     idle-machine paired run. The cost is unmeasured on an idle machine, and
+     fire preview was already over 100 ms under load in `results.md`.
    - Afterwards, rerun `just bench fire` (Ember and Mantaflow, an hour or more)
      and update `results.md`, `presets-fire.md` and the renders.
 2. **Do not adopt Euler for every grid, or `flame_vorticity = 0`, as a
    divergence fix.** Neither closes the gap on equal terms. The first leaves it
    as it was, and the second removes most of the flame.
-3. **Optional, same follow-up.** Time Euler for every grid together with ×6
-   cycles on an idle machine. If the 30% saving is real, the pair could fit
-   fire preview inside 100 ms at 128³, with divergence at Mantaflow's level.
-   That pair was not tested here. Adopting it would also change fire's flame
-   size (1.3–1.7×), and would contradict the 2b-1 spec's RK2 wording, which
-   the 2b-4 exception already relaxes for velocity faces.
+3. **Optional, same follow-up.** Time Euler for every grid, with and without
+   ×6 cycles, in an idle-machine paired run. Its cost is unmeasured on an idle
+   machine; the loaded runs above are no basis for a claim. That pair's
+   divergence was not tested here. Adopting it would also change fire's flame
+   size (1.3–1.7×). It would contradict the 2b-1 spec's RK2 wording, which the
+   2b-4 exception already relaxes for velocity faces.
 4. **The 256³ residual** (1.58× with ×6, and no better with ×10) is not
-   explained. It is small next to the original 28× and is not blocking.
+   explained. It is small next to the original 28×.
+
+## What this does not show
+
+- **Frame 60 only.** There is no burn-out or drift at frames 90 and 120.
+  `results.md` shows Ember burning out more slowly than Mantaflow there.
+- **Flame shape was not inspected or rendered.** Only flame volume and
+  measured-cell counts were compared.
+- **One run per variant**, so there is no spread. Divergence is deterministic
+  on this machine: reruns at 128³ were bit-identical.
+- **Mantaflow was not re-run.** Its numbers come from `results.md`, and its
+  peak |u| from the local fire diagnosis (see Method).
+- **Variants 3 and 4 were not run at 256³.**
+- **The 256³ baseline ran under load** (18.9 → 9.8), not on the idle machine
+  the brief preferred. Divergence does not depend on load; timings do.
+- **Variant 5 raises peak |u| at 256³**, from 14.2 to 17.5 m/s.
+- **Every timing is a loaded upper bound.** None of them supports a
+  conclusion about preview cost.
