@@ -86,7 +86,9 @@ fn a_true_cone_measures_to_its_tip() {
     );
     let cells = FieldDims::new(32, 32, 32);
     let past = s[index(cells, 24, 16, 16)]; // 0.28125 beyond the tip at 0.25
-    assert!((past - 0.28125).abs() < 1e-2, "{past}");
+    // Axis cells are 0.03125 off in y and z, so the tip is √(0.28125² + 0.0442²) away.
+    let expected = (0.28125f32.powi(2) + 2.0 * 0.03125f32.powi(2)).sqrt();
+    assert!((past - expected).abs() < 2e-3, "{past} vs {expected}");
     assert!(s[index(cells, 16, 16, 16)] < 0.0, "the middle is inside");
 }
 
@@ -108,6 +110,26 @@ fn radius_start_is_the_minus_x_end() {
     // The radius is 0.1875 at x = -0.21875 (cell 12) and 0.0125 at +0.21875 (cell 19).
     assert!(s[index(cells, 12, 18, 16)] < 0.0, "the wide end holds it");
     assert!(s[index(cells, 19, 18, 16)] > 0.0, "the tip does not");
+}
+
+/// Past the wide -x cap, inside the wide radius, the distance is the gap to the
+/// cap. Cell 10 is x = 0.65625, 0.34375 from the centre, 0.09375 past the cap at
+/// -0.25; its radial offset 0.159 is under radius_start 0.2. The side term is
+/// about 0.1025, so using radius_end (0) for the cap reads 0.1025, not 0.09375.
+#[test]
+fn the_wide_cap_measures_the_gap_to_the_cap() {
+    let s = sdf(
+        Shape::Cone {
+            length: 0.5,
+            radius_start: 0.2,
+            radius_end: 0.0,
+        },
+        None,
+        [1.0, 1.0, 1.0],
+    );
+    let cells = FieldDims::new(32, 32, 32);
+    let d = s[index(cells, 10, 18, 16)];
+    assert!((d - 0.09375).abs() < 1e-3, "{d} vs 0.09375");
 }
 
 /// A cone turned 90° about z points along +y.
