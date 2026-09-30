@@ -517,3 +517,297 @@ fn char_is_the_burned_fraction_and_zero_without_a_load() {
     assert_eq!(&out[..3], &[0.25, 1.0, 0.0]);
     assert!(out.iter().all(|v| v.is_finite()));
 }
+
+// ---- Solver integration (FT4 spec §3.1, §3.2, §4) ----
+
+/// A 16³ domain with a static wooden slab (surface_fuel) at x ≈ 1.0, a
+/// temperature emitter touching it, and the fuel input connected at rate 0.
+/// `socket` of the solver goes to the output. Options cut one connection.
+fn slab_doc(socket: u32, heat: f32, connect_fuel: bool, connect_load: bool) -> String {
+    let fuel_edge = if connect_fuel {
+        r#",{ "from_node": 3, "from_index": 0, "to_node": 1, "to_index": 6 }"#
+    } else {
+        ""
+    };
+    let load_edge = if connect_load {
+        r#",{ "from_node": 4, "from_index": 2, "to_node": 1, "to_index": 7 }"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{ "version": 3, "dims": [16, 16, 16], "fps": 24.0, "domain_size": 2.0,
+      "nodes": [
+        {{ "id": 0, "kind": "ember.sphere_emitter", "params": {{ "center": [0.75, 1.0, 0.6],
+           "radius": 0.2, "density_rate": 0.0, "temperature_rate": {heat:?} }} }},
+        {{ "id": 1, "kind": "ember.smoke_solver", "params": {{ "buoyancy_temperature": 1.0 }} }},
+        {{ "id": 2, "kind": "core.output", "params": {{}} }},
+        {{ "id": 3, "kind": "ember.sphere_emitter", "params": {{ "center": [1.0, 1.0, 1.4],
+           "radius": 0.1, "density_rate": 0.0, "temperature_rate": 0.0 }} }},
+        {{ "id": 4, "kind": "ember.collider", "params": {{
+           "shape": {{ "box": {{ "half_extents": [0.07, 0.4, 0.4] }} }},
+           "transform": {{ "keys": [{{ "frame": 0, "translate": [1.0, 1.0, 0.6] }}] }},
+           "surface_fuel": {{ "load": 4.0 }} }} }} ],
+      "edges": [
+        {{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }},
+        {{ "from_node": 0, "from_index": 1, "to_node": 1, "to_index": 1 }},
+        {{ "from_node": 4, "from_index": 0, "to_node": 1, "to_index": 4 }},
+        {{ "from_node": 4, "from_index": 1, "to_node": 1, "to_index": 5 }},
+        {{ "from_node": 1, "from_index": {socket}, "to_node": 2, "to_index": 0 }}{fuel_edge}{load_edge} ],
+      "output": 2 }}"#
+    )
+}
+
+fn char_at_frame(doc: &str, frame: u32) -> Vec<f32> {
+    let mut s = Session::new(doc);
+    let mut t = timeline(0);
+    s.density_bits(&mut t, frame)
+        .iter()
+        .map(|b| f32::from_bits(*b))
+        .collect()
+}
+
+#[test]
+fn a_slab_with_no_heat_never_chars() {
+    let char = char_at_frame(&slab_doc(4, 0.0, true, true), 20);
+    assert!(char.iter().all(|&c| c == 0.0), "no heat, no ignition");
+}
+
+#[test]
+fn a_slab_beside_a_heat_source_chars_and_stays_in_range() {
+    let char = char_at_frame(&slab_doc(4, 30.0, true, true), 20);
+    let charred = char.iter().filter(|&&c| c > 0.0).count();
+    let max = char.iter().copied().fold(0.0f32, f32::max);
+    assert!(charred > 0, "a hot source must ignite the slab");
+    assert!(
+        char.iter().all(|&c| (0.0..=1.0).contains(&c)),
+        "char in [0, 1]: {charred} charred cells, max {max}"
+    );
+}
+
+#[test]
+fn char_is_bit_identical_however_frame_40_is_reached() {
+    // The helper also requires a nonzero output at frame 40: here, some char.
+    assert_doc_frame_40_is_bit_identical(&slab_doc(4, 30.0, true, true));
+}
+
+#[test]
+fn the_load_input_needs_fuel_and_a_collider() {
+    use elements_core::graph::NodeError;
+    fn eval_error(doc: &str) -> NodeError {
+        let mut s = Session::new(doc);
+        let mut t = timeline(0);
+        match t.goto(&s.graph, &s.gpu, &mut s.pool, &mut s.pipelines, s.dims, 1) {
+            Ok(_) => panic!("must fail"),
+            Err(e) => e,
+        }
+    }
+    // Load without fuel.
+    let e = eval_error(&slab_doc(4, 1.0, false, true));
+    assert!(
+        matches!(
+            e,
+            NodeError::IncompletePair {
+                connected: 7,
+                missing: 6,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    // Load without a collider: drop the collider edges.
+    let doc = slab_doc(4, 1.0, true, true)
+        .replace(
+            r#"{ "from_node": 4, "from_index": 0, "to_node": 1, "to_index": 4 },"#,
+            "",
+        )
+        .replace(
+            r#"{ "from_node": 4, "from_index": 1, "to_node": 1, "to_index": 5 },"#,
+            "",
+        );
+    let e = eval_error(&doc);
+    assert!(
+        matches!(
+            e,
+            NodeError::IncompletePair {
+                connected: 7,
+                missing: 4,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// A graph evaluated frame by frame against one state store, so a test can
+/// swap the graph between frames (the timeline's `StateShape` reset path).
+struct Stepper {
+    gpu: GpuContext,
+    pool: FieldPool,
+    pipelines: PipelineCache,
+    state: elements_core::graph::StateStore,
+    graph: elements_core::graph::Graph,
+    dims: FieldDims,
+}
+
+impl Stepper {
+    fn new(doc: &str) -> Self {
+        let s = Session::new(doc);
+        Self {
+            gpu: s.gpu,
+            pool: s.pool,
+            pipelines: s.pipelines,
+            state: elements_core::graph::StateStore::new(),
+            graph: s.graph,
+            dims: s.dims,
+        }
+    }
+
+    fn frame(&mut self, frame: u32) -> Result<(), elements_core::graph::NodeError> {
+        let out = self.graph.eval_frame(
+            &self.gpu,
+            &mut self.pool,
+            &mut self.pipelines,
+            &mut self.state,
+            elements_core::graph::Time::at(frame, 1, 24.0),
+            self.dims,
+        )?;
+        out.value.release_to(&mut self.pool);
+        Ok(())
+    }
+}
+
+#[test]
+fn connecting_the_load_changes_the_state_shape() {
+    use elements_core::graph::{Document, NodeError};
+    use elements_ember::solver::SURFACE;
+    for (first, then) in [(true, false), (false, true)] {
+        let mut a = Stepper::new(&slab_doc(4, 30.0, true, first));
+        a.frame(1).unwrap();
+        let (graph, _) = Document::from_json(&slab_doc(4, 30.0, true, then))
+            .unwrap()
+            .into_graph(&elements_ember::registry())
+            .unwrap();
+        a.graph = graph;
+        match a.frame(2) {
+            Err(NodeError::StateShape { slot, .. }) => assert_eq!(slot, SURFACE),
+            other => panic!("{first:?} → {then:?}: {other:?}"),
+        }
+        // The mismatch path must return every field it took from the store.
+        assert_eq!(
+            a.pool.pooled_count() as u64,
+            a.pool.allocation_count(),
+            "{first:?} → {then:?}: the failed frame must return every taken field"
+        );
+    }
+}
+
+#[test]
+fn a_full_substep_moves_the_wood_into_the_gas_fuel() {
+    use elements_ember::solver::{PressureSolve, SolverState, Sources, substep};
+    let gpu = gpu();
+    let mut pool = FieldPool::new();
+    let mut cache = PipelineCache::new();
+    let (mask, load) = plank(3.0);
+    let zero = vec![0.0; K.voxel_count()];
+    let density_src = upload(&gpu, &mut pool, K, &zero);
+    // Emitted at rate 2/h for one substep, the hot cell reaches 2 > IGN
+    // before the burn reads it: substep emits temperature first.
+    let heat = upload(&gpu, &mut pool, K, &gas(&[([3, 3, 3], 2.0 / H)]));
+    let no_fuel = upload(&gpu, &mut pool, K, &zero);
+    let load_f = upload(&gpu, &mut pool, K, &load);
+    let mask_f = upload(&gpu, &mut pool, K, &mask);
+    let velocity = pool.acquire_staggered_zeroed(&gpu, &mut cache, K).unwrap();
+    let mut state = SolverState::zeroed(&gpu, &mut cache, &mut pool, K).unwrap();
+    state.add_fire(&gpu, &mut cache, &mut pool).unwrap();
+    state.add_surface(&gpu, &mut cache, &mut pool).unwrap();
+    let c = StepConstants {
+        open_mask: 0,
+        fire: true,
+        has_solids: true,
+        surface_burn_rate: BURN_RATE,
+        ignition_temperature: IGN,
+        max_temperature: 3.0,
+        burning_rate: 0.0,
+        ..StepConstants::new(K, H, 0.125)
+    };
+    let sources = Sources::new(&density_src, &heat)
+        .with_fuel(&no_fuel)
+        .with_solids(Solids {
+            mask: &mask_f,
+            velocity: &velocity,
+        })
+        .with_surface(&load_f);
+    substep(
+        &gpu,
+        &mut cache,
+        &mut pool,
+        &mut state,
+        sources,
+        &c,
+        PressureSolve::GaussSeidel(40),
+    )
+    .unwrap();
+    let lost: f64 = state
+        .surface
+        .as_ref()
+        .unwrap()
+        .read_back(&gpu)
+        .unwrap()
+        .iter()
+        .map(|&b| f64::from(b))
+        .sum();
+    let gained: f64 = state
+        .fire
+        .as_ref()
+        .unwrap()
+        .fuel
+        .read_back(&gpu)
+        .unwrap()
+        .iter()
+        .map(|&f| f64::from(f))
+        .sum();
+    assert!(lost > 0.0, "the hot cell must ignite the plank");
+    assert!(
+        (lost - gained).abs() <= 1e-3 * lost,
+        "lost {lost}, gained {gained}"
+    );
+}
+
+/// A closed cube mesh, [0.5, 1.5]³ in a 2 m domain, outward winding.
+fn cube_mesh_collider(extra: &str) -> String {
+    format!(
+        r#"{{ "version": 3, "dims": [8, 8, 8], "fps": 24.0, "domain_size": 2.0,
+      "nodes": [ {{ "id": 0, "kind": "ember.mesh_collider", "params": {{
+        "mesh": {{ "positions": [[-0.5,-0.5,-0.5],[0.5,-0.5,-0.5],[0.5,0.5,-0.5],[-0.5,0.5,-0.5],
+                               [-0.5,-0.5,0.5],[0.5,-0.5,0.5],[0.5,0.5,0.5],[-0.5,0.5,0.5]],
+                  "indices": [0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4,
+                              1,2,6, 1,6,5, 2,3,7, 2,7,6, 3,0,4, 3,4,7] }},
+        "transform": {{ "keys": [{{ "frame": 0, "translate": [1.0, 1.0, 1.0] }}{extra}] }},
+        "surface_fuel": {{ "load": 2.5 }} }} }},
+        {{ "id": 1, "kind": "core.output", "params": {{}} }} ],
+      "edges": [ {{ "from_node": 0, "from_index": 2, "to_node": 1, "to_index": 0 }} ],
+      "output": 1 }}"#
+    )
+}
+
+#[test]
+fn a_mesh_collider_outputs_its_load_and_rejects_a_moving_or_negative_one() {
+    let loads = char_at_frame(&cube_mesh_collider(""), 1);
+    let inside = loads.iter().filter(|&&l| l == 2.5).count();
+    assert!(inside > 0, "the cube's cells carry the load");
+    assert!(
+        loads.iter().all(|&l| l == 0.0 || l == 2.5),
+        "load or nothing"
+    );
+
+    let build = |doc: &str| {
+        elements_core::graph::Document::from_json(doc)
+            .unwrap()
+            .into_graph(&elements_ember::registry())
+            .map(|_| ())
+    };
+    let moving = cube_mesh_collider(r#",{ "frame": 10, "translate": [1.2, 1.0, 1.0] }"#);
+    assert!(build(&moving).is_err(), "a keyframed mesh cannot burn");
+    let negative = cube_mesh_collider("").replace("\"load\": 2.5", "\"load\": -1.0");
+    assert!(build(&negative).is_err(), "a negative load is rejected");
+}

@@ -16,6 +16,13 @@
 //! socket 3 is the flame, `sqrt(clamp(react, 0, 1))`, zero while fire is off
 //! (2b-4 spec §3.1, §4.3).
 //!
+//! Input socket 7 is a collider's wood load (a `Field`); connecting it,
+//! which needs fuel and a collider too, turns the surface on and adds the
+//! `burned` state slot. Wood touching gas above `ignition_temperature`
+//! burns at `surface_burn_rate` and its emission enters the gas as fuel,
+//! ahead of the burn. Output socket 4 is the char, burned / load, zero
+//! without a surface (FT4 spec §3.1–§3.3).
+//!
 //! The projection's pressure solve is chosen by `pressure_solver`: red-black
 //! Gauss–Seidel for `pressure_iterations` sweeps, or, on a multigrid
 //! hierarchy built each substep, `pressure_cycles` V-cycles or MGPCG
@@ -55,6 +62,12 @@ pub const REACT: &str = "react";
 const FIRE_SLOTS: [&str; 2] = [FUEL, REACT];
 /// The fuel rate input; connected turns fire on.
 const FUEL_INPUT: u32 = 6;
+
+/// The wood burned per cell, while a surface burns (FT4 spec §3.1).
+pub const SURFACE: &str = "burned";
+const SURFACE_SLOTS: [&str; 1] = [SURFACE];
+/// The wood load input; connected turns the surface on (FT4 spec §3.1, §3.2).
+const SURFACE_INPUT: u32 = 7;
 
 /// Blender's fire defaults in Ember's units at 24 fps
 /// (`tests/bench/mapping.py` `EMBER_FIRE_DEFAULTS`, 2b-4 spec §4.3).
@@ -461,6 +474,8 @@ pub struct SolverState {
     pub pressure: Field,
     /// Fuel and react, present once fire is on (2b-4 spec §3.1).
     pub fire: Option<FireState>,
+    /// The wood burned per cell, present while a surface burns (FT4 spec §3.1).
+    pub surface: Option<Field>,
 }
 
 impl SolverState {
@@ -495,6 +510,7 @@ impl SolverState {
             temperature,
             pressure,
             fire: None,
+            surface: None,
         })
     }
 
@@ -506,6 +522,9 @@ impl SolverState {
         if let Some(fire) = self.fire {
             pool.release(fire.fuel);
             pool.release(fire.react);
+        }
+        if let Some(burned) = self.surface {
+            pool.release(burned);
         }
     }
 
@@ -528,6 +547,20 @@ impl SolverState {
         if let Some(old) = self.fire.replace(FireState { fuel, react }) {
             pool.release(old.fuel);
             pool.release(old.react);
+        }
+        Ok(())
+    }
+
+    /// A zeroed `burned` grid, for a state that has a surface (FT4 spec §3.2).
+    pub fn add_surface(
+        &mut self,
+        gpu: &GpuContext,
+        cache: &mut PipelineCache,
+        pool: &mut FieldPool,
+    ) -> Result<(), GpuError> {
+        let burned = pool.acquire_zeroed(gpu, cache, self.density.dims())?;
+        if let Some(old) = self.surface.replace(burned) {
+            pool.release(old);
         }
         Ok(())
     }
@@ -562,6 +595,8 @@ pub struct Sources<'a> {
     pub solids: Option<Solids<'a>>,
     /// The fuel emission rate per second, when fire is on (2b-4 spec §4.3).
     pub fuel: Option<&'a Field>,
+    /// The wood load per cell when a surface burns (FT4 spec §3.1).
+    pub surface: Option<&'a Field>,
 }
 
 impl<'a> Sources<'a> {
@@ -572,6 +607,7 @@ impl<'a> Sources<'a> {
             emission: None,
             solids: None,
             fuel: None,
+            surface: None,
         }
     }
 
@@ -593,6 +629,15 @@ impl<'a> Sources<'a> {
     pub fn with_fuel(self, fuel: &'a Field) -> Self {
         Self {
             fuel: Some(fuel),
+            ..self
+        }
+    }
+
+    /// The wood load per cell: turns the surface on (FT4 spec §3.1). Needs
+    /// fire and solids too.
+    pub fn with_surface(self, load: &'a Field) -> Self {
+        Self {
+            surface: Some(load),
             ..self
         }
     }
@@ -692,6 +737,51 @@ impl Substep {
                 &fire.react,
                 fuel,
             )?;
+            if let Some(load) = sources.surface {
+                let (Some(burned), Some(solids)) = (state.surface.as_ref(), sources.solids) else {
+                    return Err(GpuError::Validation(
+                        "a surface substep needs the burned state and a collider".to_owned(),
+                    ));
+                };
+                // The wood burns where hot gas touches it, and its emission
+                // enters the gas as fuel ahead of the burn (FT4 spec §3.3).
+                let cells = self.uniforms.cells();
+                let emitted = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
+                let rate = match pool.acquire(gpu, cells, FieldFormat::R32Float) {
+                    Ok(rate) => rate,
+                    Err(e) => {
+                        pool.release(emitted);
+                        return Err(e);
+                    }
+                };
+                // Both scratch fields are written in every cell. They wait in
+                // `retired` until the batch has run.
+                self.retired.extend([emitted, rate]);
+                let [.., emitted, rate] = self.retired.as_slice() else {
+                    unreachable!("two fields were just retired")
+                };
+                kernels::surface_burn(
+                    gpu,
+                    cache,
+                    &mut self.batch,
+                    u,
+                    load,
+                    &state.temperature,
+                    solids,
+                    burned,
+                    emitted,
+                )?;
+                kernels::surface_gather(gpu, cache, &mut self.batch, u, solids, emitted, rate)?;
+                kernels::emit_fuel(
+                    gpu,
+                    cache,
+                    &mut self.batch,
+                    u,
+                    &fire.fuel,
+                    &fire.react,
+                    rate,
+                )?;
+            }
             kernels::burn(
                 gpu,
                 cache,
@@ -1196,10 +1286,15 @@ impl SmokeSolver {
     /// Take the state slots, or a zeroed state on the first step. With fire
     /// on the fuel and react slots must be present too, and with it off
     /// they must be absent: a state from the other mode is `StateShape`,
-    /// which the timeline answers with a reset.
-    fn take_state(ctx: &mut EvalCtx<'_>, fire: bool) -> Result<SolverState, NodeError> {
+    /// which the timeline answers with a reset. The surface's `burned` slot
+    /// follows the same rule (FT4 spec §3.1).
+    fn take_state(
+        ctx: &mut EvalCtx<'_>,
+        fire: bool,
+        surface: bool,
+    ) -> Result<SolverState, NodeError> {
         let mut taken: Vec<(&'static str, Value)> = Vec::new();
-        for slot in SLOTS.into_iter().chain(FIRE_SLOTS) {
+        for slot in SLOTS.into_iter().chain(FIRE_SLOTS).chain(SURFACE_SLOTS) {
             match ctx.take_state(slot) {
                 Ok(Some(value)) => taken.push((slot, value)),
                 Ok(None) => {}
@@ -1219,16 +1314,22 @@ impl SmokeSolver {
                     state.release_to(pool);
                     return Err(e);
                 }
+                if surface && let Err(e) = state.add_surface(gpu, cache, pool) {
+                    state.release_to(pool);
+                    return Err(e);
+                }
                 Ok(state)
             });
         }
 
         let node = ctx.node_id();
-        let expected: Vec<&'static str> = if fire {
-            SLOTS.into_iter().chain(FIRE_SLOTS).collect()
-        } else {
-            SLOTS.to_vec()
-        };
+        let mut expected: Vec<&'static str> = SLOTS.to_vec();
+        if fire {
+            expected.extend(FIRE_SLOTS);
+        }
+        if surface {
+            expected.extend(SURFACE_SLOTS);
+        }
         let missing = expected
             .iter()
             .copied()
@@ -1269,6 +1370,7 @@ impl SmokeSolver {
             fuel: field(FUEL),
             react: field(REACT),
         });
+        let surface = surface.then(|| field(SURFACE));
         let Some((_, Value::VectorField(velocity))) = taken.pop() else {
             unreachable!("only velocity remains")
         };
@@ -1278,6 +1380,7 @@ impl SmokeSolver {
             temperature,
             pressure,
             fire,
+            surface,
         })
     }
 
@@ -1289,6 +1392,9 @@ impl SmokeSolver {
         if let Some(fire) = state.fire {
             ctx.put_state(FUEL, Value::Field(fire.fuel))?;
             ctx.put_state(REACT, Value::Field(fire.react))?;
+        }
+        if let Some(burned) = state.surface {
+            ctx.put_state(SURFACE, Value::Field(burned))?;
         }
         Ok(())
     }
@@ -1304,18 +1410,28 @@ impl SmokeSolver {
         if ctx.input_connected(FUEL_INPUT) {
             wanted.push(FUEL_INPUT);
         }
+        if ctx.input_connected(SURFACE_INPUT) {
+            wanted.push(SURFACE_INPUT);
+        }
         let inputs = take_listed(ctx, &wanted)?;
-        let stepped = self.step(ctx, state, &inputs);
+        let stepped = self.step(ctx, state, &inputs).and_then(|()| {
+            // The outputs are copies: the state stays in the store for the
+            // next frame. Outputs nobody reads are not copied at all. The
+            // char output reads the load, so the inputs are released after.
+            let wanted: [bool; 5] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
+            let dx = ctx.voxel_size();
+            let load = inputs
+                .iter()
+                .find(|(i, _)| *i == SURFACE_INPUT)
+                .and_then(|(_, v)| v.as_field().ok());
+            ctx.with_gpu_pool(|gpu, cache, pool| {
+                copy_outputs(gpu, cache, pool, state, load, wanted, dx)
+            })
+        });
         for (_, value) in inputs {
             ctx.release(value);
         }
-        stepped?;
-
-        // The outputs are copies: the state stays in the store for the next
-        // frame. Outputs nobody reads are not copied at all.
-        let wanted: [bool; 4] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
-        let dx = ctx.voxel_size();
-        ctx.with_gpu_pool(|gpu, cache, pool| copy_outputs(gpu, cache, pool, state, wanted, dx))
+        stepped
     }
 
     fn step(
@@ -1361,6 +1477,9 @@ impl SmokeSolver {
         };
         if find(FUEL_INPUT).is_some() {
             sources = sources.with_fuel(field(FUEL_INPUT)?);
+        }
+        if find(SURFACE_INPUT).is_some() {
+            sources = sources.with_surface(field(SURFACE_INPUT)?);
         }
         let cells = ctx.dims();
         let dx = ctx.voxel_size();
@@ -1443,11 +1562,15 @@ impl Node for SmokeSolver {
                 SocketType::Field,
                 SocketType::VectorField,
                 SocketType::Field,
+                // 7: the wood load (FT4 spec §3.1).
+                SocketType::Field,
             ],
             outputs: vec![
                 SocketType::Field,
                 SocketType::Field,
                 SocketType::VectorField,
+                SocketType::Field,
+                // 4: char, burned / load (FT4 spec §3.1, §3.3).
                 SocketType::Field,
             ],
         }
@@ -1459,7 +1582,25 @@ impl Node for SmokeSolver {
 
     fn eval(&self, ctx: &mut EvalCtx<'_>) -> Result<Vec<Value>, NodeError> {
         let fire = ctx.input_connected(FUEL_INPUT);
-        let mut state = Self::take_state(ctx, fire)?;
+        let surface = ctx.input_connected(SURFACE_INPUT);
+        let node = ctx.node_id();
+        // The wood's emission is gas fuel (FT4 spec §3.2), and its band is
+        // found through the collider's solid mask (§3.3).
+        if surface && !fire {
+            return Err(NodeError::IncompletePair {
+                node,
+                connected: SURFACE_INPUT,
+                missing: FUEL_INPUT,
+            });
+        }
+        if surface && !(ctx.input_connected(4) && ctx.input_connected(5)) {
+            return Err(NodeError::IncompletePair {
+                node,
+                connected: SURFACE_INPUT,
+                missing: 4,
+            });
+        }
+        let mut state = Self::take_state(ctx, fire, surface)?;
         match self.run(ctx, &mut state) {
             Ok(outputs) => {
                 Self::put_state(ctx, state)?;
@@ -1492,10 +1633,11 @@ fn copy_outputs(
     cache: &mut PipelineCache,
     pool: &mut FieldPool,
     state: &SolverState,
-    wanted: [bool; 4],
+    load: Option<&Field>,
+    wanted: [bool; 5],
     dx: f32,
 ) -> Result<Vec<Value>, GpuError> {
-    let mut outputs: Vec<Value> = Vec::with_capacity(4);
+    let mut outputs: Vec<Value> = Vec::with_capacity(5);
     for (index, wanted) in wanted.into_iter().enumerate() {
         let copied = if !wanted {
             Ok(Value::Scalar(0.0))
@@ -1505,7 +1647,8 @@ fn copy_outputs(
                 1 => pool.duplicate(gpu, &state.temperature).map(Value::Field),
                 2 => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
                 3 => flame_output(gpu, cache, pool, state, dx).map(Value::Field),
-                _ => unreachable!("only four outputs exist"),
+                4 => char_output(gpu, cache, pool, state, load, dx).map(Value::Field),
+                _ => unreachable!("only five outputs exist"),
             }
         };
         match copied {
@@ -1537,6 +1680,35 @@ fn flame_output(
     let built = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).and_then(|u| {
         let mut batch = ComputeBatch::new();
         kernels::flame(gpu, cache, &mut batch, &u, &fire.react, &dst)?;
+        batch.submit(gpu)
+    });
+    match built {
+        Ok(()) => Ok(dst),
+        Err(e) => {
+            pool.release(dst);
+            Err(e)
+        }
+    }
+}
+
+/// The char output: burned / load where there is a load, zero without a
+/// surface (FT4 spec §3.3).
+fn char_output(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    pool: &mut FieldPool,
+    state: &SolverState,
+    load: Option<&Field>,
+    dx: f32,
+) -> Result<Field, GpuError> {
+    let cells = state.density.dims();
+    let (Some(burned), Some(load)) = (&state.surface, load) else {
+        return pool.acquire_zeroed(gpu, cache, cells);
+    };
+    let dst = pool.acquire(gpu, cells, FieldFormat::R32Float)?;
+    let built = Uniforms::new(gpu, &StepConstants::new(cells, 1.0, dx)).and_then(|u| {
+        let mut batch = ComputeBatch::new();
+        kernels::surface_char(gpu, cache, &mut batch, &u, burned, load, &dst)?;
         batch.submit(gpu)
     });
     match built {
