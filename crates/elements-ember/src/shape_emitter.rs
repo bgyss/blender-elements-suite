@@ -77,6 +77,10 @@ pub struct EmitterParams {
     /// velocity emission off (spec §3.3).
     #[serde(default)]
     pub velocity_blend: f32,
+    /// Whether `velocity` is in the emitter's local frame (a nozzle's axis)
+    /// instead of world space. Default false.
+    #[serde(default)]
+    pub velocity_local: bool,
     /// Optional noise that multiplies the rates.
     #[serde(default)]
     pub noise: Option<Noise>,
@@ -97,6 +101,7 @@ impl EmitterParams {
             fuel_rate: 0.0,
             velocity: [0.0; 3],
             velocity_blend: 0.0,
+            velocity_local: false,
             noise: None,
             active_frames: None,
         }
@@ -152,7 +157,8 @@ struct EmitterGpu {
     seed_lo: u32,
     seed_hi: u32,
     fuel_rate: f32,
-    _pad: [u32; 2],
+    velocity_local: u32,
+    _pad: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<EmitterGpu>() == 80);
@@ -182,7 +188,8 @@ impl EmitterGpu {
             seed_lo: noise.seed as u32,
             seed_hi: (noise.seed >> 32) as u32,
             fuel_rate: p.fuel_rate,
-            _pad: [0; 2],
+            velocity_local: u32::from(p.velocity_local),
+            _pad: 0,
         }
     }
 }

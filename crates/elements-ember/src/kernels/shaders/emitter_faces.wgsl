@@ -16,6 +16,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var offset = vec3<f32>(0.5);
     offset[axis] = 0.0;
     let x = (vec3<f32>(gid) + offset) * emitter.dx;
-    let v = emitter.velocity + shape_velocity(x);
+    // A local-frame velocity turns with the emitter. `world_to_local` is the
+    // transpose of local-to-world, so `v * M` is `transpose(M) * v`.
+    var target_velocity = emitter.velocity;
+    if (emitter.velocity_local != 0u) {
+        target_velocity = emitter.velocity * shape.world_to_local;
+    }
+    let v = target_velocity + shape_velocity(x);
     textureStore(face, vec3<i32>(gid), vec4<f32>(v[axis], 0.0, 0.0, 0.0));
 }

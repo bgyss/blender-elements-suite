@@ -16,6 +16,6 @@ struct Emitter {
     seed_lo: u32,
     seed_hi: u32,
     fuel_rate: f32,
-    _pad1: u32,
+    velocity_local: u32,   // 1: `velocity` is in the emitter's local frame
     _pad2: u32,
 };
