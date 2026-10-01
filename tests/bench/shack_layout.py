@@ -77,14 +77,26 @@ def project_x(x_m: float, cam: dict, width: int) -> float:
     return (x_m - left) / cam["ortho_scale"] * width
 
 
-def warm_pixels(rgba: Sequence[float], width: int, height: int, threshold: float = 0.05) -> int:
+# A pixel is lit when its brightest channel exceeds this (PNG values in [0, 1]).
+# Emission passes on black have no background: a frame with no char peaks at
+# 0.0039 (FT5 Task 8), so 0.02 is clear of noise and far below a lit voxel.
+LIT_THRESHOLD = 0.02
+# "Warm" means red exceeds blue by more than this: a blackbody colour, which the
+# grey world, white suns and grey planks never produce (0 warm pixels with the
+# flame off, FT5 Task 8).
+WARM_THRESHOLD = 0.05
+
+
+def warm_pixels(
+    rgba: Sequence[float], width: int, height: int, threshold: float = WARM_THRESHOLD
+) -> int:
     """Count pixels whose red exceeds blue by more than `threshold`."""
     assert len(rgba) == width * height * 4, (len(rgba), width, height)
     return sum(1 for i in range(0, len(rgba), 4) if rgba[i] - rgba[i + 2] > threshold)
 
 
 def lit_bbox(
-    rgba: Sequence[float], width: int, height: int, threshold: float = 0.02
+    rgba: Sequence[float], width: int, height: int, threshold: float = LIT_THRESHOLD
 ) -> tuple[int, int, int, int] | None:
     """(min_x, min_y, max_x, max_y) of pixels with max(R, G, B) > threshold.
 

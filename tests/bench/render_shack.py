@@ -22,14 +22,19 @@ The Cycles device is written to OUT_DIR/render-device. The script exits
 nonzero on a missing file, a missing grid (names printed), a render that
 writes nothing, or a failed image check:
 
-- `beauty` has warm pixels (red over blue): the flame rendered. It proves the
-  flame emission, not the temperature map: that is covered by `kelvin`'s test
-  and by eye.
+- `beauty` has at least MIN_WARM_PIXELS warm pixels (red over blue): the
+  flame rendered, and not just a few stray voxels of it. It proves the flame
+  emission, not the temperature map: that is covered by `kelvin`'s test and
+  by eye.
 - `fuel` and `char` each light some pixels.
 - `char`'s lit columns lie within the shack's projected x range, give or take
-  CHAR_TOLERANCE_VOXELS: char forms only on the planks.
-- `fuel`'s lit box is not inside `char`'s: fuel is also in the jet. This is
-  the check that fails if the two grids' names are swapped.
+  CHAR_TOLERANCE_VOXELS. This catches char lit far from the shack, as a wrong
+  or swapped grid would be; it does not check where within the shack's width
+  char sits, and in practice only the left bound can fail (char is at the
+  shack's front face, far from its right side).
+- `fuel`'s lit box is at least FUEL_WIDTH_RATIO times as wide as `char`'s and
+  not inside it: fuel fills the jet, char only the shack's face. This is the
+  check that fails if the fuel pass draws char (the grids' names swapped).
 """
 
 import array
@@ -51,10 +56,18 @@ PASSES = ("beauty", "fuel", "char")
 # (max 0.19) at the shack's face, so it needs far more than fuel (max 1.8, in
 # the jet) to clear the lit threshold by a clear margin without fuel saturating.
 PASS_STRENGTH = {"fuel": 5.0, "char": 100.0}
-# How far outside the shack's x range char may sit, in voxels: the solver
-# deposits char in gas cells next to the planks, and the measured frame-45 char
-# sits at voxel x 72-74 against the shack's 74-112.
+# How far outside the shack's x range char may sit, in voxels. The frame-45
+# char sits at voxel x 72-74, just in front of the shack's 74-112. The value is
+# fitted to that one measurement, not derived from the solver.
 CHAR_TOLERANCE_VOXELS = 4
+# Measured at frame 45: fuel's lit box spans 423 columns (121-543), char's 27
+# (526-552); with the fuel pass reading char it spans 23. Twice char's width
+# leaves the real render an 8x margin and a misnamed fuel pass none.
+FUEL_WIDTH_RATIO = 2.0
+# Measured at frame 45: 8066 warm pixels; with flame strength 0 or a misnamed
+# flame attribute, 0. A floor of 1000 (about 1/8 of the measured count) fails a
+# flame that renders only in scattered voxels, without tracking the exact count.
+MIN_WARM_PIXELS = 1000
 # The planks' grey; Principled diffuse, so the flame's light falls on them.
 SHACK_GREY = 0.1
 
@@ -175,6 +188,7 @@ def add_volume(path: str, location, material) -> None:
 def add_black_world() -> None:
     world = bpy.data.worlds.new("black")
     bpy.context.scene.world = world
+    # Older Blender needs use_nodes for a world node tree; 5.x deprecates it.
     if hasattr(world, "use_nodes"):
         world.use_nodes = True
     bg = world.node_tree.nodes["Background"]
@@ -229,7 +243,7 @@ def pixels(path: str) -> tuple[array.array, int, int]:
     return buf, w, h
 
 
-def lit_stats(px: array.array, threshold: float = 0.02) -> str:
+def lit_stats(px: array.array, threshold: float = sl.LIT_THRESHOLD) -> str:
     peak = max(max(px[i], px[i + 1], px[i + 2]) for i in range(0, len(px), 4))
     lit = sum(1 for i in range(0, len(px), 4) if max(px[i], px[i + 1], px[i + 2]) > threshold)
     return f"peak {peak:.4f}, {lit} pixels over {threshold:g}"
@@ -252,8 +266,11 @@ def render_pass(pass_name: str, path: str, doc: dict, cam: dict, out_dir: str, f
     if pass_name == "beauty":
         warm = sl.warm_pixels(px, w, h)
         print(f"render_shack: beauty: {warm} warm pixels", flush=True)
-        if warm == 0:
-            sys.exit("beauty still has no warm pixels: the flame did not render")
+        if warm < MIN_WARM_PIXELS:
+            sys.exit(
+                f"beauty still has {warm} warm pixels, under {MIN_WARM_PIXELS}: "
+                "the flame did not render"
+            )
     elif bbox is None:
         sys.exit(f"{pass_name} still lights no pixels")
     return device, bbox
@@ -270,6 +287,13 @@ def check_char(char: tuple, fuel: tuple, cam: dict, dx: float, width: int) -> No
     # Boxes are (min_x, min_y, max_x, max_y); fuel ⊆ char means fuel reaches nowhere char does not.
     if fuel[0] >= char[0] and fuel[1] >= char[1] and fuel[2] <= char[2] and fuel[3] <= char[3]:
         sys.exit(f"fuel box {fuel} lies inside char box {char}: are the grids swapped?")
+    fuel_w, char_w = fuel[2] - fuel[0] + 1, char[2] - char[0] + 1
+    print(f"render_shack: fuel box {fuel_w} columns wide, char {char_w}", flush=True)
+    if fuel_w < FUEL_WIDTH_RATIO * char_w:
+        sys.exit(
+            f"fuel box {fuel} is {fuel_w} columns wide, under {FUEL_WIDTH_RATIO:g}x char's "
+            f"{char_w} ({char}): are the grids swapped?"
+        )
 
 
 def main() -> None:
