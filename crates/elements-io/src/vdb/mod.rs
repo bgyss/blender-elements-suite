@@ -1,8 +1,9 @@
 //! A minimal OpenVDB writer for single-precision float grids.
 //!
 //! No Rust crate writes OpenVDB, so this module implements the container format
-//! directly. It supports exactly what Core v1 needs: one uncompressed
-//! `FloatGrid` with a uniform scale transform and a single root child.
+//! directly. It supports what the suite needs: uncompressed
+//! `FloatGrid`s (one or several per file) sharing a uniform scale transform and
+//! a single root child.
 
 mod tree;
 mod writer;

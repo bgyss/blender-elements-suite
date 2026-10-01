@@ -163,7 +163,8 @@ pub fn write_metadata<W: Write + Seek>(
     Ok(())
 }
 
-/// Write the archive header, up to and including the grid count of 1.
+/// Write the archive header, up to and including the grid count. This is the
+/// one-grid form of `write_archive_header_with_count`.
 ///
 /// `uuid` must be exactly 36 ASCII characters; the format stores it unprefixed.
 pub fn write_archive_header<W: Write + Seek>(
