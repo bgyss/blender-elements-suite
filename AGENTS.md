@@ -62,6 +62,8 @@ branch `ember-node-editor`) is designed and planned but paused.
 
 Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a nozzle cone, mesh colliders and a procedural shack. FT3 measured which fire variant closes the divergence gap; its recommendation is provisional (`docs/bench/fire-divergence.md`). FT4, surface ignition, is complete locally on Metal (Apple M1 Max); llvmpipe CI has not yet run (`docs/superpowers/specs/2026-09-30-flamethrower-ft4-surface-ignition-design.md`, `docs/superpowers/plans/2026-09-30-flamethrower-ft4-surface-ignition.md`): a static `ember.collider` or `ember.mesh_collider` with `surface_fuel` outputs a load (output 2) that the smoke solver takes on input 7 with fuel connected; wood beside gas above ignition burns into gas fuel, and solver output 4 is `char`. In the one recorded scene (16×16×32, a one-cell wall) the front-spread test tells the wood's fuel from the heater's plume only with `temperature_dissipation` 8 and `surface_burn_rate` 8, changed together and not isolated. At the defaults the heater's own plume lit every row with or without the surface's fuel (`docs/bench/surface-ignition.md`).
 
+FT5, multi-grid export and a Cycles render of the shack, is complete locally on Metal (Apple M1 Max) (`docs/superpowers/specs/2026-09-30-flamethrower-ft5-export-render-design.md`, `docs/superpowers/plans/2026-09-30-flamethrower-ft5-export-render.md`, `docs/bench/render-shack/README.md`): one bake of `examples/jet_shack_render.elements` writes eight grids per frame (density, flame, temperature, fuel, char, velocity_x/y/z) into one VDB, and `just render-shack` bakes and renders frame 45 in Cycles to three stills. llvmpipe CI has not run the render, nor has CI run this branch. Char is 1-2 voxels at default settings, so the `char` still shows a handful of pixels.
+
 - Core design spec: `docs/superpowers/specs/2026-09-19-elements-suite-core-design.md`
 - Core v1 plan: `docs/superpowers/plans/2026-09-19-elements-core-v1.md`
 - Ember umbrella spec: `docs/superpowers/specs/2026-09-21-ember-design.md`
@@ -87,6 +89,8 @@ Flamethrower vs. shack (Track A of the roadmap) is in progress: FT0–FT2 add a 
 - Mesh collider fill cost: `docs/bench/mesh-collider.md`
 - Flamethrower FT4 spec and plan: `docs/superpowers/specs/2026-09-30-flamethrower-ft4-surface-ignition-design.md`, `docs/superpowers/plans/2026-09-30-flamethrower-ft4-surface-ignition.md`
 - Surface ignition front: `docs/bench/surface-ignition.md`
+- Flamethrower FT5 spec and plan: `docs/superpowers/specs/2026-09-30-flamethrower-ft5-export-render-design.md`, `docs/superpowers/plans/2026-09-30-flamethrower-ft5-export-render.md`
+- Shack render record: `docs/bench/render-shack/README.md`
 - Mantaflow benchmark results and cache notes: `docs/bench/results.md` (2b-3c's rerun; 2b-3's run is in `docs/bench/results-2b3/`), `docs/bench/mantaflow-notes.md`
 - Solver gate (Gauss–Seidel, multigrid and MGPCG): `docs/bench/solver-gate.md`
 - Speed gate, iteration sweep and presets: `docs/bench/speed-gate.md`, `docs/bench/iteration-sweep.md`, `docs/bench/presets.md`
@@ -125,6 +129,7 @@ just bench-presets # the preview preset's substep cap (`PRESET_SCENE=fire` for f
 just bench-solver # the 2b-3c solver gate; about an hour, real GPU, not in check
 just bench-latency # 2b-3b latency, Ember and Mantaflow at 128³; about 30 min, real GPU and Blender
 just bench-render # 2b-3b side-by-side Cycles stills into docs/bench/render/; needs Blender
+just render-shack # FT5: bake + Cycles still of the shack scene; real GPU and Blender, not in check
 just bench        # the Mantaflow benchmark; an hour or more, real GPU and Blender, not in check
                   # (positional: `just bench plume 64` for one scene and resolution)
 ```

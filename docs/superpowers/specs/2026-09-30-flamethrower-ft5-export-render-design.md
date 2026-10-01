@@ -52,8 +52,9 @@ that would write the same grid name, counting a vector entry `velocity` as `velo
 rejected by the bake before any GPU work (Task 5). Read-backs are sequential, so the existing
 per-field `validate_for` check bounds each buffer.
 
-The velocity `VectorField` is named by a single entry with the reserved name `velocity`; the bake
-expands it into `velocity_x/y/z`.
+Any vector-field entry named `n` is written as `n_x`, `n_y`, `n_z` (the velocity field is `velocity`
+and becomes `velocity_x/y/z`); two entries that would write the same grid name are rejected by the
+bake before any GPU work.
 
 ### 3.3 Bake
 
@@ -79,7 +80,8 @@ FT6 records the cost for a clip.
 ### 3.5 Blender template
 
 `tests/bench/render_shack.py`, GPL, run as
-`Blender --background --factory-startup --python-exit-code 1 --python tests/bench/render_shack.py -- BAKE_DIR NAME FRAME OUT_DIR`.
+`Blender --background --factory-startup --python-exit-code 1 --python tests/bench/render_shack.py -- BAKE_DIR NAME FRAME SCENE_JSON OUT_DIR`
+(SCENE_JSON is the `.elements` scene the bake used).
 It reuses `placement.py` and the `render_compare` helpers; Cycles 64 spp, seed 0, no denoise, Metal
 GPU when present.
 
@@ -96,17 +98,19 @@ GPU when present.
    shade the shack mesh here. `fuel` and `char` each render as a separate emission-only still from
    the same camera by swapping the volume material: `beauty`, `fuel`, `char` per frame. Mesh-lookup
    char shading is FT6.
-5. **Shack proxy.** Grey unlit boxes placed from the scene document stand in for the planks.
+5. **Shack proxy.** The real planks mesh from the scene JSON, as a grey mesh (not grey boxes).
 6. **Recipe.** `just render-shack` bakes the small shack scene (`examples/jet_shack.elements`
    extended with an `outputs` list and cut to a low resolution; all grids, one `bake` call),
-   renders one frame, and writes PNGs to `docs/bench/render-shack/`. Real GPU and Blender; not in
+   renders one frame (default 45, not 60: the jet is active for frames 5-40 and the fire fades by 50, so frame 60 is nearly empty), and writes PNGs to `docs/bench/render-shack/`. Real GPU and Blender; not in
    `just check`.
 
 ## 4. Error handling
 
 - Invalid `outputs` are rejected on load or in `into_graph` (§3.2). Writer and bake errors as in §3.3–3.4.
-- The render script exits nonzero on a missing grid, a missing frame file, or a non-finite pixel
-  statistic.
+- The render script exits nonzero on a missing grid, a missing frame file, or a failed image check.
+  PNG pixel values cannot be non-finite, so the script instead checks lit and warm pixel counts
+  against floors: a warm-pixel floor on beauty; lit pixels on fuel and char; char within the shack's
+  projected x extent plus or minus 4 voxels; fuel at least 2x as wide as char.
 - `elements-io` and `elements-cli` keep `forbid(unsafe_code)` and `Apache-2.0 OR MIT`; the Blender
   script is GPL and lives in `tests/`; no code is copied between them. No new wgpu features.
 
@@ -127,7 +131,9 @@ Each test is proven to fail under one mutation, restored, with the real output r
   file names.
 - **Blender, inside the recipe:** the beauty still has warm pixels (R > B) near the flame; the
   `fuel` and `char` stills are nonzero only where their grids are; each shown to fail under a
-  single mutation (constant temperature, swapped grid name).
+  single mutation (constant temperature, swapped grid name). As implemented, the checks are the ones
+  in §4. The temperature to Kelvin map is the one mutation they do not trip (reading `density` for
+  temperature goes uncaught); it is covered by `kelvin()`'s unit test and by eye.
 
 llvmpipe CI covers the Rust and pure-Python parts. The Blender render is Metal-local and is
 recorded as such.

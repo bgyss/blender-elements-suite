@@ -11,5 +11,6 @@ __pycache__/
 !crates/*/tests/golden/*.npy
 !crates/*/tests/golden/*.png
 !docs/bench/render/*.png
+!docs/bench/render-shack/*.png
 !crates/*/tests/fixtures/*/*.vdb
 .superpowers/
