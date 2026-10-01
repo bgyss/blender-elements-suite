@@ -227,3 +227,105 @@ fn the_cli_knows_ember_node_kinds() {
     );
     assert!(out.exists());
 }
+
+fn read_active(path: &std::path::Path, name: &str) -> Vec<((i32, i32, i32), f32)> {
+    let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+    let mut reader = vdb_rs::VdbReader::new(file).unwrap();
+    let grid = reader.read_grid::<f32>(name).unwrap();
+    let mut v: Vec<_> = grid
+        .iter()
+        .map(|(c, v, _)| ((c.x as i32, c.y as i32, c.z as i32), v))
+        .collect();
+    v.sort_by_key(|(c, _)| *c);
+    v
+}
+
+const TWO_NOISES: &str = r#"{
+  "version": 4, "dims": [8, 8, 8],
+  "nodes": [
+    { "id": 0, "kind": "core.noise_field", "params": { "seed": 7, "frequency": 4.0 } },
+    { "id": 1, "kind": "core.output", "params": {} },
+    { "id": 2, "kind": "core.noise_field", "params": { "seed": 9, "frequency": 2.0 } }
+  ],
+  "edges": [{ "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 }],
+  "output": 1,
+  "outputs": [
+    { "node": 0, "socket": 0, "name": "first" },
+    { "node": 2, "socket": 0, "name": "second" }
+  ]
+}"#;
+
+#[test]
+fn bake_with_outputs_writes_every_named_grid_into_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join("two.elements");
+    std::fs::write(&graph, TWO_NOISES).unwrap();
+    let out = dir.path().join("vdb");
+    assert!(
+        cli()
+            .args(["bake", graph.to_str().unwrap()])
+            .args(["--out", out.to_str().unwrap(), "--frames", "1-2"])
+            .args(["--name", "shot"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // The same two noises baked alone, each through the plain single-grid path.
+    let reference: Vec<_> = [(7, "4.0"), (9, "2.0")]
+        .iter()
+        .map(|(seed, freq)| {
+            let doc = NOISE_GRAPH
+                .replace("\"seed\": 7", &format!("\"seed\": {seed}"))
+                .replace("4.0", freq);
+            let g = dir.path().join(format!("ref{seed}.elements"));
+            std::fs::write(&g, doc).unwrap();
+            let o = dir.path().join(format!("ref{seed}"));
+            assert!(
+                cli()
+                    .args(["bake", g.to_str().unwrap(), "--out", o.to_str().unwrap()])
+                    .args(["--frames", "1"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            read_active(&o.join("density.0001.vdb"), "density")
+        })
+        .collect();
+    for frame in 1..=2 {
+        let path = out.join(format!("shot.{frame:04}.vdb"));
+        let file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut names = vdb_rs::VdbReader::new(file).unwrap().available_grids();
+        names.sort();
+        assert_eq!(names, ["first", "second"]);
+        // Each name carries its own socket's values: compare with a plain bake of each noise.
+        assert!(
+            read_active(&path, "first") == reference[0],
+            "first, frame {frame}"
+        );
+        assert!(
+            read_active(&path, "second") == reference[1],
+            "second, frame {frame}"
+        );
+        assert!(reference[0] != reference[1]);
+    }
+}
+
+#[test]
+fn bake_rejects_two_outputs_that_expand_to_the_same_grid_before_baking() {
+    // Two entries named "a": the document is rejected, the CLI reports it, and no output
+    // directory is created. (Vector-expansion collisions are covered by expanded_names.)
+    let doc = TWO_NOISES
+        .replace("\"first\"", "\"a\"")
+        .replace("\"second\"", "\"a\"");
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join("dup.elements");
+    std::fs::write(&graph, doc).unwrap();
+    let out = dir.path().join("vdb");
+    let status = cli()
+        .args(["bake", graph.to_str().unwrap()])
+        .args(["--out", out.to_str().unwrap(), "--frames", "1"])
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(!out.exists(), "the output directory must not be created");
+}
