@@ -37,6 +37,8 @@ pub struct Graph {
     output: Option<NodeId>,
     /// Metres along the domain's longest axis. See `EvalCtx::voxel_size`.
     domain_size: f64,
+    /// Sockets besides the result that `eval_frame` hands back, in order.
+    extra_outputs: Vec<SocketId>,
 }
 
 impl Default for Graph {
@@ -46,6 +48,7 @@ impl Default for Graph {
             edges: HashMap::new(),
             output: None,
             domain_size: DEFAULT_DOMAIN_SIZE,
+            extra_outputs: Vec::new(),
         }
     }
 }
@@ -69,7 +72,19 @@ pub struct Evaluated {
     /// The output node's first output. The caller owns it and should return it
     /// to the pool with `Value::release_to` when finished.
     pub value: Value,
+    /// `extras[i]` is the value of `Graph::extra_outputs()[i]`. The caller owns them too.
+    pub extras: Vec<Value>,
     pub stats: EvalStats,
+}
+
+impl Evaluated {
+    /// Return the result and every extra to `pool`.
+    pub fn release_to(self, pool: &mut FieldPool) {
+        self.value.release_to(pool);
+        for value in self.extras {
+            value.release_to(pool);
+        }
+    }
 }
 
 /// Everything one `eval_frame` call threads through its nodes.
@@ -255,6 +270,7 @@ impl Graph {
 
         let mut needed = vec![false; self.nodes.len()];
         let mut stack = vec![output];
+        stack.extend(self.extra_outputs.iter().map(|s| s.node));
         while let Some(id) = stack.pop() {
             if std::mem::replace(&mut needed[id.0 as usize], true) {
                 continue;
@@ -266,6 +282,38 @@ impl Graph {
             .into_iter()
             .filter(|id| needed[id.0 as usize])
             .collect())
+    }
+
+    /// Name sockets, besides the result, that `eval_frame` returns in `Evaluated::extras`.
+    pub fn set_extra_outputs(&mut self, sockets: Vec<SocketId>) -> Result<(), NodeError> {
+        for (i, socket) in sockets.iter().enumerate() {
+            let spec = self.node(socket.node)?.sockets();
+            let bad = |reason| NodeError::BadExtraOutput {
+                node: socket.node,
+                index: socket.index,
+                reason,
+            };
+            let ty = spec
+                .outputs
+                .get(socket.index as usize)
+                .copied()
+                .ok_or_else(|| bad("the node has no such output"))?;
+            if !matches!(ty, SocketType::Field | SocketType::VectorField) {
+                return Err(bad("only a field or a vector field can be exported"));
+            }
+            if sockets[..i].contains(socket) {
+                return Err(bad("it is named twice"));
+            }
+            if self.output == Some(socket.node) && socket.index == 0 {
+                return Err(bad("it is the graph's result socket"));
+            }
+        }
+        self.extra_outputs = sockets;
+        Ok(())
+    }
+
+    pub fn extra_outputs(&self) -> &[SocketId] {
+        &self.extra_outputs
     }
 
     /// Whether any node in this graph keeps state between frames.
@@ -322,11 +370,28 @@ impl Graph {
             stats: EvalStats::default(),
         };
         let result = self.run(&mut run, &order, output);
+        let extras = match &result {
+            Ok(_) => self
+                .extra_outputs
+                .iter()
+                .map(|s| run.produced.remove(s).ok_or(NodeError::UnknownNode(s.node)))
+                .collect::<Result<Vec<_>, _>>(),
+            Err(_) => Ok(Vec::new()),
+        };
         for (_, value) in run.produced.drain() {
             value.release_to(run.pool);
         }
+        let value = result?;
+        let extras = match extras {
+            Ok(extras) => extras,
+            Err(err) => {
+                value.release_to(run.pool);
+                return Err(err);
+            }
+        };
         Ok(Evaluated {
-            value: result?,
+            value,
+            extras,
             stats: run.stats,
         })
     }
@@ -338,6 +403,11 @@ impl Graph {
             if needed.contains(&to.node) {
                 *run.remaining.entry(*from).or_insert(0) += 1;
             }
+        }
+
+        // An extra output is wanted once more, so it outlives its last consumer.
+        for socket in &self.extra_outputs {
+            *run.remaining.entry(*socket).or_insert(0) += 1;
         }
 
         let result_socket = SocketId {

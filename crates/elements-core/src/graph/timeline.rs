@@ -203,7 +203,7 @@ impl Timeline {
             }
             while let Some(c) = self.cursor.filter(|&c| c < frame) {
                 let stepped = self.step(env, c)?;
-                stepped.value.release_to(env.pool);
+                stepped.release_to(env.pool);
             }
         }
         self.step(env, frame)
