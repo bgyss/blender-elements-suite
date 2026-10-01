@@ -8,7 +8,7 @@ use crate::IoError;
 
 use super::writer::{
     ByteWriter, COMPRESSION_ACTIVE_MASK, MetaValue, NO_MASK_AND_ALL_VALS, NO_MASK_OR_INACTIVE_VALS,
-    write_archive_header, write_grid_descriptor, write_metadata,
+    write_archive_header_with_count, write_grid_descriptor, write_metadata,
 };
 
 /// Voxels per leaf edge.
@@ -145,6 +145,13 @@ fn build_tree(
     Ok((root_mask, internals))
 }
 
+/// One named grid of a multi-grid file; `values` is x-fastest.
+#[derive(Debug, Clone, Copy)]
+pub struct GridSpec<'a> {
+    pub name: &'a str,
+    pub values: &'a [f32],
+}
+
 /// Write one uncompressed `FloatGrid` to `path`.
 ///
 /// `values` is x-fastest with `dims[0] * dims[1] * dims[2]` entries.
@@ -157,18 +164,72 @@ pub fn write_float_grid(
     voxel_size: f64,
     background: f32,
 ) -> Result<(), IoError> {
-    let (root_mask, internals) = build_tree(values, dims, background)?;
+    write_float_grids(
+        path,
+        &[GridSpec { name, values }],
+        dims,
+        voxel_size,
+        background,
+    )
+}
+
+/// Write several uncompressed `FloatGrid`s, sharing `dims` and one transform,
+/// into one archive. Each grid is a descriptor followed by its data, which is
+/// how OpenVDB streams write a multi-grid file. Every tree is built before the
+/// file is created, so a bad grid leaves no file behind.
+pub fn write_float_grids(
+    path: &Path,
+    grids: &[GridSpec<'_>],
+    dims: [u32; 3],
+    voxel_size: f64,
+    background: f32,
+) -> Result<(), IoError> {
+    if grids.is_empty() {
+        return Err(IoError::NoGrids);
+    }
+    for (i, grid) in grids.iter().enumerate() {
+        if grids[..i].iter().any(|earlier| earlier.name == grid.name) {
+            return Err(IoError::DuplicateGrid {
+                name: grid.name.to_owned(),
+            });
+        }
+    }
+    let trees = grids
+        .iter()
+        .map(|g| build_tree(g.values, dims, background))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let file = std::fs::File::create(path)?;
     let mut w = ByteWriter::new(std::io::BufWriter::new(file));
+    write_archive_header_with_count(
+        &mut w,
+        "00000000-0000-4000-8000-000000000000",
+        grids.len() as u32,
+    )?;
+    for (grid, (root_mask, internals)) in grids.iter().zip(&trees) {
+        write_one_grid(
+            &mut w, grid.name, dims, voxel_size, background, root_mask, internals,
+        )?;
+    }
+    Ok(())
+}
 
-    write_archive_header(&mut w, "00000000-0000-4000-8000-000000000000")?;
-    let offsets = write_grid_descriptor(&mut w, name)?;
+/// One grid's descriptor and data; the body `write_float_grid` had before FT5.
+fn write_one_grid<W: Write + Seek>(
+    w: &mut ByteWriter<W>,
+    name: &str,
+    dims: [u32; 3],
+    voxel_size: f64,
+    background: f32,
+    root_mask: &BitMask,
+    internals: &BTreeMap<usize, Internal>,
+) -> Result<(), IoError> {
+    let offsets = write_grid_descriptor(w, name)?;
 
     let grid_pos = w.pos()?;
     w.u32(COMPRESSION_ACTIVE_MASK)?;
     write_metadata(
-        &mut w,
+        w,
         &[
             // Readers (Blender's bundled OpenVDB among them) take a grid's
             // display name from this "name" entry in its own metadata map,
@@ -196,17 +257,16 @@ pub fn write_float_grid(
         ],
     )?;
 
-    write_uniform_scale_transform(&mut w, voxel_size)?;
-    write_tree_topology(&mut w, &root_mask, &internals, background)?;
+    write_uniform_scale_transform(w, voxel_size)?;
+    write_tree_topology(w, root_mask, internals, background)?;
 
     let block_pos = w.pos()?;
-    write_tree_data(&mut w, &root_mask, &internals)?;
+    write_tree_data(w, root_mask, internals)?;
     let end_pos = w.pos()?;
 
     w.patch_u64_at(offsets.grid_pos_at, grid_pos)?;
     w.patch_u64_at(offsets.block_pos_at, block_pos)?;
     w.patch_u64_at(offsets.end_pos_at, end_pos)?;
-
     Ok(())
 }
 

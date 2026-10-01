@@ -27,6 +27,7 @@ ci-test: py-test
 py-test:
     python tests/bench/test_mapping.py
     python tests/bench/test_placement.py
+    python tests/bench/test_shack_layout.py
 
 # Everything a commit must pass.
 check: lint test
@@ -204,3 +205,29 @@ bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256 fire:1
         --python tests/bench/render_compare.py -- --readme "$OUT" "$R" {{cases}} \
         > "$R/readme.log" 2>&1 || { tail -30 "$R/readme.log"; exit 1; }
     echo "wrote $OUT/README.md"
+
+# FT5: bake the shack scene (every grid, one bake) and render one frame of it in
+# Cycles. Real GPU and Blender; not in `check`. Stills go in docs/bench/render-shack/.
+# Frame 45 is the default: the jet is active for frames 5-40 and the fire fades by 50.
+render-shack frame="45":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BLENDER_BIN="${BLENDER_BIN:-/Applications/Blender.app/Contents/MacOS/Blender}"
+    cargo build --release -p elements-cli
+    CLI=target/release/elements
+    SCENE=examples/jet_shack_render.elements
+    R=target/ft5/render
+    OUT=docs/bench/render-shack
+    mkdir -p "$R" "$OUT"
+    commit="$(git rev-parse --short HEAD)"
+    [ -z "$(git status --porcelain -- crates Cargo.toml Cargo.lock tests/bench examples)" ] || commit="$commit-dirty"
+    dx="$(python3 -c "import json, sys; d = json.load(open(sys.argv[1])); print(d['domain_size'] / max(d['dims']))" "$SCENE")"
+    echo "bake shack frame {{frame}}; load $(sysctl -n vm.loadavg)"
+    start=$SECONDS
+    "$CLI" bake "$SCENE" --out "$R" --frames {{frame}} --name shack --voxel-size "$dx"
+    echo "bake wall time: $((SECONDS - start)) s"
+    echo "render; load $(sysctl -n vm.loadavg)"
+    "$BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
+        --python tests/bench/render_shack.py -- "$R" shack {{frame}} "$SCENE" "$OUT"
+    echo "$commit" > "$OUT/commit"
+    echo "wrote $OUT (commit $commit, load $(sysctl -n vm.loadavg))"

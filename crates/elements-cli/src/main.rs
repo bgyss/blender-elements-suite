@@ -6,6 +6,7 @@
 //! daemon, which is what lets CI exercise the engine on software Vulkan.
 
 mod bake;
+mod grids;
 mod preview;
 
 use std::path::PathBuf;

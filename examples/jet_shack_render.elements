@@ -2463,6 +2463,9 @@
           ]
         },
         "offset": 0.0078125,
+        "surface_fuel": {
+          "load": 4.0
+        },
         "transform": {
           "keys": [
             {
@@ -2526,7 +2529,45 @@
       "from_index": 1,
       "to_node": 1,
       "to_index": 5
+    },
+    {
+      "from_node": 3,
+      "from_index": 2,
+      "to_node": 1,
+      "to_index": 7
     }
   ],
-  "output": 2
+  "output": 2,
+  "outputs": [
+    {
+      "node": 1,
+      "socket": 0,
+      "name": "density"
+    },
+    {
+      "node": 1,
+      "socket": 1,
+      "name": "temperature"
+    },
+    {
+      "node": 1,
+      "socket": 2,
+      "name": "velocity"
+    },
+    {
+      "node": 1,
+      "socket": 3,
+      "name": "flame"
+    },
+    {
+      "node": 1,
+      "socket": 4,
+      "name": "char"
+    },
+    {
+      "node": 1,
+      "socket": 5,
+      "name": "fuel"
+    }
+  ]
 }

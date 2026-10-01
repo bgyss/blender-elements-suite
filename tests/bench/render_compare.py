@@ -461,4 +461,5 @@ def main() -> None:
     render(ember_dir, manta_cache, scene_name, int(res), float(size), out_dir)
 
 
-main()
+if __name__ == "__main__":
+    main()

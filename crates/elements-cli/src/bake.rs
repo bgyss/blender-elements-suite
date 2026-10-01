@@ -3,8 +3,10 @@
 use std::path::Path;
 
 use anyhow::Context;
-use elements_core::gpu::{FieldPool, GpuContext, PipelineCache};
-use elements_core::graph::{Document, Timeline};
+use elements_core::gpu::{Axis, FieldPool, GpuContext, PipelineCache};
+use elements_core::graph::{DocOutput, Document, Timeline, Value};
+
+use crate::grids;
 
 /// Load a `.elements` document, evaluate it, and read the result back.
 ///
@@ -68,6 +70,9 @@ pub fn parse_frames(spec: &str) -> anyhow::Result<(u32, u32)> {
 /// Frames are produced by a timeline, so a stateful graph is simulated from
 /// the document's start frame even when `frames` starts later. Only frames in
 /// `frames` are written.
+///
+/// With an `outputs` list in the document, each frame's file holds those grids and
+/// `name` is only the file stem.
 pub fn bake(
     graph: &Path,
     out_dir: &Path,
@@ -86,8 +91,15 @@ pub fn bake(
         .context("validating document dimensions against this device's limits")?;
 
     let config = doc.timeline_config();
+    let outputs = doc.outputs.clone();
     let registry = elements_ember::registry();
     let (graph, dims) = doc.into_graph(&registry)?;
+    // Names are checked before any GPU evaluation and before the output directory exists.
+    let names = if outputs.is_empty() {
+        Vec::new()
+    } else {
+        grids::expanded_names(&graph, &outputs)?
+    };
 
     let mut pool = FieldPool::new();
     let mut pipelines = PipelineCache::new();
@@ -100,22 +112,85 @@ pub fn bake(
         if let Some(warning) = timeline.take_warning() {
             eprintln!("warning: {warning}");
         }
-        let values = evaluated.value.as_field()?.read_back(&gpu)?;
-        evaluated.value.release_to(&mut pool);
-
         let path = out_dir.join(format!("{name}.{frame:04}.vdb"));
-        elements_io::write_float_grid(
-            &path,
-            name,
-            &values,
-            [dims.x, dims.y, dims.z],
-            voxel_size,
-            0.0,
-        )
-        .with_context(|| format!("writing {}", path.display()))?;
+        if outputs.is_empty() {
+            let values = evaluated.value.as_field()?.read_back(&gpu)?;
+            evaluated.release_to(&mut pool);
+            elements_io::write_float_grid(
+                &path,
+                name,
+                &values,
+                [dims.x, dims.y, dims.z],
+                voxel_size,
+                0.0,
+            )
+            .with_context(|| format!("writing {}", path.display()))?;
+        } else {
+            let cells = [dims.x, dims.y, dims.z];
+            let (value, extras) = (evaluated.value, evaluated.extras);
+            value.release_to(&mut pool);
+            let grids = read_grids(&gpu, &mut pool, &outputs, extras, cells)
+                .with_context(|| format!("reading frame {frame}"))?;
+            debug_assert_eq!(grids.len(), names.len());
+            let specs: Vec<elements_io::GridSpec<'_>> = names
+                .iter()
+                .zip(&grids)
+                .map(|(n, v)| elements_io::GridSpec { name: n, values: v })
+                .collect();
+            if let Err(e) = elements_io::write_float_grids(&path, &specs, cells, voxel_size, 0.0) {
+                let _ = std::fs::remove_file(&path);
+                return Err(e).with_context(|| format!("writing {}", path.display()));
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Read every extra back: a field as itself, a vector field as three cell-centred grids.
+/// Values return to `pool` whether or not a read fails.
+fn read_grids(
+    gpu: &GpuContext,
+    pool: &mut FieldPool,
+    outputs: &[DocOutput],
+    extras: Vec<Value>,
+    cells: [u32; 3],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if extras.len() != outputs.len() {
+        let (got, want) = (extras.len(), outputs.len());
+        for value in extras {
+            value.release_to(pool);
+        }
+        anyhow::bail!("the graph returned {got} extra outputs, the document names {want}");
+    }
+    let mut grids = Vec::new();
+    let mut failure = None;
+    for (entry, value) in outputs.iter().zip(extras) {
+        if failure.is_none() {
+            match read_one(gpu, &value, cells) {
+                Ok(mut read) => grids.append(&mut read),
+                Err(e) => failure = Some(e.context(format!("output {:?}", entry.name))),
+            }
+        }
+        value.release_to(pool);
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(grids),
+    }
+}
+
+fn read_one(gpu: &GpuContext, value: &Value, cells: [u32; 3]) -> anyhow::Result<Vec<Vec<f32>>> {
+    match value {
+        Value::Field(field) => Ok(vec![field.read_back(gpu)?]),
+        Value::VectorField(velocity) => {
+            let fx = velocity.face(Axis::X).read_back(gpu)?;
+            let fy = velocity.face(Axis::Y).read_back(gpu)?;
+            let fz = velocity.face(Axis::Z).read_back(gpu)?;
+            Ok(grids::cell_centred_velocity(cells, [&fx, &fy, &fz])?.into())
+        }
+        other => anyhow::bail!("{other:?} cannot be written as a grid"),
+    }
 }
 
 #[cfg(test)]

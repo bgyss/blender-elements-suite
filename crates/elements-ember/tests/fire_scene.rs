@@ -130,6 +130,34 @@ fn the_flame_output_is_the_square_root_of_react() {
 }
 
 #[test]
+fn fuel_output_equals_the_fuel_slot_with_fire_on() {
+    let mut r = Run::new(&doc(Some(24.0), 5));
+    let mut out = Vec::new();
+    for f in 1..=3 {
+        out = r.frame(f).unwrap();
+    }
+    let slot = r.slot(FUEL);
+    assert!(slot.iter().any(|&v| v > 0.0), "fuel was emitted");
+    assert_eq!(out.len(), slot.len());
+    assert!(
+        out.iter()
+            .zip(&slot)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "output 5 is bit-equal to the fuel slot"
+    );
+}
+
+#[test]
+fn fuel_output_is_zero_with_fire_off() {
+    let mut r = Run::new(&doc(None, 5));
+    for f in 1..=3 {
+        let out = r.frame(f).unwrap();
+        assert_eq!(out.len(), 16 * 16 * 16, "a field of the domain's dims");
+        assert!(out.iter().all(|&v| v == 0.0), "zero at frame {f}");
+    }
+}
+
+#[test]
 fn fuel_at_zero_rate_makes_no_fuel_or_flame() {
     // Fire on at rate 0 is not bit-identical to fire off: with fire on,
     // velocity faces trace back with one Euler step (2b-4 spec §3.2 step 5),

@@ -30,6 +30,12 @@ pub enum NodeError {
     InputAlreadyConnected { node: NodeId, index: u32 },
     #[error("no such node: {0:?}")]
     UnknownNode(NodeId),
+    #[error("node {node:?} output {index} cannot be an extra output: {reason}")]
+    BadExtraOutput {
+        node: NodeId,
+        index: u32,
+        reason: &'static str,
+    },
     #[error("no output node is set on this graph")]
     NoOutput,
     #[error("node {node:?} is not stateful but tried to use persistent state")]

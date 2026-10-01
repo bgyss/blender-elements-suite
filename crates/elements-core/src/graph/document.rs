@@ -13,10 +13,11 @@ use super::timeline::{DEFAULT_CACHE_BUDGET_MB, TimelineConfig};
 
 /// The `.elements` schema version this build writes.
 ///
-/// It also reads versions 1 and 2, which predate time and physical units: see
+/// It also reads versions 1 to 3, which predate the `outputs` list (and 1 and 2 time and
+/// physical units): see
 /// `Document::from_json`.
 /// Bumping this requires a migration test in `tests/document.rs`.
-pub const ELEMENTS_DOC_VERSION: u32 = 3;
+pub const ELEMENTS_DOC_VERSION: u32 = 4;
 
 fn default_fps() -> f64 {
     DEFAULT_FPS
@@ -72,6 +73,14 @@ pub struct DocEdge {
     pub to_index: u32,
 }
 
+/// One grid a bake writes: socket `socket` of node `node`, named `name` in the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocOutput {
+    pub node: u32,
+    pub socket: u32,
+    pub name: String,
+}
+
 /// A serialized node graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -92,15 +101,19 @@ pub struct Document {
     pub nodes: Vec<DocNode>,
     pub edges: Vec<DocEdge>,
     pub output: u32,
+    /// Extra grids a bake writes into each frame's file (version 4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<DocOutput>,
 }
 
 impl Document {
     pub fn from_json(text: &str) -> Result<Self, DocError> {
         let mut doc: Document = serde_json::from_str(text)?;
         match doc.version {
-            // Versions 1 and 2 predate time and physical units. Their only
-            // migration is the defaults serde has already filled in above.
-            1 | 2 => doc.version = ELEMENTS_DOC_VERSION,
+            // Versions 1-3 predate the `outputs` list (and 1 and 2 time and
+            // physical units). Their only migration is the defaults serde has
+            // already filled in above.
+            1..=3 => doc.version = ELEMENTS_DOC_VERSION,
             ELEMENTS_DOC_VERSION => {}
             // Deliberately exact, not a range: a newer document may rely on
             // fields this build would silently ignore.
@@ -123,6 +136,15 @@ impl Document {
                     doc.domain_size
                 ),
             });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for entry in &doc.outputs {
+            if entry.name.is_empty() || !seen.insert(entry.name.as_str()) {
+                return Err(DocError::BadParams {
+                    kind: "document".to_string(),
+                    reason: format!("output name {:?} is empty or used twice", entry.name),
+                });
+            }
         }
         Ok(doc)
     }
@@ -217,6 +239,16 @@ impl Document {
 
         graph.set_domain_size(self.domain_size);
         graph.set_output(NodeId(self.output));
+        // After `set_output`: it rejects an entry naming the result socket.
+        graph.set_extra_outputs(
+            self.outputs
+                .iter()
+                .map(|o| SocketId {
+                    node: NodeId(o.node),
+                    index: o.socket,
+                })
+                .collect(),
+        )?;
 
         Ok((
             graph,

@@ -248,7 +248,7 @@ fn render(session: &mut Session, frame: u32) -> Result<Response, EngineError> {
         }),
         Err(e) => Err(map_node_error(e)),
     };
-    evaluated.value.release_to(&mut session.pool);
+    evaluated.release_to(&mut session.pool);
     let values = match values {
         Ok(values) => values,
         Err(e) => {

@@ -12,9 +12,11 @@ mod common;
 
 use common::*;
 use elements_core::gpu::{Axis, FieldDims, FieldFormat, FieldPool, PipelineCache};
-use elements_core::graph::{DocEdge, DocNode, Document, ELEMENTS_DOC_VERSION, StateStore, Time};
+use elements_core::graph::{
+    DocEdge, DocNode, DocOutput, Document, ELEMENTS_DOC_VERSION, StateStore, Time,
+};
 use elements_ember::bench::{FIRE_FUEL_RATE, SOLVER_NODE, Scene, report::load_average};
-use elements_ember::collider::{self, ColliderFields, ColliderParams};
+use elements_ember::collider::{self, ColliderFields, ColliderParams, SurfaceFuel};
 use elements_ember::mesh_collider::{self, MeshColliderParams, fill_mesh_collider};
 use elements_ember::metrics::{
     FLAME_THRESHOLD, SMOKE_THRESHOLD, Sample, divergence, fire_metrics, measure,
@@ -187,6 +189,7 @@ fn document(v: Variant) -> Document {
         nodes,
         edges,
         output: 2,
+        outputs: Vec::new(),
     }
 }
 
@@ -204,6 +207,95 @@ fn the_jet_shack_example_is_the_generated_scene() {
         .unwrap()
         .into_graph(&elements_ember::registry())
         .unwrap();
+}
+
+const RENDER_EXAMPLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/jet_shack_render.elements"
+);
+/// The wood's fuel load per surface cell for the render scene.
+const RENDER_WOOD_LOAD: f32 = 4.0;
+
+/// The baseline scene plus what a render reads: the shack's wood load, wired into
+/// the solver, and the grids to export (FT5 spec section 3.5).
+fn render_document() -> Document {
+    let mut doc = document(BASELINE);
+    let mut shack = shack_collider();
+    shack.surface_fuel = Some(SurfaceFuel {
+        load: RENDER_WOOD_LOAD,
+    });
+    doc.nodes[3].params = serde_json::to_value(shack).expect("mesh params serialize");
+    doc.edges.push(DocEdge {
+        from_node: 3,
+        from_index: 2,
+        to_node: 1,
+        to_index: 7,
+    });
+    let out = |socket, name: &str| DocOutput {
+        node: 1,
+        socket,
+        name: name.to_owned(),
+    };
+    doc.outputs = vec![
+        out(0, "density"),
+        out(1, "temperature"),
+        out(2, "velocity"),
+        out(3, "flame"),
+        out(4, "char"),
+        out(5, "fuel"),
+    ];
+    doc
+}
+
+/// The committed render example is exactly the generated render scene, and it
+/// loads into a graph. Regenerate it with `write_jet_shack_render_example`.
+#[test]
+fn the_render_example_is_the_generated_render_scene() {
+    let text =
+        std::fs::read_to_string(RENDER_EXAMPLE).expect("examples/jet_shack_render.elements exists");
+    assert!(
+        text == render_document().to_json().unwrap() + "\n",
+        "examples/jet_shack_render.elements is stale; run write_jet_shack_render_example"
+    );
+    Document::from_json(&text)
+        .unwrap()
+        .into_graph(&elements_ember::registry())
+        .unwrap();
+}
+
+#[test]
+fn the_render_scene_exports_six_entries_with_the_shack_load_wired_in() {
+    let doc = render_document();
+    let pairs: Vec<(u32, &str)> = doc
+        .outputs
+        .iter()
+        .map(|o| (o.socket, o.name.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            (0, "density"),
+            (1, "temperature"),
+            (2, "velocity"),
+            (3, "flame"),
+            (4, "char"),
+            (5, "fuel")
+        ]
+    );
+    assert!(doc.outputs.iter().all(|o| o.node == 1));
+    assert!(
+        doc.edges
+            .iter()
+            .any(|e| (e.from_node, e.from_index, e.to_node, e.to_index) == (3, 2, 1, 7))
+    );
+}
+
+/// Writes `examples/jet_shack_render.elements`. Run by hand:
+/// `cargo nextest run -p elements-ember --run-ignored ignored-only -E 'test(write_jet_shack_render_example)'`.
+#[test]
+#[ignore = "writes examples/jet_shack_render.elements"]
+fn write_jet_shack_render_example() {
+    std::fs::write(RENDER_EXAMPLE, render_document().to_json().unwrap() + "\n").unwrap();
 }
 
 /// Writes `examples/jet_shack.elements`. Run by hand:
