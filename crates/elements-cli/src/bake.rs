@@ -156,6 +156,13 @@ fn read_grids(
     extras: Vec<Value>,
     cells: [u32; 3],
 ) -> anyhow::Result<Vec<Vec<f32>>> {
+    if extras.len() != outputs.len() {
+        let (got, want) = (extras.len(), outputs.len());
+        for value in extras {
+            value.release_to(pool);
+        }
+        anyhow::bail!("the graph returned {got} extra outputs, the document names {want}");
+    }
     let mut grids = Vec::new();
     let mut failure = None;
     for (entry, value) in outputs.iter().zip(extras) {

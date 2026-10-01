@@ -84,6 +84,24 @@ mod tests {
     }
 
     #[test]
+    fn velocity_strides_are_right_on_a_2x2x2_domain() {
+        // Face index is (z * face_ny + y) * face_nx + x. Values are 1 + index, so a face
+        // at index i holds i + 1; the expected means are worked out by hand below.
+        // x faces are 3x2x2 (12 values), y faces 2x3x2 (12), z faces 2x2x3 (12).
+        let f: Vec<f32> = (0..12).map(|i| i as f32 + 1.0).collect();
+        let [vx, vy, vz] = cell_centred_velocity([2, 2, 2], [&f, &f, &f]).unwrap();
+        // x: cell (x,y,z) averages indices (z*2+y)*3+x and +1 -> mean = base + 0.5 + 1.
+        // bases (y,z)=(0,0):0 (1,0):3 (0,1):6 (1,1):9; x=0 -> base+1.5, x=1 -> base+2.5.
+        assert_eq!(vx, [1.5, 2.5, 4.5, 5.5, 7.5, 8.5, 10.5, 11.5]);
+        // y: cell averages indices lo and lo+2, values lo+1 and lo+3 -> lo + 2, with
+        // lo = (z*3+y)*2+x: z=0 gives 0,1,2,3 and z=1 gives 6,7,8,9.
+        assert_eq!(vy, [2.0, 3.0, 4.0, 5.0, 8.0, 9.0, 10.0, 11.0]);
+        // z: cell averages indices (z*2+y)*2+x and +4 -> base + 4 + 1 = base + 3
+        // with base = (z*2+y)*2+x = 0..7 in cell order, but mean of base+1 and base+5 = base+3.
+        assert_eq!(vz, [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+    }
+
+    #[test]
     fn a_face_array_of_the_wrong_length_is_an_error() {
         let fx = [0.0; 3];
         let short = [0.0; 3];

@@ -312,8 +312,8 @@ fn bake_with_outputs_writes_every_named_grid_into_one_file() {
 
 #[test]
 fn bake_rejects_two_outputs_that_expand_to_the_same_grid_before_baking() {
-    // Two entries named "a": the document is rejected, the CLI reports it, and no output
-    // directory is created. (Vector-expansion collisions are covered by expanded_names.)
+    // Two entries named "a": `Document::from_json` rejects this itself, so it does NOT cover
+    // the ordering of `expanded_names`; the vector-expansion test below does.
     let doc = TWO_NOISES
         .replace("\"first\"", "\"a\"")
         .replace("\"second\"", "\"a\"");
@@ -327,5 +327,43 @@ fn bake_rejects_two_outputs_that_expand_to_the_same_grid_before_baking() {
         .status()
         .unwrap();
     assert!(!status.success());
+    assert!(!out.exists(), "the output directory must not be created");
+}
+
+#[test]
+fn bake_rejects_a_vector_expansion_collision_before_creating_the_output_directory() {
+    // `velocity` expands to velocity_x/_y/_z, colliding with the scalar `velocity_x`. Only
+    // `expanded_names` sees this, so it proves names are checked before `create_dir_all`.
+    const DOC: &str = r#"{
+      "version": 4, "dims": [8, 8, 8],
+      "nodes": [
+        { "id": 0, "kind": "ember.emitter", "params": {
+            "shape": { "sphere": { "radius": 0.1 } },
+            "transform": { "keys": [{ "frame": 0 }] } } },
+        { "id": 1, "kind": "ember.smoke_solver", "params": {} },
+        { "id": 2, "kind": "core.output", "params": {} }
+      ],
+      "edges": [
+        { "from_node": 0, "from_index": 0, "to_node": 1, "to_index": 0 },
+        { "from_node": 1, "from_index": 0, "to_node": 2, "to_index": 0 }
+      ],
+      "output": 2,
+      "outputs": [
+        { "node": 1, "socket": 2, "name": "velocity" },
+        { "node": 1, "socket": 0, "name": "velocity_x" }
+      ]
+    }"#;
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join("collide.elements");
+    std::fs::write(&graph, DOC).unwrap();
+    let out = dir.path().join("vdb");
+    let result = cli()
+        .args(["bake", graph.to_str().unwrap()])
+        .args(["--out", out.to_str().unwrap(), "--frames", "1"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("velocity_x"), "{stderr}");
     assert!(!out.exists(), "the output directory must not be created");
 }
