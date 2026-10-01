@@ -44,17 +44,13 @@ document that names socket indices are checked for breakage.
 
 The document gains an optional `outputs: [{node, socket, name}]` beside `output`. Version 3 becomes
 version 4; versions 1–3 still load (a migration test in `tests/document.rs`, as the constant's doc
-comment requires). A document without `outputs` bakes exactly as today, byte for byte.
+comment requires). The single-grid writer's file is byte-identical (pinned by a pre-FT5 fixture) and a document without `outputs` takes the unchanged single-grid branch; no end-to-end pre/post bake comparison exists.
 
 `Document::from_json` rejects duplicate and empty names; `Document::into_graph` rejects a node or
-socket out of range and a socket that is not a field (via `Graph::set_extra_outputs`). Two entries
+socket out of range and a socket that is not a field (via `Graph::set_extra_outputs`). Any vector-field entry named `n` is written as `n_x`, `n_y`, `n_z` (the velocity field is `velocity`). Two entries
 that would write the same grid name, counting a vector entry `velocity` as `velocity_x/_y/_z`, are
 rejected by the bake before any GPU work (Task 5). Read-backs are sequential, so the existing
 per-field `validate_for` check bounds each buffer.
-
-Any vector-field entry named `n` is written as `n_x`, `n_y`, `n_z` (the velocity field is `velocity`
-and becomes `velocity_x/y/z`); two entries that would write the same grid name are rejected by the
-bake before any GPU work.
 
 ### 3.3 Bake
 
@@ -91,16 +87,16 @@ GPU when present.
    `flame` × strength; emission colour from blackbody driven by the real `temperature` grid through
    a Map Range from solver temperature to Kelvin. The Kelvin endpoints and strength are constants
    chosen by eye and recorded.
-3. **Velocity.** The volume's `velocity_grid` is set to the `velocity` prefix. Whether Blender reads
-   `velocity_x/y/z` for motion blur is unverified; the plan's first Blender task checks it against
-   the binary. If it fails, a `Vec3s` writer becomes part of FT5.
+3. **Velocity.** The volume's `velocity_grid` is set to the `velocity` prefix. Checked on Blender 5.2.2 LTS: all 8
+   grids load from the multi-grid file and `velocity_grid = "velocity"` is accepted (resolving
+   `velocity_x/_y/_z`); a render with motion blur was NOT tested. If it fails, a `Vec3s` writer becomes part of FT5.
 4. **Fuel and char passes.** Cycles surface shaders cannot sample a volume grid, so char cannot
    shade the shack mesh here. `fuel` and `char` each render as a separate emission-only still from
    the same camera by swapping the volume material: `beauty`, `fuel`, `char` per frame. Mesh-lookup
    char shading is FT6.
 5. **Shack proxy.** The real planks mesh from the scene JSON, as a grey mesh (not grey boxes).
-6. **Recipe.** `just render-shack` bakes the small shack scene (`examples/jet_shack.elements`
-   extended with an `outputs` list and cut to a low resolution; all grids, one `bake` call),
+6. **Recipe.** `just render-shack` bakes `examples/jet_shack_render.elements`
+   (128x64x64 over 2.0 m, not cut down; an `outputs` list names all grids, one `bake` call),
    renders one frame (default 45, not 60: the jet is active for frames 5-40 and the fire fades by 50, so frame 60 is nearly empty), and writes PNGs to `docs/bench/render-shack/`. Real GPU and Blender; not in
    `just check`.
 
@@ -122,7 +118,8 @@ Each test is proven to fail under one mutation, restored, with the real output r
   one-grid `write_float_grids` equals `write_float_grid` byte for byte; length mismatch, empty list
   and duplicate names error.
 - **Rust, core:** `outputs` validation cases; version-3 document migration; a document without
-  `outputs` bakes byte-identically.
+  `outputs` takes the unchanged single-grid branch (the single-grid writer's file is byte-identical,
+  pinned by a pre-FT5 fixture; no end-to-end pre/post bake comparison exists).
 - **Rust, `elements-ember`:** the fuel output equals the fuel slot with fire on and is zero with it
   off; the existing fire-off hashes are unchanged.
 - **Rust, `elements-cli`:** one bake evaluation per frame yields every named grid; velocity
@@ -145,7 +142,7 @@ unless §3.5(3) fails; heat-wave distortion, sparks and embers; any Mantaflow si
 
 ## 7. Risks
 
-1. Velocity naming in Blender (§3.5(3)) is unverified.
+1. Velocity naming in Blender (§3.5(3)): checked on Blender 5.2.2 LTS, all 8 grids load and `velocity_grid = "velocity"` is accepted (resolving `velocity_x/_y/_z`); a render with motion blur was NOT tested.
 2. The blackbody mapping is chosen by eye, so its colour is a judgement and is recorded as one.
 3. File size grows with grid count; FT6 records the clip cost.
 4. Adding solver output 5 touches a node interface the benchmark and examples use; every consumer

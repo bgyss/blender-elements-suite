@@ -337,14 +337,20 @@ impl Graph {
         let time = Time::at(DEFAULT_START_FRAME, DEFAULT_START_FRAME, DEFAULT_FPS);
         let result = self.eval_frame(gpu, pool, pipelines, &mut scratch, time, dims);
         scratch.clear(pool);
-        result.map(|evaluated| evaluated.value)
+        let Evaluated { value, extras, .. } = result?;
+        for extra in extras {
+            extra.release_to(pool);
+        }
+        Ok(value)
     }
 
     /// Evaluate the output node and everything it depends on, as frame `time`,
     /// reading and writing persistent state in `state`.
     ///
     /// Every field produced along the way is back in `pool` when this returns,
-    /// except the result, whether evaluation succeeds or fails.
+    /// except the result and every extra, which go to the caller (extras in
+    /// `extra_outputs()` order), whether evaluation succeeds or fails.
+    /// `Graph::eval` releases the extras itself.
     pub fn eval_frame(
         &self,
         gpu: &GpuContext,
@@ -370,25 +376,34 @@ impl Graph {
             stats: EvalStats::default(),
         };
         let result = self.run(&mut run, &order, output);
-        let extras = match &result {
-            Ok(_) => self
-                .extra_outputs
-                .iter()
-                .map(|s| run.produced.remove(s).ok_or(NodeError::UnknownNode(s.node)))
-                .collect::<Result<Vec<_>, _>>(),
-            Err(_) => Ok(Vec::new()),
-        };
+        let mut extras = Vec::new();
+        let mut missing = None;
+        if result.is_ok() {
+            for s in &self.extra_outputs {
+                match run.produced.remove(s) {
+                    Some(v) => extras.push(v),
+                    None => {
+                        missing = Some(NodeError::BadExtraOutput {
+                            node: s.node,
+                            index: s.index,
+                            reason: "the evaluation did not produce it",
+                        });
+                        break;
+                    }
+                }
+            }
+        }
         for (_, value) in run.produced.drain() {
             value.release_to(run.pool);
         }
         let value = result?;
-        let extras = match extras {
-            Ok(extras) => extras,
-            Err(err) => {
-                value.release_to(run.pool);
-                return Err(err);
+        if let Some(err) = missing {
+            value.release_to(run.pool);
+            for extra in extras {
+                extra.release_to(run.pool);
             }
-        };
+            return Err(err);
+        }
         Ok(Evaluated {
             value,
             extras,

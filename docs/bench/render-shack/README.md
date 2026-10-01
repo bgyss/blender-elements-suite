@@ -2,8 +2,9 @@
 
 One bake of `examples/jet_shack_render.elements` writes every grid of a frame into one VDB, and
 Blender renders that frame to three stills. Measured locally on Metal (Apple M1 Max). The llvmpipe
-CI did not run the render, and nothing from this branch has been pushed, so CI has not run on it at
-all (`gh run list` was not consulted).
+CI did not run the render. `git ls-remote --heads origin flamethrower-ft5` printed nothing when run
+for the final review and again after it, so the branch was not pushed and CI has not run on it
+(`gh run list` was not consulted).
 
 Spec: `docs/superpowers/specs/2026-09-30-flamethrower-ft5-export-render-design.md`.
 Plan: `docs/superpowers/plans/2026-09-30-flamethrower-ft5-export-render.md`.
@@ -18,7 +19,9 @@ from the scene JSON), then runs `tests/bench/render_shack.py` in Blender 5.2.2 L
 so it can be rerun. The CLI prints "frame caching is off", which is expected.
 
 - Commit the bake and render came from: see `commit` (65c4fbd; the recipe marks `-dirty` if
-  `crates`, `Cargo.*`, `tests/bench` or `examples` differ; this run was not dirty).
+  `crates`, `Cargo.*`, `tests/bench` or `examples` differ; this run was not dirty). That hash is the commit the stills were rendered from, which is the commit
+  before the record commit (d1957d3); the `render-shack` recipe itself exists only from d1957d3, and
+  its dirty check excludes `justfile` and `docs`.
 - Device: `GPU (Apple M1 Max (GPU - 32 cores))` (`render-device`). Cycles 64 spp, no denoise.
 - Load average (1, 5, 15 min) printed by the recipe: before the bake `{ 12.40 13.61 16.57 }`, at the
   end `{ 11.96 13.50 16.51 }`. The machine was loaded, so timings are not clean.
@@ -65,6 +68,7 @@ What the checks do not prove:
 - The char check can only fail on its left bound in practice (see the script's docstring).
 - `char` is a volume still, not a shader on the planks: Cycles surface shaders cannot sample a
   volume grid. Mesh-lookup char shading is FT6.
+- The removal of a partial `.vdb` after a failed write is untested.
 - Mantaflow is not involved.
 
 ## Char is almost absent at default settings
@@ -79,7 +83,7 @@ Retuning is FT6's decision.
 Measured on the unchanged scene at default settings: a 31-frame bake (frames 20-50, release CLI),
 5.7 s wall. Temperature minimum is 0.0 in every frame, so ambient is 0; temperature counts use
 > 0.1, other counts use > 0. The shack spans voxel x 74..112. The recipe's default frame is 45
-because the jet is active for frames 5-40 and the fire fades by 50; frame 60 is nearly empty.
+because the jet is active for frames 5-40 and the fire fades by 50; frame 60 (from the Task 6 measurement) is nearly empty.
 
 | frame | density max / nz | flame max / nz | temp max / nz(>0.1) | fuel max / nz | char max / nz | char x-range |
 |---|---|---|---|---|---|---|
@@ -90,6 +94,7 @@ because the jet is active for frames 5-40 and the fire fades by 50; frame 60 is 
 | 40 | 0.1157 / 39351 | 0.900 / 1257 | 2.860 / 16588 | 4.805 / 1237 | 0.0833 / 1 | 72..72 |
 | 45 | 0.1003 / 57426 | 0.607 / 791 | 2.507 / 20959 | 1.774 / 782 | 0.1875 / 2 | 72..74 |
 | 50 | 0.1050 / 77638 | 0.392 / 312 | 2.074 / 24507 | 0.610 / 310 | 0.2917 / 2 | 72..74 |
+| 60 | not measured | not measured | not measured | 0.0075 / 6 | 0.50000006 / 4 | not measured |
 
 ## Verdict
 

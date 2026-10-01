@@ -147,6 +147,26 @@ fn evaluated_release_to_returns_every_field_to_the_pool() {
     assert_eq!(h.pool.pooled_count(), before + 3);
 }
 
+#[test]
+fn graph_eval_returns_its_extras_to_the_pool() {
+    let mut h = Harness::new();
+    let mut g = graph();
+    g.set_extra_outputs(vec![socket(NodeId(1), 0), socket(NodeId(0), 0)])
+        .unwrap();
+    let before = h.pool.pooled_count();
+    let value = g
+        .eval(
+            &h.gpu,
+            &mut h.pool,
+            &mut h.pipelines,
+            FieldDims::new(4, 4, 4),
+        )
+        .unwrap();
+    // The extras are already back; only the result is the caller's.
+    assert_eq!(h.pool.pooled_count(), before + 2);
+    value.release_to(&mut h.pool);
+}
+
 const ACCUMULATE_DOC: &str = r#"{
   "version": 1,
   "dims": [4, 4, 4],

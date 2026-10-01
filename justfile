@@ -206,7 +206,7 @@ bench-render cases="plume:128 plume_collider:128 plume_wind:128 plume:256 fire:1
         > "$R/readme.log" 2>&1 || { tail -30 "$R/readme.log"; exit 1; }
     echo "wrote $OUT/README.md"
 
-# FT5: bake the half-size shack scene (every grid, one bake) and render one frame of it in
+# FT5: bake the shack scene (every grid, one bake) and render one frame of it in
 # Cycles. Real GPU and Blender; not in `check`. Stills go in docs/bench/render-shack/.
 # Frame 45 is the default: the jet is active for frames 5-40 and the fire fades by 50.
 render-shack frame="45":
