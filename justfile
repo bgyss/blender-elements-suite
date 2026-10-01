@@ -27,6 +27,7 @@ ci-test: py-test
 py-test:
     python tests/bench/test_mapping.py
     python tests/bench/test_placement.py
+    python tests/bench/test_shack_layout.py
 
 # Everything a commit must pass.
 check: lint test
