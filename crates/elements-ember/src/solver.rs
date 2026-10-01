@@ -21,7 +21,8 @@
 //! `burned` state slot. Wood touching gas above `ignition_temperature`
 //! burns at `surface_burn_rate` and its emission enters the gas as fuel,
 //! ahead of the burn. Output socket 4 is the char, burned / load, zero
-//! without a surface (FT4 spec §3.1–§3.3).
+//! without a surface (FT4 spec §3.1–§3.3). Output socket 5 is the fuel, zero
+//! without fire (FT5 spec §3.1).
 //!
 //! The projection's pressure solve is chosen by `pressure_solver`: red-black
 //! Gauss–Seidel for `pressure_iterations` sweeps, or, on a multigrid
@@ -1418,7 +1419,7 @@ impl SmokeSolver {
             // The outputs are copies: the state stays in the store for the
             // next frame. Outputs nobody reads are not copied at all. The
             // char output reads the load, so the inputs are released after.
-            let wanted: [bool; 5] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
+            let wanted: [bool; 6] = std::array::from_fn(|i| ctx.output_wanted(i as u32));
             let dx = ctx.voxel_size();
             let load = inputs
                 .iter()
@@ -1572,6 +1573,8 @@ impl Node for SmokeSolver {
                 SocketType::Field,
                 // 4: char, burned / load (FT4 spec §3.1, §3.3).
                 SocketType::Field,
+                // 5: fuel, a copy of the fuel slot; zero without fire (FT5 spec §3.1).
+                SocketType::Field,
             ],
         }
     }
@@ -1634,10 +1637,10 @@ fn copy_outputs(
     pool: &mut FieldPool,
     state: &SolverState,
     load: Option<&Field>,
-    wanted: [bool; 5],
+    wanted: [bool; 6],
     dx: f32,
 ) -> Result<Vec<Value>, GpuError> {
-    let mut outputs: Vec<Value> = Vec::with_capacity(5);
+    let mut outputs: Vec<Value> = Vec::with_capacity(6);
     for (index, wanted) in wanted.into_iter().enumerate() {
         let copied = if !wanted {
             Ok(Value::Scalar(0.0))
@@ -1648,7 +1651,8 @@ fn copy_outputs(
                 2 => duplicate_velocity(gpu, pool, &state.velocity).map(Value::VectorField),
                 3 => flame_output(gpu, cache, pool, state, dx).map(Value::Field),
                 4 => char_output(gpu, cache, pool, state, load, dx).map(Value::Field),
-                _ => unreachable!("only five outputs exist"),
+                5 => fuel_output(gpu, cache, pool, state).map(Value::Field),
+                _ => unreachable!("only six outputs exist"),
             }
         };
         match copied {
@@ -1688,6 +1692,19 @@ fn flame_output(
             pool.release(dst);
             Err(e)
         }
+    }
+}
+
+/// The fuel output: a copy of the fuel state with fire on, zero without (FT5 spec §3.1).
+fn fuel_output(
+    gpu: &GpuContext,
+    cache: &mut PipelineCache,
+    pool: &mut FieldPool,
+    state: &SolverState,
+) -> Result<Field, GpuError> {
+    match &state.fire {
+        Some(fire) => pool.duplicate(gpu, &fire.fuel),
+        None => pool.acquire_zeroed(gpu, cache, state.density.dims()),
     }
 }
 
