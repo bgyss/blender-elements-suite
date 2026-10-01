@@ -187,6 +187,7 @@ fn document(v: Variant) -> Document {
         nodes,
         edges,
         output: 2,
+        outputs: Vec::new(),
     }
 }
 

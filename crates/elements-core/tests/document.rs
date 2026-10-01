@@ -1,7 +1,7 @@
 use elements_core::gpu::{FieldFormat, FieldPool, GpuContext, PipelineCache, fill_constant};
 use elements_core::graph::{
-    DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION, EvalCtx, Node, NodeError,
-    NodeRegistry, SocketSpec, SocketType, TimelineConfig, Value,
+    DocEdge, DocError, DocNode, DocOutput, Document, ELEMENTS_DOC_VERSION, EvalCtx, Node,
+    NodeError, NodeRegistry, SocketSpec, SocketType, TimelineConfig, Value,
 };
 
 const MINIMAL: &str = include_str!("fixtures/v1_minimal.elements");
@@ -221,6 +221,7 @@ fn accepts_a_document_wiring_one_output_to_two_inputs() {
             },
         ],
         output: 1,
+        outputs: Vec::new(),
     };
 
     let registry = test_registry();
@@ -246,6 +247,7 @@ fn rejects_an_out_of_range_output() {
         }],
         edges: vec![],
         output: 5,
+        outputs: Vec::new(),
     };
 
     let registry = test_registry();
@@ -300,7 +302,7 @@ fn probe_doc(version_and_size: &str) -> String {
 fn a_version_2_document_migrates_with_the_default_domain_size() {
     let doc = Document::from_json(&probe_doc(r#""version": 2,"#)).unwrap();
     assert_eq!(doc.version, ELEMENTS_DOC_VERSION);
-    assert_eq!(doc.version, 3);
+    assert_eq!(doc.version, 4);
     assert_eq!(doc.domain_size, 2.0);
 }
 
@@ -354,4 +356,84 @@ fn rejects_a_domain_size_that_f32_voxels_cannot_hold() {
             "domain_size {size} is inside the range and must load"
         );
     }
+}
+
+const V3: &str = include_str!("fixtures/v3_minimal.elements");
+
+#[test]
+fn a_version_3_document_loads_as_version_4_and_bakes_no_outputs() {
+    let doc = Document::from_json(V3).unwrap();
+    assert_eq!(doc.version, 4);
+    assert!(doc.outputs.is_empty());
+    assert!(
+        !doc.to_json().unwrap().contains("outputs"),
+        "an empty list is not written"
+    );
+}
+
+fn with_outputs(outputs: &str) -> String {
+    V3.replacen(
+        "\"output\": 1",
+        &format!("\"output\": 1, \"outputs\": {outputs}"),
+        1,
+    )
+}
+
+#[test]
+fn outputs_round_trip() {
+    let json = with_outputs(r#"[{"node":0,"socket":0,"name":"density"}]"#);
+    let doc = Document::from_json(&json).unwrap();
+    assert_eq!(
+        doc.outputs,
+        vec![DocOutput {
+            node: 0,
+            socket: 0,
+            name: "density".into()
+        }]
+    );
+    assert_eq!(
+        Document::from_json(&doc.to_json().unwrap())
+            .unwrap()
+            .outputs,
+        doc.outputs
+    );
+}
+
+#[test]
+fn duplicate_and_empty_output_names_are_rejected() {
+    for bad in [
+        r#"[{"node":0,"socket":0,"name":"a"},{"node":0,"socket":0,"name":"a"}]"#,
+        r#"[{"node":0,"socket":0,"name":""}]"#,
+    ] {
+        assert!(
+            matches!(
+                Document::from_json(&with_outputs(bad)),
+                Err(DocError::BadParams { .. })
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn into_graph_rejects_an_output_that_is_not_a_field() {
+    // node 1 is core.output (socket 0 is its result), node 0 is the source.
+    let registry = NodeRegistry::with_builtins();
+    for bad in [
+        r#"[{"node":9,"socket":0,"name":"a"}]"#, // no such node
+        r#"[{"node":0,"socket":9,"name":"a"}]"#, // no such socket
+        r#"[{"node":1,"socket":0,"name":"a"}]"#, // the result socket
+    ] {
+        let doc = Document::from_json(&with_outputs(bad)).unwrap();
+        assert!(doc.into_graph(&registry).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn into_graph_installs_the_outputs_on_the_graph() {
+    let registry = NodeRegistry::with_builtins();
+    let doc =
+        Document::from_json(&with_outputs(r#"[{"node":0,"socket":0,"name":"density"}]"#)).unwrap();
+    let (graph, _) = doc.into_graph(&registry).unwrap();
+    assert_eq!(graph.extra_outputs().len(), 1);
 }

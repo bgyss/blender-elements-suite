@@ -46,10 +46,11 @@ The document gains an optional `outputs: [{node, socket, name}]` beside `output`
 version 4; versions 1–3 still load (a migration test in `tests/document.rs`, as the constant's doc
 comment requires). A document without `outputs` bakes exactly as today, byte for byte.
 
-`Document::validate_for` rejects, before any GPU work: duplicate names, a node or socket out of
-range, a socket that is neither a scalar `Field` nor the velocity `VectorField`, the reserved names
-`velocity_x`, `velocity_y`, `velocity_z`, and a set of read-back grids that does not fit the
-device's `max_buffer_size` together (risk (g)).
+`Document::from_json` rejects duplicate and empty names; `Document::into_graph` rejects a node or
+socket out of range and a socket that is not a field (via `Graph::set_extra_outputs`). Two entries
+that would write the same grid name, counting a vector entry `velocity` as `velocity_x/_y/_z`, are
+rejected by the bake before any GPU work (Task 5). Read-backs are sequential, so the existing
+per-field `validate_for` check bounds each buffer.
 
 The velocity `VectorField` is named by a single entry with the reserved name `velocity`; the bake
 expands it into `velocity_x/y/z`.
@@ -103,7 +104,7 @@ GPU when present.
 
 ## 4. Error handling
 
-- Invalid `outputs` are rejected in `validate_for` (§3.2). Writer and bake errors as in §3.3–3.4.
+- Invalid `outputs` are rejected on load or in `into_graph` (§3.2). Writer and bake errors as in §3.3–3.4.
 - The render script exits nonzero on a missing grid, a missing frame file, or a non-finite pixel
   statistic.
 - `elements-io` and `elements-cli` keep `forbid(unsafe_code)` and `Apache-2.0 OR MIT`; the Blender

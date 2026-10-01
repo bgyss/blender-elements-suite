@@ -8,7 +8,7 @@ mod state;
 mod time;
 mod timeline;
 
-pub use document::{DocEdge, DocError, DocNode, Document, ELEMENTS_DOC_VERSION};
+pub use document::{DocEdge, DocError, DocNode, DocOutput, Document, ELEMENTS_DOC_VERSION};
 pub use node::{EvalCtx, EvalStats, Node, NodeError, Value};
 pub use registry::{NodeCtor, NodeRegistry};
 pub use socket::{NodeId, SocketId, SocketSpec, SocketType};

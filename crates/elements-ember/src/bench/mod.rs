@@ -392,6 +392,7 @@ impl Scene {
             nodes,
             edges,
             output: 2,
+            outputs: Vec::new(),
         }
     }
 }
