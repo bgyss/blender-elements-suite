@@ -64,7 +64,33 @@ def test_warm_pixels_counts_red_over_blue() -> None:
     grey = (0.5, 0.5, 0.5, 1.0)
     orange = (1.0, 0.4, 0.1, 1.0)
     rgba = [c for px in (orange, grey, grey, grey) for c in px]
-    assert sl.warm_pixels(rgba) == 1, sl.warm_pixels(rgba)
+    assert sl.warm_pixels(rgba, 2, 2) == 1, sl.warm_pixels(rgba, 2, 2)
+
+
+def test_warm_pixels_threshold_is_strict() -> None:
+    # Red minus blue is exactly the threshold in the first pixel (not counted)
+    # and above it in the second; both are exact in binary.
+    exact = [0.25, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 1.0]
+    assert sl.warm_pixels(exact, 2, 1, threshold=0.25) == 1, sl.warm_pixels(exact, 2, 1, 0.25)
+
+
+def test_pixel_helpers_reject_a_buffer_of_the_wrong_size() -> None:
+    for call in (lambda: sl.warm_pixels([0.0] * 12, 2, 2), lambda: sl.lit_bbox([0.0] * 12, 2, 2)):
+        try:
+            call()
+        except AssertionError:
+            continue
+        raise AssertionError("a 3-pixel buffer passed as 2x2")
+
+
+def test_project_x_maps_the_view_onto_pixel_columns() -> None:
+    cam = sl.camera((2.0, 1.0, 1.0), 16 / 9)
+    (x_lo, x_hi), _ = view(cam, 16 / 9)
+    assert close(sl.project_x(x_lo, cam, 960), 0.0), sl.project_x(x_lo, cam, 960)
+    assert close(sl.project_x(x_hi, cam, 960), 960.0), sl.project_x(x_hi, cam, 960)
+    assert close(sl.project_x(1.0, cam, 960), 480.0), sl.project_x(1.0, cam, 960)
+    # The domain spans 2 / 2.4 of the width, centred: x = 1.5 is 0.25 of it right.
+    assert close(sl.project_x(1.5, cam, 960), 480.0 + 0.5 / 2.4 * 960), sl.project_x(1.5, cam, 960)
 
 
 def test_lit_bbox_treats_row_0_as_the_bottom() -> None:

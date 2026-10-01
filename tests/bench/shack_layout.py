@@ -55,7 +55,11 @@ def missing_grids(present: Iterable[str]) -> list[str]:
 
 
 def camera(extent: tuple[float, float, float], aspect: float, margin: float = 0.1) -> dict:
-    """An orthographic camera looking along +y at a domain [0, extent]."""
+    """An orthographic camera looking along +y at a domain [0, extent].
+
+    Assumes a landscape frame (aspect >= 1): `ortho_scale` is then the frame's
+    width, which is what `project_x` relies on.
+    """
     scale = 1.0 + 2.0 * margin
     return {
         "location": (extent[0] / 2, -4.0 * max(extent), extent[2] / 2),
@@ -66,8 +70,16 @@ def camera(extent: tuple[float, float, float], aspect: float, margin: float = 0.
     }
 
 
-def warm_pixels(rgba: Sequence[float], threshold: float = 0.05) -> int:
+def project_x(x_m: float, cam: dict, width: int) -> float:
+    """The pixel column (0 at the left edge) that world x `x_m` lands on
+    through `camera`'s orthographic view, `width` pixels wide (aspect >= 1)."""
+    left = cam["location"][0] - cam["ortho_scale"] / 2
+    return (x_m - left) / cam["ortho_scale"] * width
+
+
+def warm_pixels(rgba: Sequence[float], width: int, height: int, threshold: float = 0.05) -> int:
     """Count pixels whose red exceeds blue by more than `threshold`."""
+    assert len(rgba) == width * height * 4, (len(rgba), width, height)
     return sum(1 for i in range(0, len(rgba), 4) if rgba[i] - rgba[i + 2] > threshold)
 
 
@@ -78,6 +90,7 @@ def lit_bbox(
 
     Blender's pixel rows run bottom-up, so row 0 is the bottom of the image.
     """
+    assert len(rgba) == width * height * 4, (len(rgba), width, height)
     xs: list[int] = []
     ys: list[int] = []
     for y in range(height):
