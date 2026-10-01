@@ -8,11 +8,15 @@ pub mod vdb;
 
 pub use npy::{read_npy, write_npy};
 pub use preview::write_slice_png;
-pub use vdb::write_float_grid;
+pub use vdb::{GridSpec, write_float_grid, write_float_grids};
 
 /// Everything that can go wrong writing an Elements output file.
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
+    #[error("a VDB file needs at least one grid")]
+    NoGrids,
+    #[error("grid name {name:?} appears twice in one VDB file")]
+    DuplicateGrid { name: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("npy error: {0}")]

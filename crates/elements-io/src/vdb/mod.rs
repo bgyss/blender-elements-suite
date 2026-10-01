@@ -8,11 +8,12 @@ mod tree;
 mod writer;
 
 pub use tree::{
-    BitMask, internal_child_offset, internal_node_slot_offset, leaf_voxel_offset, write_float_grid,
+    BitMask, GridSpec, internal_child_offset, internal_node_slot_offset, leaf_voxel_offset,
+    write_float_grid, write_float_grids,
 };
 pub use writer::{
     ByteWriter, COMPRESSION_ACTIVE_MASK, FLOAT_GRID_TYPE, GridOffsets, MetaValue,
     NO_MASK_AND_ALL_VALS, NO_MASK_OR_INACTIVE_VALS, OPENVDB_FILE_VERSION, OPENVDB_LIBRARY_MAJOR,
-    OPENVDB_LIBRARY_MINOR, OPENVDB_MAGIC, write_archive_header, write_grid_descriptor,
-    write_metadata,
+    OPENVDB_LIBRARY_MINOR, OPENVDB_MAGIC, write_archive_header, write_archive_header_with_count,
+    write_grid_descriptor, write_metadata,
 };

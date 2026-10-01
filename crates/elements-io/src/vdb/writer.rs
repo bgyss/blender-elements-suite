@@ -170,6 +170,15 @@ pub fn write_archive_header<W: Write + Seek>(
     w: &mut ByteWriter<W>,
     uuid: &str,
 ) -> Result<(), IoError> {
+    write_archive_header_with_count(w, uuid, 1)
+}
+
+/// `write_archive_header` for a file holding `grid_count` grids.
+pub fn write_archive_header_with_count<W: Write + Seek>(
+    w: &mut ByteWriter<W>,
+    uuid: &str,
+    grid_count: u32,
+) -> Result<(), IoError> {
     if uuid.len() != 36 {
         return Err(IoError::BadUuid { len: uuid.len() });
     }
@@ -181,7 +190,7 @@ pub fn write_archive_header<W: Write + Seek>(
     w.u8(1)?; // has_grid_offsets
     w.raw(uuid.as_bytes())?;
     write_metadata(w, &[])?; // no file-level metadata
-    w.u32(1)?; // grid_count
+    w.u32(grid_count)?;
     Ok(())
 }
 
